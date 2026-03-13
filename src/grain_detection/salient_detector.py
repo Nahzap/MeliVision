@@ -1,0 +1,229 @@
+"""
+SalientObjectDetector — Wrapper U²-Net para detección de objetos salientes.
+
+Adaptado de XYZ_Ctrl_L206_GUI/src/ai_segmentation.py para el proyecto MetricLearning.
+Genera mapas de saliencia pixel-level que permiten localizar granos de polen
+sin necesidad de anotaciones de bounding box.
+
+Ref: Qin et al. (2020) U²-Net: Going Deeper with Nested U-Structure for SOD
+"""
+
+import logging
+from pathlib import Path
+from typing import Optional, Tuple
+
+import cv2
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from src.models.u2net import U2NET, U2NETP
+
+logger = logging.getLogger(__name__)
+
+WEIGHTS_DIR = Path(__file__).resolve().parent.parent.parent / "models" / "weights"
+U2NET_WEIGHTS = WEIGHTS_DIR / "u2net.pth"
+U2NETP_WEIGHTS = WEIGHTS_DIR / "u2netp.pth"
+
+WEIGHTS_URLS = {
+    "u2net": "https://drive.google.com/uc?id=1ao1ovG1Qtx4b7EoskHXmi2E9rp5CHLcZ",
+    "u2netp": "https://drive.google.com/uc?id=1rbSTGKAE-MTxBYHd-51l2hMOQPT_7EPy",
+}
+
+
+class SalientObjectDetector:
+    """
+    Detector de Objetos Salientes usando U²-Net.
+
+    Permite aislar granos de polen del fondo de microscopía usando
+    deep learning, sin necesidad de calibración ni anotación previa.
+
+    Attributes:
+        model_type: 'u2netp' (rápido, ~4MB) o 'u2net' (preciso, ~176MB)
+        device: 'cuda' o 'cpu'
+        input_size: Tamaño de entrada del modelo (default 320x320)
+    """
+
+    def __init__(
+        self,
+        model_type: str = "u2netp",
+        device: Optional[str] = None,
+        input_size: int = 320,
+        auto_download: bool = True,
+    ):
+        self.model_type = model_type
+        self.input_size = input_size
+        self.auto_download = auto_download
+
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(device)
+
+        logger.info(f"[SalientObjectDetector] Dispositivo: {self.device}")
+
+        self.model = None
+        self._load_model()
+
+    def _get_weights_path(self) -> Path:
+        if self.model_type == "u2net":
+            return U2NET_WEIGHTS
+        return U2NETP_WEIGHTS
+
+    def _download_weights(self) -> bool:
+        weights_path = self._get_weights_path()
+
+        if weights_path.exists():
+            return True
+
+        WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+
+        url = WEIGHTS_URLS.get(self.model_type)
+        if not url:
+            logger.error(f"[SalientObjectDetector] URL no encontrada para {self.model_type}")
+            return False
+
+        logger.info(f"[SalientObjectDetector] Descargando pesos {self.model_type}...")
+
+        try:
+            import gdown
+
+            gdown.download(url, str(weights_path), quiet=False)
+            logger.info(f"[SalientObjectDetector] Pesos descargados: {weights_path}")
+            return True
+        except ImportError:
+            logger.error(
+                "[SalientObjectDetector] gdown no instalado. Ejecuta: pip install gdown"
+            )
+            logger.error(f"[SalientObjectDetector] O descarga manualmente desde: {url}")
+            logger.error(f"[SalientObjectDetector] Guardar en: {weights_path}")
+            return False
+        except Exception as e:
+            logger.error(f"[SalientObjectDetector] Error descargando pesos: {e}")
+            return False
+
+    def _load_model(self):
+        weights_path = self._get_weights_path()
+
+        if not weights_path.exists():
+            if self.auto_download:
+                if not self._download_weights():
+                    raise FileNotFoundError(
+                        f"No se encontraron pesos en {weights_path}. "
+                        f"Ejecuta setup_u2net.py o descarga manualmente."
+                    )
+            else:
+                raise FileNotFoundError(
+                    f"Pesos no encontrados: {weights_path}. "
+                    f"Ejecuta setup_u2net.py para descargarlos."
+                )
+
+        if self.model_type == "u2net":
+            self.model = U2NET(3, 1)
+        else:
+            self.model = U2NETP(3, 1)
+
+        logger.info(f"[SalientObjectDetector] Cargando pesos desde {weights_path}")
+        state_dict = torch.load(
+            str(weights_path), map_location=self.device, weights_only=True
+        )
+        self.model.load_state_dict(state_dict)
+
+        self.model.to(self.device)
+        self.model.eval()
+
+        logger.info(f"[SalientObjectDetector] Modelo {self.model_type} cargado exitosamente")
+
+    def _preprocess(self, image: np.ndarray) -> Tuple[torch.Tensor, Tuple[int, int]]:
+        """
+        Preprocesa imagen para el modelo.
+
+        Args:
+            image: Imagen BGR o grayscale (numpy array)
+
+        Returns:
+            (tensor, original_size) donde original_size = (H, W)
+        """
+        original_size = image.shape[:2]
+
+        if len(image.shape) == 2:
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+        elif image.shape[2] == 4:
+            image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGB)
+        else:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        image = cv2.resize(image, (self.input_size, self.input_size))
+
+        image = image.astype(np.float32) / 255.0
+        image = (image - np.array([0.485, 0.456, 0.406])) / np.array(
+            [0.229, 0.224, 0.225]
+        )
+
+        tensor = torch.from_numpy(image.transpose(2, 0, 1)).float().unsqueeze(0)
+
+        return tensor.to(self.device), original_size
+
+    def _postprocess(
+        self, output: torch.Tensor, original_size: Tuple[int, int]
+    ) -> np.ndarray:
+        """
+        Postprocesa la salida del modelo.
+
+        Args:
+            output: Tensor de salida del modelo
+            original_size: (H, W) tamaño original
+
+        Returns:
+            Máscara de probabilidad [0-1] en tamaño original
+        """
+        mask = output[0].squeeze().cpu().numpy()
+
+        mask = (mask - mask.min()) / (mask.max() - mask.min() + 1e-8)
+
+        mask = cv2.resize(mask, (original_size[1], original_size[0]))
+
+        return mask
+
+    @torch.no_grad()
+    def get_saliency_map(self, image: np.ndarray) -> np.ndarray:
+        """
+        Obtiene mapa de probabilidad de saliencia [0-1] en tamaño original.
+
+        Args:
+            image: Imagen BGR o grayscale (numpy array)
+
+        Returns:
+            Mapa de probabilidad float32 [0-1], shape = imagen original
+        """
+        if self.model is None:
+            raise RuntimeError("Modelo no cargado")
+
+        tensor, original_size = self._preprocess(image)
+        outputs = self.model(tensor)
+        mask = self._postprocess(outputs, original_size)
+
+        return mask.astype(np.float32)
+
+    @torch.no_grad()
+    def get_binary_mask(
+        self, image: np.ndarray, threshold: float = 0.5
+    ) -> np.ndarray:
+        """
+        Obtiene máscara binaria (0/255) de objetos salientes.
+
+        Args:
+            image: Imagen BGR o grayscale
+            threshold: Umbral de binarización [0-1]
+
+        Returns:
+            Máscara binaria uint8 (0 o 255)
+        """
+        prob_mask = self.get_saliency_map(image)
+        return (prob_mask > threshold).astype(np.uint8) * 255
+
+    def is_ready(self) -> bool:
+        return self.model is not None
+
+    def get_device(self) -> str:
+        return str(self.device)

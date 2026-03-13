@@ -1,0 +1,206 @@
+model:
+  backbone: dinov2_vits14
+  embedding_dim: 128
+  pretrained: true
+  use_attention: false
+  freeze_backbone: false
+  projection_head:
+    hidden_dims:
+    - 512
+    - 256
+    use_batch_norm: true
+    dropout: 0.1
+data:
+  train_dir: data/processed/train
+  val_dir: data/processed/val
+  test_dir: data/processed/test
+  annotation_root: data/annotations
+  classes_per_batch: 7
+  samples_per_class: 14
+  batch_size: 98
+  num_workers: 8
+  pin_memory: true
+  drop_last: true
+  image_size: 252
+  resize_size: 252
+augmentation:
+  random_horizontal_flip: 0.5
+  random_vertical_flip: 0.5
+  random_rotation: 180
+  random_crop: true
+  color_jitter:
+    brightness: 0.3
+    contrast: 0.3
+    saturation: 0.2
+    hue: 0.2
+  microscopy_specific:
+    random_gamma:
+      enabled: true
+      gamma_limit:
+      - 80
+      - 120
+      p: 0.5
+    gaussian_noise:
+      enabled: true
+      var_limit:
+      - 10.0
+      - 50.0
+      p: 0.5
+    blur:
+      enabled: true
+      blur_limit: 3
+      p: 0.3
+    optical_distortion:
+      enabled: true
+      distort_limit: 0.1
+      p: 0.3
+    clahe:
+      enabled: true
+      clip_limit: 2.0
+      tile_grid_size:
+      - 8
+      - 8
+      p: 0.5
+  domain_augmentation:
+    enabled: true
+    brightness_contrast_limit: 0.4
+    rgb_shift_limit: 25
+    tone_curve_scale: 0.2
+    downscale_min: 0.5
+    coarse_dropout_holes: 4
+  normalize:
+    mean:
+    - 0.485
+    - 0.456
+    - 0.406
+    std:
+    - 0.229
+    - 0.224
+    - 0.225
+training:
+  epochs: 25
+  warmup_epochs: 3
+  loss:
+    type: arcface
+    params:
+      margin: 0.5
+      scale: 64
+  validation_metric: recall_at_1
+  mining:
+    enabled: true
+    type: semihard
+    margin: 0.2
+  hard_mining:
+    enabled: true
+    ratio: 0.3
+    min_samples: 32
+    warmup_epochs: 0
+    adaptive: false
+  optimizer: adamw
+  learning_rate: 0.00015
+  weight_decay: 0.0009
+  backbone_lr_factor: 0.2
+  scheduler: cosine
+  scheduler_params:
+    T_max: 50
+    eta_min: 1.0e-06
+  gradient_clip_norm: 5.0
+  early_stopping:
+    enabled: true
+    patience: 10
+    min_delta: 0.001
+    restore_best_weights: true
+  save_every_n_epochs: 15
+  save_best_only: true
+sota:
+  nir:
+    enabled: false
+    lambda: 0.5
+    eps: 0.0001
+  hier:
+    enabled: false
+    lambda: 0.1
+    num_levels: 3
+    temperature: 0.1
+  dada:
+    enabled: false
+    lambda: 0.1
+    kernel_bandwidth: 1.0
+  self_distillation:
+    enabled: false
+    ema_alpha: 0.999
+    temperature: 0.1
+    lambda: 0.5
+  embedding_space: euclidean
+  hyperbolic_curvature: 1.0
+  augmentation_mode: full
+grain_detection:
+  enabled: true
+  model_type: u2netp
+  input_size: 320
+  saliency_threshold: 0.3
+  adaptive_k: 0.3
+  min_area: 1000
+  max_area: 120000
+  morph_kernel_size: 3
+  min_circularity: 0.3
+  crop_padding: 0.2
+  crop_size: 252
+  use_mask: true
+  masked_pooling: false
+  distance_threshold: 0.7
+  dataset_mode: grain
+inference:
+  index_type: flat
+  metric_type: inner_product
+  k_neighbors: 5
+  use_gpu: true
+  batch_queries: true
+  ivf_nlist: 1024
+  ivf_nprobe: 32
+  pq_m: 16
+  pq_nbits: 8
+  use_tta: false
+  tta_augmentations: 5
+  use_gradcam: false
+  similarity_threshold: 0.6
+  confidence_threshold: 0.7
+  inference_batch_size: 64
+  device: cuda
+logging:
+  tensorboard:
+    enabled: true
+    log_dir: runs
+  wandb:
+    enabled: false
+    project: metric-learning
+    entity: null
+  log_level: INFO
+  log_interval: 10
+paths:
+  model_save_dir: models
+  checkpoint_dir: models/checkpoints
+  log_dir: logs
+  experiment_dir: experiments
+hardware:
+  use_gpu: true
+  gpu_ids:
+  - 0
+  use_amp: true
+  distributed: false
+  world_size: 1
+  faiss_gpu: true
+evaluation:
+  compute_precision_at_k:
+  - 1
+  - 5
+  - 10
+  compute_map: true
+  compute_nmi: true
+  visualize_embeddings: true
+  embedding_visualization_method: tsne
+  eval_every_n_epochs: 1
+reproducibility:
+  seed: 42
+  deterministic: false
+  benchmark: true

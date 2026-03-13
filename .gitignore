@@ -1,0 +1,117 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+.env
+
+# PyTorch
+*.pth
+*.pt
+*.ckpt
+checkpoints/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_checkpoints/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+logs/
+*.log
+tensorboard/
+wandb/
+runs/
+
+# Data (EXCLUIR TODO - datos personales)
+data/
+*.jpg
+*.jpeg
+*.png
+*.tiff
+*.bmp
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.zip
+
+# FAISS Indices
+*.faiss
+*.index
+
+# Experiments y Resultados (EXCLUIR)
+experiments/
+runs/
+reports/
+!experiments/.gitkeep
+
+# Models (EXCLUIR TODOS - muy pesados)
+models/
+*.pth
+*.pt
+*.onnx
+!models/.gitkeep
+
+# Cache
+.cache/
+*.cache
+
+# Coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Documentación técnica detallada (EXCLUIR - solo README público)
+docs/*
+!docs/.gitkeep
+
+# Archivos de workspace personales
+*.code-workspace
+
+# Backups de configuración
+*.backup
+
+# Resultados de tests e imágenes de prueba
+test_*.png
+test_*.jpg
