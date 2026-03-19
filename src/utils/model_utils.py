@@ -36,12 +36,13 @@ def load_model_from_checkpoint(
         >>> model = load_model_from_checkpoint('models/final_model.pth', config, device)
     """
     from src.models.analogy_net import AnalogyNet
+    from src.utils.config_utils import get_backbone_name
     
     logger.info(f"Loading model from {checkpoint_path}")
     
-    # Crear modelo
+    # Crear modelo (con compatibilidad hacia atrás)
     model = AnalogyNet(
-        backbone=config['model']['backbone'],
+        backbone=get_backbone_name(config),
         embedding_dim=config['model']['embedding_dim'],
         pretrained=False,
         projection_head_config=config['model'].get('projection_head'),

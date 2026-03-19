@@ -684,12 +684,12 @@ class MetricLearningTrainer:
     
     def validate(self) -> Tuple[float, Dict]:
         """
-        Validate the model. Computes loss and Recall@K metrics.
+        Validate the model. Computes loss and SOTA metrics.
         
         Returns:
-            Tuple of (avg_loss, metrics_dict) where metrics_dict contains R@1, R@5, NMI
+            Tuple of (avg_loss, metrics_dict) with R@1, R@5, mAP@R, NMI, F1-macro
         """
-        from src.utils.metrics_utils import compute_recall_at_k
+        from src.utils.metrics_utils import compute_all_metrics
         
         self.model.eval()
         total_loss = 0
@@ -734,7 +734,15 @@ class MetricLearningTrainer:
         
         embeddings_np = np.vstack(all_embeddings)
         labels_np = np.concatenate(all_labels)
-        recall_metrics = compute_recall_at_k(embeddings_np, labels_np, k_list=[1, 5])
+        
+        # Compute ALL SOTA metrics (CVPR 2016-2024)
+        class_names = getattr(self.val_loader.dataset, 'classes', None)
+        sota_metrics = compute_all_metrics(
+            embeddings_np, 
+            labels_np, 
+            k_list=[1, 5, 10],
+            class_names=class_names
+        )
         
         # Embedding diagnostics
         norms = np.linalg.norm(embeddings_np, axis=1)
@@ -745,7 +753,12 @@ class MetricLearningTrainer:
         
         metrics = {
             'val_loss': avg_loss,
-            **recall_metrics
+            'R@1': sota_metrics.get('R@1', 0.0),
+            'R@5': sota_metrics.get('R@5', 0.0),
+            'R@10': sota_metrics.get('R@10', 0.0),
+            'mAP@R': sota_metrics.get('mAP@R', 0.0),
+            'NMI': sota_metrics.get('NMI', 0.0),
+            'F1_macro': sota_metrics.get('F1_macro', 0.0)
         }
         
         return avg_loss, metrics
@@ -856,7 +869,9 @@ class MetricLearningTrainer:
         with open(self.metrics_csv_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow([
-                'epoch', 'train_loss', 'val_loss', 'recall_at_1', 'recall_at_5',
+                'epoch', 'train_loss', 'val_loss', 
+                'recall_at_1', 'recall_at_5', 'recall_at_10',
+                'mAP@R', 'NMI', 'F1_macro',
                 'learning_rate', 'is_best', 'best_recall_at_1', 'epoch_time_sec'
             ])
         self.logger.info(f"Metrics CSV: {self.metrics_csv_path}")
@@ -894,13 +909,21 @@ class MetricLearningTrainer:
             
             recall_at_1 = val_metrics.get('R@1', 0.0)
             recall_at_5 = val_metrics.get('R@5', 0.0)
+            recall_at_10 = val_metrics.get('R@10', 0.0)
+            map_at_r = val_metrics.get('mAP@R', 0.0)
+            nmi = val_metrics.get('NMI', 0.0)
+            f1_macro = val_metrics.get('F1_macro', 0.0)
             
-            # Log metrics
-            self.logger.info(f"\n--- Metrics ---")
+            # Log SOTA metrics
+            self.logger.info(f"\n--- SOTA Metrics (CVPR 2016-2024) ---")
             self.logger.info(f"  Train Loss: {train_loss:.4f}")
             self.logger.info(f"  Val Loss:   {val_loss:.4f}")
             self.logger.info(f"  R@1:        {recall_at_1:.4f}")
             self.logger.info(f"  R@5:        {recall_at_5:.4f}")
+            self.logger.info(f"  R@10:       {recall_at_10:.4f}")
+            self.logger.info(f"  mAP@R:      {map_at_r:.4f}")
+            self.logger.info(f"  NMI:        {nmi:.4f}")
+            self.logger.info(f"  F1-Macro:   {f1_macro:.4f}")
             self.logger.info(f"  LR:         {current_lr:.2e}")
             
             # Determine if this is the best model
@@ -928,7 +951,8 @@ class MetricLearningTrainer:
                 writer = csv.writer(f)
                 writer.writerow([
                     epoch + 1, f'{train_loss:.6f}', f'{val_loss:.6f}',
-                    f'{recall_at_1:.6f}', f'{recall_at_5:.6f}',
+                    f'{recall_at_1:.6f}', f'{recall_at_5:.6f}', f'{recall_at_10:.6f}',
+                    f'{map_at_r:.6f}', f'{nmi:.6f}', f'{f1_macro:.6f}',
                     f'{current_lr:.2e}', is_best, f'{self.best_recall_at_1:.6f}',
                     f'{epoch_time:.1f}'
                 ])

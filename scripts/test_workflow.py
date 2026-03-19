@@ -20,6 +20,7 @@ from src.utils.config_utils import load_config, get_transforms_from_config, get_
 from src.utils.inference_utils import get_single_embedding
 from src.inference.knn_classifier import KNNClassifier
 from src.models.analogy_net import AnalogyNet
+from src.utils.config_utils import get_backbone_name
 
 
 def test_logging_system():
@@ -86,7 +87,7 @@ def test_model_creation(logger, config, device):
     
     try:
         model = AnalogyNet(
-            backbone=config['model']['backbone'],
+            backbone=get_backbone_name(config),
             embedding_dim=config['model']['embedding_dim'],
             pretrained=False,
             projection_head_config=config['model'].get('projection_head'),

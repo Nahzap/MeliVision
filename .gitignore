@@ -10,7 +10,6 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
 lib64/
 parts/
 sdist/
@@ -66,6 +65,8 @@ data/
 *.h5
 *.hdf5
 *.zip
+# Pero permitir código fuente en src/data/
+!src/data/
 
 # FAISS Indices
 *.faiss
@@ -83,6 +84,8 @@ models/
 *.pt
 *.onnx
 !models/.gitkeep
+# Pero permitir código fuente en src/models/
+!src/models/
 
 # Cache
 .cache/

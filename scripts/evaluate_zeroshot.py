@@ -14,7 +14,7 @@ import numpy as np
 from src.models.analogy_net import AnalogyNet
 from src.data.dataset import MielDataset
 from src.utils.model_utils import load_model_from_checkpoint
-from src.utils.config_utils import load_config, get_transforms_from_config
+from src.utils.config_utils import load_config, get_backbone_name, get_transforms_from_config
 from src.utils.zero_shot_eval import evaluate_zero_shot_protocol, compare_standard_vs_zeroshot
 from src.utils.academic_report import AcademicReportGenerator
 
@@ -96,7 +96,7 @@ def main():
         }
         
         model_info = {
-            'backbone': config['model']['backbone'],
+            'backbone': get_backbone_name(config),
             'embedding_dim': config['model']['embedding_dim'],
             'loss': config['training']['loss_function'],
             'projection': config['model'].get('projection_head', 'MLP')

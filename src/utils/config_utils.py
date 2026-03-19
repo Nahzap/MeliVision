@@ -90,6 +90,25 @@ def merge_configs(*configs: Dict) -> Dict:
     return merged
 
 
+def get_backbone_name(config: Dict) -> str:
+    """
+    Obtiene nombre del backbone con compatibilidad hacia atrás.
+    
+    Args:
+        config: Configuración completa
+        
+    Returns:
+        Nombre del backbone
+        
+    Example:
+        >>> config = load_config()
+        >>> backbone = get_backbone_name(config)
+        >>> print(backbone)  # 'dinov2_vits14'
+    """
+    # Compatibilidad hacia atrás: backbone_name (nuevo) o backbone (legacy)
+    return config['model'].get('backbone_name', config['model'].get('backbone', 'dinov2_vits14'))
+
+
 def get_device_from_config(config: Dict) -> str:
     """
     Obtiene dispositivo desde configuración.
@@ -129,8 +148,12 @@ def validate_config(config: Dict) -> bool:
         if key not in config:
             raise ValueError(f"Missing required config key: {key}")
     
-    if 'backbone' not in config['model']:
-        raise ValueError("Missing 'backbone' in model config")
+    # Validar sección model
+    if 'model' not in config:
+        raise ValueError("Falta sección 'model' en config")
+    # Aceptar backbone_name (nuevo) o backbone (legacy)
+    if 'backbone_name' not in config['model'] and 'backbone' not in config['model']:
+        raise ValueError("Falta 'model.backbone_name' o 'model.backbone' en config")
     
     if 'embedding_dim' not in config['model']:
         raise ValueError("Missing 'embedding_dim' in model config")

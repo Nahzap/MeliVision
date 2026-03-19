@@ -149,6 +149,9 @@ class AnalogyNet(nn.Module):
         'dinov2_vitb14': 768,
         'dinov2_vits14_reg': 384,
         'dinov2_vitb14_reg': 768,
+        'deit_small_patch16_224': 384,
+        'efficientnet_b4': 1792,
+        'swin_tiny_patch4_window7_224': 768,
     }
     
     def __init__(self, backbone='resnet18', embedding_dim=128, pretrained=True,
@@ -223,6 +226,39 @@ class AnalogyNet(nn.Module):
                 )
             except Exception:
                 raise ValueError("ConvNeXt V2 Tiny requires timm >= 0.9.0: pip install timm>=0.9.0")
+        elif backbone == 'deit_small_patch16_224':
+            # DeiT-S: Vision Transformer supervisado (Touvron et al. ICML 2021)
+            try:
+                import timm
+                model = timm.create_model(
+                    'deit_small_patch16_224.fb_in1k',
+                    pretrained=pretrained,
+                    num_classes=0  # Remove classification head
+                )
+            except ImportError:
+                raise ValueError("DeiT requires timm >= 0.9.0: pip install timm>=0.9.0")
+        elif backbone == 'efficientnet_b4':
+            # EfficientNet-B4: CNN eficiente (Tan & Le, ICML 2019)
+            try:
+                import timm
+                model = timm.create_model(
+                    'efficientnet_b4.ra2_in1k',
+                    pretrained=pretrained,
+                    num_classes=0
+                )
+            except ImportError:
+                raise ValueError("EfficientNet requires timm >= 0.9.0: pip install timm>=0.9.0")
+        elif backbone == 'swin_tiny_patch4_window7_224':
+            # Swin Transformer Tiny: ViT jerárquico (Liu et al. ICCV 2021)
+            try:
+                import timm
+                model = timm.create_model(
+                    'swin_tiny_patch4_window7_224.ms_in22k_ft_in1k',
+                    pretrained=pretrained,
+                    num_classes=0
+                )
+            except ImportError:
+                raise ValueError("Swin Transformer requires timm >= 0.9.0: pip install timm>=0.9.0")
         elif backbone.startswith('dinov2_'):
             # Map our backbone names to torch.hub model names
             hub_name_map = {
@@ -245,8 +281,36 @@ class AnalogyNet(nn.Module):
         else:
             raise ValueError(f"Backbone '{backbone}' no soportado.")
         
+        # Obtener num_features dinámicamente si está disponible
+        num_features = self._get_num_features(backbone, model)
         logger.info(f"Backbone '{backbone}' loaded: {num_features} features")
         return model, num_features
+    
+    def _get_num_features(self, backbone_name, backbone_module):
+        """
+        Obtiene el número de features del backbone dinámicamente.
+        
+        Args:
+            backbone_name: Nombre del backbone
+            backbone_module: Módulo del backbone ya instanciado
+            
+        Returns:
+            int: Número de features de salida
+        """
+        # Para modelos timm, usar atributo num_features si existe
+        if hasattr(backbone_module, 'num_features'):
+            return backbone_module.num_features
+        
+        # Para DINOv2 y otros sin num_features, usar dict estático
+        if backbone_name in self.BACKBONE_FEATURES:
+            return self.BACKBONE_FEATURES[backbone_name]
+        
+        # Fallback: intentar inferir del último módulo
+        logger.warning(
+            f"Could not detect num_features for '{backbone_name}'. "
+            f"Using static value from BACKBONE_FEATURES."
+        )
+        return self.BACKBONE_FEATURES.get(backbone_name, 512)
     
     def _build_projection_head(self, num_features, embedding_dim, config):
         """

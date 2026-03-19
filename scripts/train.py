@@ -24,6 +24,7 @@ from src.models.analogy_net import AnalogyNet
 from src.data.dataset import MielDataset
 from src.data.transforms_enhanced import get_train_transforms, get_val_transforms
 from src.training.trainer_enhanced import MetricLearningTrainer
+from src.utils.config_utils import get_backbone_name
 
 
 def setup_logging(log_dir: str = 'logs', log_level: str = 'INFO'):
@@ -67,10 +68,11 @@ def create_dataloaders(config: dict):
     # Merge data and augmentation config for transforms
     transform_config = {**aug_config, **data_config}
     
-    # Create transforms (support DeiT III 3-Augment mode)
+    # Create transforms (support DeiT III 3-Augment mode + dynamic resolution per backbone)
     aug_mode = config.get('sota', {}).get('augmentation_mode', 'full')
-    train_transforms = get_train_transforms(transform_config, mode=aug_mode)
-    val_transforms = get_val_transforms(transform_config)
+    backbone_name = get_backbone_name(config)
+    train_transforms = get_train_transforms(transform_config, mode=aug_mode, backbone_name=backbone_name)
+    val_transforms = get_val_transforms(transform_config, backbone_name=backbone_name)
     
     # num_workers > 0 enables parallel data loading in background processes,
     # keeping the GPU fed while the next batch is prepared.
@@ -217,7 +219,7 @@ def create_model(config: dict) -> AnalogyNet:
     
     sota_config = config.get('sota', {})
     model = AnalogyNet(
-        backbone=model_config['backbone'],
+        backbone=get_backbone_name(config),
         embedding_dim=model_config['embedding_dim'],
         pretrained=model_config['pretrained'],
         projection_head_config=model_config.get('projection_head'),
@@ -227,7 +229,7 @@ def create_model(config: dict) -> AnalogyNet:
         hyperbolic_curvature=sota_config.get('hyperbolic_curvature', 1.0)
     )
     
-    logger.info(f"Model created: {model_config['backbone']}")
+    logger.info(f"Model created: {get_backbone_name(config)}")
     logger.info(f"Embedding dimension: {model_config['embedding_dim']}")
     logger.info(f"Pretrained: {model_config['pretrained']}")
     
@@ -479,7 +481,7 @@ def estimate_training_time(config: dict, train_loader, val_loader, model, logger
         'val_samples': len(val_loader.dataset),
         'num_classes': len(train_loader.dataset.classes),
         'class_names': train_loader.dataset.classes,
-        'model_backbone': config['model']['backbone'],
+        'model_backbone': get_backbone_name(config),
         'embedding_dim': config['model']['embedding_dim'],
         'loss_type': loss_type,
         'optimizer': config['training']['optimizer'],
@@ -553,7 +555,7 @@ def run_training(args, estimate_only: bool = False, run_dir: str = None):
     model_cfg = config['model']
     train_cfg = config['training']
     logger.info("--- CONFIG DUMP ---")
-    logger.info(f"  Model: {model_cfg['backbone']}, emb_dim={model_cfg['embedding_dim']}, pretrained={model_cfg['pretrained']}")
+    logger.info(f"  Model: {get_backbone_name(config)}, emb_dim={model_cfg['embedding_dim']}, pretrained={model_cfg['pretrained']}")
     logger.info(f"  Projection: {model_cfg.get('projection_head', {}).get('hidden_dims', [])}, dropout={model_cfg.get('projection_head', {}).get('dropout', 0)}")
     logger.info(f"  Data: image_size={data_cfg.get('image_size')}, resize={data_cfg.get('resize_size')}, batch={data_cfg['batch_size']}, workers={data_cfg.get('num_workers', 4)}")
     logger.info(f"  Grain: mode={grain_cfg.get('dataset_mode')}, crop_size={grain_cfg.get('crop_size')}, use_mask={grain_cfg.get('use_mask')}, masked_pooling={grain_cfg.get('masked_pooling')}")

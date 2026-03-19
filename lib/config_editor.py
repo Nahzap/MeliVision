@@ -18,10 +18,110 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox,
     QLineEdit, QSpinBox, QDoubleSpinBox, QCheckBox, QComboBox,
     QPushButton, QScrollArea, QLabel, QMessageBox, QFileDialog,
-    QTabWidget, QTextEdit
+    QTabWidget, QTextEdit, QDialog, QDialogButtonBox
 )
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QFont, QColor, QPalette
+
+# Import para auto-configuración de backbones
+from src.data.transforms_enhanced import get_input_size_for_backbone
+
+
+class ConfigChangesDialog(QDialog):
+    """
+    Diálogo para mostrar cambios automáticos aplicados al cambiar backbone.
+    Permite al usuario ver y copiar los cambios realizados.
+    """
+    def __init__(self, changes, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Información - Cambios Aplicados")
+        self.setModal(False)  # No modal para poder seguir trabajando
+        self.setMinimumWidth(500)
+        self.setMinimumHeight(300)
+        
+        layout = QVBoxLayout()
+        
+        # Header
+        header = QLabel("✅ Configuración Actualizada Automáticamente")
+        header.setStyleSheet("""
+            QLabel {
+                font-size: 12pt;
+                font-weight: bold;
+                color: #0e639c;
+                padding: 10px;
+                background-color: #e8f4f8;
+                border-radius: 5px;
+            }
+        """)
+        layout.addWidget(header)
+        
+        # Descripción
+        desc = QLabel("Los siguientes parámetros se actualizaron según las características del backbone seleccionado:")
+        desc.setWordWrap(True)
+        desc.setStyleSheet("padding: 10px; color: #666;")
+        layout.addWidget(desc)
+        
+        # Lista de cambios
+        self.changes_text = QTextEdit()
+        self.changes_text.setReadOnly(True)
+        self.changes_text.setStyleSheet("""
+            QTextEdit {
+                background-color: #f9f9f9;
+                border: 1px solid #cccccc;
+                border-radius: 3px;
+                padding: 8px;
+                font-family: 'Courier New', monospace;
+                font-size: 10pt;
+            }
+        """)
+        
+        # Formatear cambios
+        changes_html = "<table cellpadding='5' style='width: 100%;'>"
+        changes_html += "<tr style='background-color: #e0e0e0; font-weight: bold;'>"
+        changes_html += "<td>Parámetro</td><td>Valor Anterior</td><td>→</td><td>Nuevo Valor</td></tr>"
+        
+        for param, old_val, new_val in changes:
+            changes_html += f"<tr>"
+            changes_html += f"<td style='color: #0e639c;'><b>{param}</b></td>"
+            changes_html += f"<td style='color: #888;'>{old_val}</td>"
+            changes_html += f"<td>→</td>"
+            changes_html += f"<td style='color: #4ec9b0; font-weight: bold;'>{new_val}</td>"
+            changes_html += "</tr>"
+        
+        changes_html += "</table>"
+        self.changes_text.setHtml(changes_html)
+        layout.addWidget(self.changes_text)
+        
+        # Nota informativa
+        note = QLabel("💡 Estos cambios se aplicaron automáticamente pero AÚN NO se han guardado en config.yaml")
+        note.setWordWrap(True)
+        note.setStyleSheet("""
+            QLabel {
+                background-color: #fff4e6;
+                border: 1px solid #ffa94d;
+                border-radius: 3px;
+                padding: 8px;
+                color: #d9480f;
+            }
+        """)
+        layout.addWidget(note)
+        
+        # Botones
+        button_box = QDialogButtonBox()
+        copy_btn = button_box.addButton("📋 Copiar", QDialogButtonBox.ActionRole)
+        copy_btn.clicked.connect(self.copy_to_clipboard)
+        close_btn = button_box.addButton("Cerrar", QDialogButtonBox.AcceptRole)
+        close_btn.clicked.connect(self.accept)
+        
+        layout.addWidget(button_box)
+        self.setLayout(layout)
+    
+    def copy_to_clipboard(self):
+        """Copia los cambios al portapapeles"""
+        from PyQt5.QtWidgets import QApplication
+        text = self.changes_text.toPlainText()
+        QApplication.clipboard().setText(text)
+        QMessageBox.information(self, "Copiado", "Cambios copiados al portapapeles")
 
 
 class ConfigField(QWidget):
@@ -355,17 +455,43 @@ class ConfigEditorTab(QWidget):
         tab = QWidget()
         layout = QVBoxLayout()
         
+        # Experiment group (nuevo: tracking y metadata)
+        exp_group = QGroupBox("Experimento")
+        exp_layout = QFormLayout()
+        
+        self.fields['experiment.name'] = StringField(
+            "Name",
+            default="dinov2_vits14_baseline",
+            tooltip="Nombre del experimento para tracking",
+            placeholder="nombre_modelo_baseline"
+        )
+        exp_layout.addRow("Name:", self.fields['experiment.name'].widget)
+        
+        self.fields['experiment.description'] = StringField(
+            "Description",
+            default="Baseline experiment",
+            tooltip="Descripción breve del experimento",
+            placeholder="Descripción del modelo y configuración"
+        )
+        exp_layout.addRow("Description:", self.fields['experiment.description'].widget)
+        
+        exp_group.setLayout(exp_layout)
+        layout.addWidget(exp_group)
+        
         # Model group
         model_group = QGroupBox("Arquitectura del Modelo")
         model_layout = QFormLayout()
         
-        self.fields['model.backbone'] = ChoiceField(
+        self.fields['model.backbone_name'] = ChoiceField(
             "Backbone",
-            ['resnet18', 'resnet50', 'convnext_v2_tiny',
-             'dinov2_vits14', 'dinov2_vitb14', 'dinov2_vits14_reg', 'dinov2_vitb14_reg'],
+            ['dinov2_vits14', 'dinov2_vitb14', 'resnet50', 'convnext_v2_tiny',
+             'deit_small_patch16_224', 'efficientnet_b4', 'swin_tiny_patch4_window7_224',
+             'resnet18', 'dinov2_vits14_reg', 'dinov2_vitb14_reg'],
             tooltip="Arquitectura base del modelo (DINOv2 recomendado para fine-grained)"
         )
-        model_layout.addRow("Backbone:", self.fields['model.backbone'].widget)
+        # Conectar cambio de backbone a auto-configuración
+        self.fields['model.backbone_name'].widget.currentTextChanged.connect(self.on_backbone_changed)
+        model_layout.addRow("Backbone:", self.fields['model.backbone_name'].widget)
         
         self.fields['model.embedding_dim'] = IntField(
             "Embedding Dim",
@@ -1099,14 +1225,99 @@ class ConfigEditorTab(QWidget):
         return all_valid
     
     def reset_to_defaults(self):
-        """Restaura valores originales"""
+        """Restaura valores por defecto"""
         reply = QMessageBox.question(
             self,
-            "Confirmar Restauración",
-            "¿Restaurar todos los valores desde el archivo?\n\nSe perderán los cambios no guardados.",
+            "Confirmar Reset",
+            "¿Restaurar todos los valores a sus valores por defecto?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
         
         if reply == QMessageBox.Yes:
             self.load_config()
+    
+    def on_backbone_changed(self, backbone_name):
+        """
+        Auto-configura parámetros al cambiar el backbone.
+        Actualiza resolución, batch_size si es necesario, y otros parámetros.
+        """
+        if not backbone_name:
+            return
+        
+        changes = []  # Lista de (parámetro, valor_anterior, valor_nuevo)
+        
+        try:
+            # 1. Obtener resolución óptima para el backbone
+            resolved_size = get_input_size_for_backbone(backbone_name)
+            
+            # 2. Actualizar data.image_size
+            if 'data.image_size' in self.fields:
+                old_size = self.fields['data.image_size'].get_value()
+                if old_size != resolved_size:
+                    self.fields['data.image_size'].set_value(resolved_size)
+                    changes.append(('data.image_size', old_size, resolved_size))
+            
+            # 3. Actualizar augmentation.image_size si existe
+            if 'augmentation.image_size' in self.fields:
+                old_aug_size = self.fields['augmentation.image_size'].get_value()
+                if old_aug_size != resolved_size:
+                    self.fields['augmentation.image_size'].set_value(resolved_size)
+                    changes.append(('augmentation.image_size', old_aug_size, resolved_size))
+            
+            # 4. Ajustar batch_size para modelos grandes
+            if backbone_name in ['efficientnet_b4', 'dinov2_vitb14', 'dinov2_vitb14_reg']:
+                if 'data.batch_size' in self.fields:
+                    old_batch = self.fields['data.batch_size'].get_value()
+                    recommended_batch = 64 if backbone_name == 'efficientnet_b4' else 96
+                    if old_batch > recommended_batch:
+                        self.fields['data.batch_size'].set_value(recommended_batch)
+                        changes.append(('data.batch_size', old_batch, f'{recommended_batch} (reducido por VRAM)'))
+            
+            # 5. Actualizar experiment.name si existe
+            if 'experiment.name' in self.fields:
+                old_exp_name = self.fields['experiment.name'].get_value()
+                # Generar nombre sugerido: backbone + baseline
+                suggested_name = f"{backbone_name}_baseline"
+                if old_exp_name != suggested_name:
+                    self.fields['experiment.name'].set_value(suggested_name)
+                    changes.append(('experiment.name', old_exp_name, suggested_name))
+            
+            # 6. Actualizar experiment.description si existe
+            if 'experiment.description' in self.fields:
+                backbone_descriptions = {
+                    'dinov2_vits14': 'DINOv2 ViT-S/14 baseline with ArcFace',
+                    'dinov2_vitb14': 'DINOv2 ViT-B/14 baseline with ArcFace',
+                    'resnet50': 'ResNet-50 baseline (CNN clásico)',
+                    'convnext_v2_tiny': 'ConvNeXt V2 Tiny baseline (CNN moderno)',
+                    'deit_small_patch16_224': 'DeiT-S baseline (ViT supervisado)',
+                    'efficientnet_b4': 'EfficientNet-B4 baseline (CNN eficiente)',
+                    'swin_tiny_patch4_window7_224': 'Swin Transformer Tiny baseline',
+                }
+                if backbone_name in backbone_descriptions:
+                    old_desc = self.fields['experiment.description'].get_value()
+                    new_desc = backbone_descriptions[backbone_name]
+                    if old_desc != new_desc:
+                        self.fields['experiment.description'].set_value(new_desc)
+                        changes.append(('experiment.description', old_desc, new_desc))
+            
+            # Mostrar diálogo con cambios si hubo alguno
+            if changes:
+                dialog = ConfigChangesDialog(changes, self)
+                dialog.show()
+                
+                # Log en la aplicación principal
+                if self.parent_window and hasattr(self.parent_window, 'log_widget'):
+                    self.parent_window.log_widget.append_log(
+                        f"Auto-configuración aplicada para '{backbone_name}': {len(changes)} parámetros actualizados",
+                        "SUCCESS"
+                    )
+                
+                self.status_label.setText(f"✅ Auto-configurado para {backbone_name} ({len(changes)} cambios)")
+                self.status_label.setStyleSheet("color: #4ec9b0; padding: 5px;")
+            
+        except Exception as e:
+            error_msg = f"Error en auto-configuración: {str(e)}"
+            QMessageBox.warning(self, "Error", error_msg)
+            if self.parent_window and hasattr(self.parent_window, 'log_widget'):
+                self.parent_window.log_widget.append_log(error_msg, "ERROR")

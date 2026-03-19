@@ -20,7 +20,7 @@ import logging
 from src.models.analogy_net import AnalogyNet
 from src.data.dataset import MielDataset
 from src.utils.model_utils import load_model_from_checkpoint
-from src.utils.config_utils import load_config, get_transforms_from_config
+from src.utils.config_utils import load_config, get_transforms_from_config, get_backbone_name
 from src.utils.inference_utils import extract_embeddings
 from src.utils.metrics_utils import compute_confusion_matrix, compute_all_metrics
 from src.utils.academic_report import AcademicReportGenerator
@@ -313,7 +313,7 @@ def main():
     }
     
     model_info = {
-        'backbone': config['model']['backbone'],
+        'backbone': get_backbone_name(config),
         'embedding_dim': config['model']['embedding_dim'],
         'loss': config['training']['loss_function'],
         'projection': config['model'].get('projection_head', 'MLP')

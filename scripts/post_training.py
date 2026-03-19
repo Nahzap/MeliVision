@@ -991,7 +991,7 @@ def generate_summary_report(csv_path, config, output_path, accuracy=0, per_class
             "",
             f"| Parameter | Value |",
             f"|-----------|-------|",
-            f"| Backbone | {config.get('model', {}).get('backbone', 'N/A')} |",
+            f"| Backbone | {config.get('model', {}).get('backbone_name', config.get('model', {}).get('backbone', 'N/A'))} |",
             f"| Embedding Dim | {config.get('model', {}).get('embedding_dim', 'N/A')} |",
             f"| Loss | {config.get('training', {}).get('loss', {}).get('type', 'N/A')} |",
             f"| Optimizer | {config.get('training', {}).get('optimizer', 'N/A')} |",

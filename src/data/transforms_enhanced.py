@@ -11,6 +11,65 @@ from torchvision import transforms
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import numpy as np
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def get_input_size_for_backbone(backbone_name):
+    """
+    Obtiene la resolución de entrada óptima para cada backbone.
+    
+    Args:
+        backbone_name: Nombre del backbone
+        
+    Returns:
+        int: Tamaño de imagen (asume cuadrada, e.g., 224 → 224×224)
+        
+    Notes:
+        - DINOv2 ViT-S/14: 252×252 (18×14 parches, sin fractales)
+        - DeiT-S: 224×224 (estándar ImageNet, parche 16×16)
+        - ResNet-50: 224×224 (estándar ImageNet)
+        - ConvNeXt-V2 Tiny: 224×224 (timm default)
+        - EfficientNet-B4: 380×380 (compound scaling)
+        - Swin-T: 224×224 (window size 7×7)
+    """
+    # Tabla estática de resoluciones óptimas
+    BACKBONE_RESOLUTIONS = {
+        'resnet18': 224,
+        'resnet50': 224,
+        'convnext_v2_tiny': 224,
+        'dinov2_vits14': 252,
+        'dinov2_vitb14': 252,
+        'dinov2_vits14_reg': 252,
+        'dinov2_vitb14_reg': 252,
+        'deit_small_patch16_224': 224,
+        'efficientnet_b4': 380,
+        'swin_tiny_patch4_window7_224': 224,
+    }
+    
+    if backbone_name in BACKBONE_RESOLUTIONS:
+        return BACKBONE_RESOLUTIONS[backbone_name]
+    
+    # Fallback: intentar consultar timm si está disponible
+    try:
+        import timm
+        from timm.data import resolve_model_data_config
+        
+        # Intentar obtener config del modelo en timm
+        data_config = resolve_model_data_config(pretrained_cfg=None, model=None, 
+                                                  model_name=backbone_name)
+        input_size = data_config.get('input_size', (3, 224, 224))
+        resolution = input_size[1]  # Asume (C, H, W)
+        logger.info(f"Resolved input size for '{backbone_name}' from timm: {resolution}×{resolution}")
+        return resolution
+    except Exception:
+        # Fallback final: 224×224 (estándar ImageNet)
+        logger.warning(
+            f"Could not resolve input size for '{backbone_name}'. "
+            f"Using default 224×224."
+        )
+        return 224
 
 
 class MicroscopyAugmentation:
@@ -200,17 +259,31 @@ class MicroscopyAugmentation:
         return augmented['image']
 
 
-def get_train_transforms(config=None, mode='full'):
+def get_train_transforms(config=None, mode='full', backbone_name=None):
     """
     Get training transforms with microscopy-specific augmentations.
     
     Args:
         config (dict, optional): Configuration dictionary
         mode (str): 'full' for microscopy augmentations, 'deit3' for DeiT III 3-Augment
+        backbone_name (str, optional): Backbone name for dynamic input size resolution
         
     Returns:
         MicroscopyAugmentation or DeiT3Augmentation or transforms.Compose
     """
+    # Si se proporciona backbone_name, ajustar image_size dinámicamente
+    if backbone_name is not None:
+        if config is None:
+            config = {}
+        resolved_size = get_input_size_for_backbone(backbone_name)
+        config['image_size'] = resolved_size
+        # Para resize_size, usar un poco más grande para crop (excepto DINOv2 que usa exacto)
+        if 'dinov2' in backbone_name:
+            config['resize_size'] = resolved_size
+        else:
+            config['resize_size'] = int(resolved_size * 1.14)  # ~256 para 224
+        logger.info(f"Train transforms using dynamic size for '{backbone_name}': {resolved_size}×{resolved_size}")
+    
     if mode == 'deit3':
         return DeiT3Augmentation(config)
     
@@ -221,57 +294,6 @@ def get_train_transforms(config=None, mode='full'):
         # Fallback to torchvision transforms if albumentations not available
         print("Warning: albumentations not available, using basic torchvision transforms")
         return _get_basic_train_transforms(config)
-
-
-def _get_basic_train_transforms(config=None):
-    """
-    Fallback training transforms using torchvision only.
-    
-    Args:
-        config (dict, optional): Configuration dictionary
-        
-    Returns:
-        transforms.Compose: Transform pipeline
-    """
-    if config is None:
-        config = {
-            'resize_size': 256,
-            'image_size': 224,
-            'random_horizontal_flip': 0.5,
-            'random_vertical_flip': 0.5,
-            'random_rotation': 180,
-            'color_jitter': {
-                'brightness': 0.3,
-                'contrast': 0.3,
-                'saturation': 0.2,
-                'hue': 0.1
-            },
-            'normalize': {
-                'mean': [0.485, 0.456, 0.406],
-                'std': [0.229, 0.224, 0.225]
-            }
-        }
-    
-    transform_list = [
-        transforms.Resize((config['resize_size'], config['resize_size'])),
-        transforms.RandomCrop(config['image_size']),
-        transforms.RandomHorizontalFlip(p=config['random_horizontal_flip']),
-        transforms.RandomVerticalFlip(p=config['random_vertical_flip']),
-        transforms.RandomRotation(degrees=config['random_rotation']),
-        transforms.ColorJitter(
-            brightness=config['color_jitter']['brightness'],
-            contrast=config['color_jitter']['contrast'],
-            saturation=config['color_jitter']['saturation'],
-            hue=config['color_jitter']['hue']
-        ),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=config['normalize']['mean'],
-            std=config['normalize']['std']
-        )
-    ]
-    
-    return transforms.Compose(transform_list)
 
 
 class ValidationTransform:
@@ -305,12 +327,13 @@ class ValidationTransform:
         return augmented['image']
 
 
-def get_val_transforms(config=None):
+def get_val_transforms(config=None, backbone_name=None):
     """
     Get validation/test transforms (no augmentation).
     
     Args:
         config (dict, optional): Configuration dictionary
+        backbone_name (str, optional): Backbone name for dynamic input size resolution
         
     Returns:
         ValidationTransform or transforms.Compose: Transform pipeline
@@ -323,6 +346,12 @@ def get_val_transforms(config=None):
                 'std': [0.229, 0.224, 0.225]
             }
         }
+    
+    # Si se proporciona backbone_name, ajustar image_size dinámicamente
+    if backbone_name is not None:
+        resolved_size = get_input_size_for_backbone(backbone_name)
+        config['image_size'] = resolved_size
+        logger.info(f"Val transforms using dynamic size for '{backbone_name}': {resolved_size}×{resolved_size}")
     
     try:
         # Try Albumentations for consistency

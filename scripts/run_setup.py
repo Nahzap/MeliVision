@@ -38,6 +38,8 @@ from pathlib import Path
 from collections import Counter
 from PIL import Image
 
+from src.utils.config_utils import get_backbone_name
+
 logger = logging.getLogger(__name__)
 
 
@@ -382,7 +384,7 @@ def generate_dataset_stats(train_dataset, val_dataset, config: dict, save_path: 
             'learning_rate': config['training']['learning_rate'],
             'loss_type': config['training']['loss']['type'],
             'optimizer': config['training']['optimizer'],
-            'model_backbone': config['model']['backbone'],
+            'model_backbone': get_backbone_name(config),
             'embedding_dim': config['model']['embedding_dim'],
             'use_amp': config['hardware']['use_amp'],
         }

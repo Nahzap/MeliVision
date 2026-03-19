@@ -338,5 +338,93 @@ def test_m10_cbam_gradient_flow():
     assert not torch.isnan(x.grad).any(), "Gradientes con NaN"
 
 
+# ============================================================
+# Tests Fase 2: Nuevos Backbones (DeiT-S, EfficientNet-B4, Swin-T)
+# ============================================================
+
+def test_deit_small_backbone():
+    """Fase 2: DeiT-S debe producir embeddings correctos."""
+    try:
+        model = AnalogyNet(backbone='deit_small_patch16_224', embedding_dim=128, pretrained=False)
+        x = torch.randn(2, 3, 224, 224)
+        out = model(x)
+        assert out.shape == (2, 128), f"Expected (2, 128), got {out.shape}"
+        
+        # Verificar L2 normalization
+        norms = torch.norm(out, p=2, dim=1)
+        assert torch.allclose(norms, torch.ones(2), atol=1e-5), f"Norms: {norms}"
+    except (ImportError, ValueError) as e:
+        pytest.skip(f"DeiT-S not available: {e}")
+
+
+def test_efficientnet_b4_backbone():
+    """Fase 2: EfficientNet-B4 debe producir embeddings correctos."""
+    try:
+        model = AnalogyNet(backbone='efficientnet_b4', embedding_dim=128, pretrained=False)
+        x = torch.randn(2, 3, 380, 380)  # EfficientNet-B4 usa 380x380
+        out = model(x)
+        assert out.shape == (2, 128), f"Expected (2, 128), got {out.shape}"
+        
+        # Verificar L2 normalization
+        norms = torch.norm(out, p=2, dim=1)
+        assert torch.allclose(norms, torch.ones(2), atol=1e-5), f"Norms: {norms}"
+    except (ImportError, ValueError) as e:
+        pytest.skip(f"EfficientNet-B4 not available: {e}")
+
+
+def test_swin_tiny_backbone():
+    """Fase 2: Swin Transformer Tiny debe producir embeddings correctos."""
+    try:
+        model = AnalogyNet(backbone='swin_tiny_patch4_window7_224', embedding_dim=128, pretrained=False)
+        x = torch.randn(2, 3, 224, 224)
+        out = model(x)
+        assert out.shape == (2, 128), f"Expected (2, 128), got {out.shape}"
+        
+        # Verificar L2 normalization
+        norms = torch.norm(out, p=2, dim=1)
+        assert torch.allclose(norms, torch.ones(2), atol=1e-5), f"Norms: {norms}"
+    except (ImportError, ValueError) as e:
+        pytest.skip(f"Swin-T not available: {e}")
+
+
+def test_num_features_dynamic():
+    """Fase 2: _get_num_features debe detectar dinámicamente para modelos timm."""
+    try:
+        model = AnalogyNet(backbone='deit_small_patch16_224', embedding_dim=128, pretrained=False)
+        # DeiT-S debe tener 384 features (igual que DINOv2 ViT-S)
+        assert hasattr(model.backbone, 'num_features'), "timm model debe tener num_features"
+        assert model.backbone.num_features == 384, f"Expected 384, got {model.backbone.num_features}"
+    except (ImportError, ValueError) as e:
+        pytest.skip(f"DeiT-S not available: {e}")
+
+
+def test_all_new_backbones_in_dict():
+    """Fase 2: BACKBONE_FEATURES debe contener todos los nuevos backbones."""
+    expected = ['deit_small_patch16_224', 'efficientnet_b4', 'swin_tiny_patch4_window7_224']
+    for name in expected:
+        assert name in AnalogyNet.BACKBONE_FEATURES, f"'{name}' missing in BACKBONE_FEATURES"
+
+
+def test_freeze_backbone_deit():
+    """Fase 2: freeze_backbone debe funcionar con DeiT-S."""
+    try:
+        model = AnalogyNet(
+            backbone='deit_small_patch16_224', 
+            embedding_dim=128, 
+            pretrained=False,
+            freeze_backbone=True
+        )
+        
+        # Verificar que backbone params están frozen
+        for param in model.backbone.parameters():
+            assert not param.requires_grad, "Backbone params deben estar frozen"
+        
+        # Projection debe ser trainable
+        for param in model.projection.parameters():
+            assert param.requires_grad, "Projection params deben ser trainable"
+    except (ImportError, ValueError) as e:
+        pytest.skip(f"DeiT-S not available: {e}")
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
