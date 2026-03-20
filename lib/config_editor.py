@@ -1265,16 +1265,48 @@ class ConfigEditorTab(QWidget):
                     self.fields['augmentation.image_size'].set_value(resolved_size)
                     changes.append(('augmentation.image_size', old_aug_size, resolved_size))
             
-            # 4. Ajustar batch_size para modelos grandes
-            if backbone_name in ['efficientnet_b4', 'dinov2_vitb14', 'dinov2_vitb14_reg']:
+            # 4. Ajustar samples_per_class según VRAM del modelo
+            # Modelos grandes necesitan menos samples por batch
+            samples_per_class_map = {
+                'efficientnet_b4': 5,          # Modelo grande
+                'dinov2_vitb14': 7,            # Modelo mediano-grande
+                'dinov2_vitb14_reg': 7,        # Modelo mediano-grande
+                'convnext_v2_tiny': 7,         # Modelo mediano
+                'swin_tiny_patch4_window7_224': 7,  # Modelo mediano
+                'dinov2_vits14': 14,           # Modelo pequeño (default)
+                'dinov2_vits14_reg': 14,       # Modelo pequeño
+                'resnet50': 14,                # CNN clásico, eficiente
+                'resnet18': 14,                # CNN pequeño
+                'deit_small_patch16_224': 14,  # ViT pequeño
+            }
+            
+            if 'data.samples_per_class' in self.fields:
+                old_samples = self.fields['data.samples_per_class'].get_value()
+                recommended_samples = samples_per_class_map.get(backbone_name, 14)
+                if old_samples != recommended_samples:
+                    self.fields['data.samples_per_class'].set_value(recommended_samples)
+                    changes.append(('data.samples_per_class', old_samples, recommended_samples))
+            
+            # 5. Recalcular batch_size = classes_per_batch × samples_per_class
+            if 'data.classes_per_batch' in self.fields and 'data.samples_per_class' in self.fields:
+                classes_per_batch = self.fields['data.classes_per_batch'].get_value()
+                samples_per_class = self.fields['data.samples_per_class'].get_value()
+                calculated_batch = classes_per_batch * samples_per_class
+                
                 if 'data.batch_size' in self.fields:
                     old_batch = self.fields['data.batch_size'].get_value()
-                    recommended_batch = 64 if backbone_name == 'efficientnet_b4' else 96
-                    if old_batch > recommended_batch:
-                        self.fields['data.batch_size'].set_value(recommended_batch)
-                        changes.append(('data.batch_size', old_batch, f'{recommended_batch} (reducido por VRAM)'))
+                    if old_batch != calculated_batch:
+                        self.fields['data.batch_size'].set_value(calculated_batch)
+                        changes.append(('data.batch_size', old_batch, f'{calculated_batch} ({classes_per_batch}×{samples_per_class})'))
             
-            # 5. Actualizar experiment.name si existe
+            # 6. Sincronizar grain_detection.crop_size con image_size
+            if 'grain_detection.crop_size' in self.fields:
+                old_crop_size = self.fields['grain_detection.crop_size'].get_value()
+                if old_crop_size != resolved_size:
+                    self.fields['grain_detection.crop_size'].set_value(resolved_size)
+                    changes.append(('grain_detection.crop_size', old_crop_size, resolved_size))
+            
+            # 7. Actualizar experiment.name si existe
             if 'experiment.name' in self.fields:
                 old_exp_name = self.fields['experiment.name'].get_value()
                 # Generar nombre sugerido: backbone + baseline
@@ -1283,7 +1315,7 @@ class ConfigEditorTab(QWidget):
                     self.fields['experiment.name'].set_value(suggested_name)
                     changes.append(('experiment.name', old_exp_name, suggested_name))
             
-            # 6. Actualizar experiment.description si existe
+            # 8. Actualizar experiment.description si existe
             if 'experiment.description' in self.fields:
                 backbone_descriptions = {
                     'dinov2_vits14': 'DINOv2 ViT-S/14 baseline with ArcFace',

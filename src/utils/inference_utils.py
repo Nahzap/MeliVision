@@ -165,29 +165,87 @@ class EmbeddingSimilarityTarget:
 
 
 def _is_vit_backbone(model):
-    """Check if the model uses a ViT-based backbone (DINOv2, ViT, etc.)."""
+    """Check if the model uses a ViT-based backbone (DINOv2, DeiT, ViT, etc.)."""
     if hasattr(model, 'backbone'):
         backbone = model.backbone
-        return hasattr(backbone, 'blocks') and hasattr(backbone, 'patch_embed')
+        # Direct ViT from timm (DeiT, ViT, etc.)
+        if hasattr(backbone, 'blocks') and hasattr(backbone, 'patch_embed'):
+            return True
+        # DINOv2Backbone wrapper (has .model attribute pointing to raw ViT)
+        if hasattr(backbone, 'model') and hasattr(backbone.model, 'blocks'):
+            return True
     return False
 
 
 def _get_dino_model(model):
-    """Get the inner DINOv2 model from AnalogyNet > DINOv2Backbone > model."""
-    if hasattr(model, 'backbone') and hasattr(model.backbone, 'model'):
-        return model.backbone.model
+    """
+    Get the inner ViT model from AnalogyNet.
+    Supports:
+    - DINOv2: AnalogyNet > DINOv2Backbone > model
+    - Generic ViT (DeiT, ViT): AnalogyNet > backbone (direct timm model)
+    """
+    if hasattr(model, 'backbone'):
+        backbone = model.backbone
+        # DINOv2 wrapped structure
+        if hasattr(backbone, 'model'):
+            return backbone.model
+        # Generic ViT from timm (DeiT, ViT, etc.)
+        elif hasattr(backbone, 'blocks') and hasattr(backbone, 'patch_embed'):
+            return backbone
     return None
+
+
+def _run_vit_forward_for_attention(model, dino_model, image_tensor, enable_grad=False):
+    """
+    Run a standard ViT forward pass that preserves ALL tokens (CLS + patches).
+    
+    CRITICAL: This bypasses DINOv2Backbone.forward() which uses
+    get_intermediate_layers() and discards CLS token. Instead, it calls
+    forward_features() directly on the raw ViT model, ensuring:
+    - CLS token is preserved at position 0
+    - Standard attention patterns between CLS and patches
+    - Clean gradient flow (when enable_grad=True)
+    
+    Args:
+        model: AnalogyNet (used only if dino_model doesn't have forward_features)
+        dino_model: Raw ViT model (from _get_dino_model)
+        image_tensor: (B, 3, H, W) tensor on correct device
+        enable_grad: If True, enables gradient computation
+        
+    Returns:
+        Output tensor from forward_features (typically (B, N_tokens, D))
+    """
+    ctx = torch.enable_grad() if enable_grad else torch.no_grad()
+    with ctx:
+        # Prefer forward_for_attention on the backbone (DINOv2Backbone)
+        if hasattr(model, 'backbone') and hasattr(model.backbone, 'forward_for_attention'):
+            return model.backbone.forward_for_attention(image_tensor)
+        # timm models (DeiT, ViT, etc.) have forward_features
+        elif hasattr(dino_model, 'forward_features'):
+            return dino_model.forward_features(image_tensor)
+        # Fallback: standard forward (not ideal but works)
+        else:
+            return dino_model(image_tensor)
 
 
 def extract_dino_attention(model, image_tensor, device):
     """
-    Extract CLS-to-patch attention maps from DINOv2's last transformer block.
+    Extract CLS-to-patch attention maps from ViT's last transformer block.
+    Supports DINOv2, DeiT, and other ViT architectures.
+    
+    IMPORTANT ARCHITECTURAL NOTE:
+    - DINOv2Backbone wrapper uses get_intermediate_layers() for training
+      (excludes CLS token, uses mean pooling for optimal metric learning embeddings)
+    - For attention extraction, we bypass the wrapper and execute forward_features()
+      directly on the raw ViT model to preserve CLS token
+    - This ensures meaningful CLS-to-patch attention maps
+    
     Ref: Caron et al. (DINO, ICCV 2021) — self-attention heads naturally
     segment foreground objects. This is the correct approach for ViTs
     (GradCAM was designed for CNNs and often fails on ViT architectures).
 
     Args:
-        model: AnalogyNet with DINOv2Backbone
+        model: AnalogyNet with ViT-based backbone (DINOv2, DeiT, ViT, etc.)
         image_tensor: (1, 3, H, W) normalized tensor
         device: torch.device
 
@@ -201,8 +259,18 @@ def extract_dino_attention(model, image_tensor, device):
     image_tensor = image_tensor.to(device)
     dino_model = _get_dino_model(model)
     if dino_model is None:
-        raise ValueError("Model does not have DINOv2 backbone")
+        raise ValueError("Model does not have ViT backbone (expected DINOv2, DeiT, or similar)")
 
+    # Detect if model has distillation token (DeiT-specific)
+    has_dist_token = hasattr(dino_model, 'dist_token') and dino_model.dist_token is not None
+    
+    # Detect DINOv2 register tokens (dinov2_*_reg variants have 4 register tokens)
+    num_register_tokens = 0
+    if hasattr(model, 'backbone') and hasattr(model.backbone, 'num_register_tokens'):
+        num_register_tokens = model.backbone.num_register_tokens
+    elif hasattr(dino_model, 'num_register_tokens'):
+        num_register_tokens = dino_model.num_register_tokens
+    
     last_block = dino_model.blocks[-1]
     attn_module = last_block.attn
     num_heads = attn_module.num_heads
@@ -214,14 +282,30 @@ def extract_dino_attention(model, image_tensor, device):
 
     hook = attn_module.qkv.register_forward_hook(qkv_hook)
 
-    with torch.no_grad():
-        _ = model(image_tensor)
-
-    hook.remove()
+    try:
+        # CRITICAL: bypass DINOv2Backbone wrapper — use forward_features() directly
+        _ = _run_vit_forward_for_attention(model, dino_model, image_tensor, enable_grad=False)
+    finally:
+        hook.remove()
 
     qkv = captured['qkv']  # (B, N_tokens, 3 * dim)
     B, N, _ = qkv.shape
     head_dim = qkv.shape[-1] // (3 * num_heads)
+    
+    # Determine patch start index based on prefix tokens:
+    # DeiT: [CLS, DIST, patches...] → start=2
+    # DINOv2: [CLS, patches...] → start=1
+    # DINOv2_reg: [CLS, reg0, ..., regN, patches...] → start=1+num_register_tokens
+    if has_dist_token:
+        patch_start_idx = 2
+    else:
+        patch_start_idx = 1 + num_register_tokens
+    n_expected_patches = N - patch_start_idx
+    
+    logger.info(f"[Attention] N_tokens={N}, has_dist_token={has_dist_token}, "
+                f"num_register_tokens={num_register_tokens}, "
+                f"patch_start_idx={patch_start_idx}, n_patches={n_expected_patches}, "
+                f"backbone={type(dino_model).__name__}")
 
     qkv = qkv.reshape(B, N, 3, num_heads, head_dim).permute(2, 0, 3, 1, 4)
     q, k, _ = qkv.unbind(0)  # each: (B, heads, N, head_dim)
@@ -231,10 +315,14 @@ def extract_dino_attention(model, image_tensor, device):
     attn = (q @ k.transpose(-2, -1)) * scale
     attn = attn.softmax(dim=-1)  # (B, heads, N, N)
 
-    # CLS token (index 0) attention to patch tokens (index 1:)
-    cls_attn = attn[0, :, 0, 1:]  # (heads, N_patches)
+    # CLS token (index 0) attention to patch tokens
+    # DeiT has [CLS, DIST, patches...], others have [CLS, patches...]
+    cls_attn = attn[0, :, 0, patch_start_idx:]  # (heads, N_patches)
     n_patches = cls_attn.shape[-1]
+    
     h_p = w_p = int(n_patches ** 0.5)
+    if h_p * w_p != n_patches:
+        logger.warning(f"Non-square patch grid: {n_patches} patches, using {h_p}x{w_p}")
 
     # Per-head attention maps
     head_maps = cls_attn.reshape(num_heads, h_p, w_p).cpu().numpy()
@@ -256,15 +344,19 @@ def extract_dino_attention(model, image_tensor, device):
 
 def extract_gradient_weighted_attention(model, image_tensor, device, centroid):
     """
-    Gradient-weighted attention for metric learning: combines DINOv2
+    Gradient-weighted attention for metric learning: combines ViT
     self-attention with gradients of cosine similarity to class centroid.
     This produces task-specific attention maps that show which patches
     contribute most to the predicted embedding's similarity with the centroid.
+    
+    IMPORTANT: Bypasses DINOv2Backbone wrapper by using forward_features()
+    directly on the raw ViT, then manually pipes through the projection head
+    to compute cosine similarity for gradient weighting.
 
     Ref: Chefer et al. (Transformer Interpretability, CVPR 2021)
 
     Args:
-        model: AnalogyNet with DINOv2Backbone
+        model: AnalogyNet with ViT-based backbone (DINOv2, DeiT, ViT, etc.)
         image_tensor: (1, 3, H, W) normalized tensor
         device: torch.device
         centroid: (embed_dim,) class centroid tensor
@@ -279,8 +371,18 @@ def extract_gradient_weighted_attention(model, image_tensor, device, centroid):
     centroid = centroid.to(device)
     dino_model = _get_dino_model(model)
     if dino_model is None:
-        raise ValueError("Model does not have DINOv2 backbone")
+        raise ValueError("Model does not have ViT backbone (expected DINOv2, DeiT, or similar)")
 
+    # Detect if model has distillation token (DeiT-specific)
+    has_dist_token = hasattr(dino_model, 'dist_token') and dino_model.dist_token is not None
+    
+    # Detect DINOv2 register tokens
+    num_register_tokens = 0
+    if hasattr(model, 'backbone') and hasattr(model.backbone, 'num_register_tokens'):
+        num_register_tokens = model.backbone.num_register_tokens
+    elif hasattr(dino_model, 'num_register_tokens'):
+        num_register_tokens = dino_model.num_register_tokens
+    
     last_block = dino_model.blocks[-1]
     attn_module = last_block.attn
     num_heads = attn_module.num_heads
@@ -288,25 +390,69 @@ def extract_gradient_weighted_attention(model, image_tensor, device, centroid):
     captured = {}
     def qkv_hook(module, input_args, output):
         captured['qkv'] = output
-        output.retain_grad()
-        captured['qkv_ref'] = output
+        # Guard retain_grad: only works if tensor has requires_grad=True
+        if output.requires_grad:
+            output.retain_grad()
+            captured['qkv_ref'] = output
+        else:
+            captured['qkv_ref'] = None
 
     hook = attn_module.qkv.register_forward_hook(qkv_hook)
 
-    # Forward WITH gradients
-    embedding = model(image_tensor)
-    similarity = torch.nn.functional.cosine_similarity(
-        embedding, centroid.unsqueeze(0), dim=1
-    )
-    similarity.backward()
-
-    hook.remove()
+    try:
+        # CRITICAL: bypass wrapper — forward_features() with gradients enabled
+        features_out = _run_vit_forward_for_attention(
+            model, dino_model, image_tensor, enable_grad=True
+        )
+        
+        # Determine patch start index for feature extraction
+        if has_dist_token:
+            patch_start = 2
+        else:
+            patch_start = 1 + num_register_tokens
+        
+        # Extract features for embedding computation:
+        # forward returns (B, N_tokens, D) — use mean pooling of patch tokens
+        # to match the DINOv2Backbone training behavior
+        if features_out.dim() == 3:
+            patch_features = features_out[:, patch_start:]  # (B, N_patches, D)
+            pooled_features = patch_features.mean(dim=1)  # (B, D)
+        else:
+            pooled_features = features_out
+        
+        # Pipe through projection head + normalize (mirrors AnalogyNet.forward)
+        if hasattr(model, 'attention') and model.attention is not None:
+            pooled_features = model.attention(pooled_features)
+        
+        if hasattr(model, 'projection'):
+            embedding = model.projection(pooled_features)
+            embedding = nn.functional.normalize(embedding, p=2, dim=1)
+        else:
+            embedding = pooled_features
+        
+        similarity = torch.nn.functional.cosine_similarity(
+            embedding, centroid.unsqueeze(0), dim=1
+        )
+        similarity.backward()
+    finally:
+        hook.remove()
 
     qkv = captured['qkv'].detach()
-    qkv_grad = captured['qkv_ref'].grad
+    qkv_grad = captured['qkv_ref'].grad if captured.get('qkv_ref') is not None else None
 
     B, N, _ = qkv.shape
     head_dim = qkv.shape[-1] // (3 * num_heads)
+    
+    # Patch start index (same as above)
+    if has_dist_token:
+        patch_start_idx = 2
+    else:
+        patch_start_idx = 1 + num_register_tokens
+    
+    logger.info(f"[GradAttention] N_tokens={N}, has_dist_token={has_dist_token}, "
+                f"num_register_tokens={num_register_tokens}, "
+                f"grad_available={qkv_grad is not None}, "
+                f"backbone={type(dino_model).__name__}")
 
     qkv = qkv.reshape(B, N, 3, num_heads, head_dim).permute(2, 0, 3, 1, 4)
     q, k, _ = qkv.unbind(0)
@@ -316,7 +462,7 @@ def extract_gradient_weighted_attention(model, image_tensor, device, centroid):
     attn = attn.softmax(dim=-1)  # (B, heads, N, N)
 
     # CLS attention to patches
-    cls_attn = attn[0, :, 0, 1:]  # (heads, N_patches)
+    cls_attn = attn[0, :, 0, patch_start_idx:]  # (heads, N_patches)
 
     # Weight by gradient magnitude (which heads matter for this centroid)
     if qkv_grad is not None:
@@ -326,6 +472,7 @@ def extract_gradient_weighted_attention(model, image_tensor, device, centroid):
         head_importance = head_importance / (head_importance.sum() + 1e-8)
         weighted_attn = (cls_attn * head_importance.unsqueeze(-1)).sum(dim=0)  # (N_patches,)
     else:
+        logger.warning("[GradAttention] No gradients captured — falling back to mean attention")
         weighted_attn = cls_attn.mean(dim=0)
 
     n_patches = weighted_attn.shape[-1]
@@ -360,22 +507,82 @@ def _vit_reshape_transform(tensor):
 
 def _detect_target_layer(model):
     """
-    Auto-detecta la última capa del backbone para Grad-CAM.
-    Soporta ResNet (layer4), ConvNeXt (features[-1]), DINOv2, y genéricos.
+    Auto-detecta la última capa convolucional del backbone para Grad-CAM.
+    Prueba múltiples candidatos y valida que tengan salida 4D (B, C, H, W).
+    Soporta: ResNet, ConvNeXt V1/V2, DINOv2, EfficientNet, Swin, etc.
     """
-    if hasattr(model, 'backbone'):
-        backbone = model.backbone
-        if hasattr(backbone, 'layer4'):
-            return backbone.layer4[-1]
-        elif hasattr(backbone, 'features'):
-            return backbone.features[-1]
-        elif hasattr(backbone, 'blocks'):
-            return backbone.blocks[-1]
-        else:
-            children = list(backbone.children())
-            if children:
-                return children[-1]
-    raise ValueError("No se pudo detectar target_layer. Proporcione uno manualmente.")
+    if not hasattr(model, 'backbone'):
+        raise ValueError("Model doesn't have 'backbone' attribute")
+    
+    backbone = model.backbone
+    candidates = []
+    
+    # Strategy 1: ResNet-style (layer4)
+    if hasattr(backbone, 'layer4'):
+        candidates.append(('layer4[-1]', backbone.layer4[-1]))
+    
+    # Strategy 2: ConvNeXt from timm (stages)
+    if hasattr(backbone, 'stages'):
+        # ConvNeXt V2 from timm has stages -> last stage is best
+        try:
+            last_stage = backbone.stages[-1]
+            # Last stage puede ser Sequential, tomar último bloque
+            if hasattr(last_stage, '__getitem__'):
+                candidates.append(('stages[-1][-1]', last_stage[-1]))
+            else:
+                candidates.append(('stages[-1]', last_stage))
+        except:
+            pass
+    
+    # Strategy 3: torchvision ConvNeXt V1 (features)
+    if hasattr(backbone, 'features'):
+        # features es Sequential, tomar el penúltimo (último suele ser norm/pool)
+        try:
+            features = backbone.features
+            if len(features) > 1:
+                # Probar penúltimo y último
+                candidates.append(('features[-2]', features[-2]))
+                candidates.append(('features[-1]', features[-1]))
+        except:
+            pass
+    
+    # Strategy 4: EfficientNet/timm genérico (blocks)
+    if hasattr(backbone, 'blocks'):
+        try:
+            candidates.append(('blocks[-1]', backbone.blocks[-1]))
+        except:
+            pass
+    
+    # Strategy 5: Último hijo genérico
+    try:
+        children = list(backbone.children())
+        if children:
+            candidates.append(('children[-1]', children[-1]))
+            if len(children) > 1:
+                candidates.append(('children[-2]', children[-2]))
+    except:
+        pass
+    
+    if not candidates:
+        raise ValueError("No target layer candidates found in backbone")
+    
+    # Validar cada candidato: debe ser un módulo con parámetros
+    valid_candidates = []
+    for name, layer in candidates:
+        # Verificar que sea un nn.Module con parámetros
+        if isinstance(layer, nn.Module):
+            params = list(layer.parameters())
+            if len(params) > 0:
+                valid_candidates.append((name, layer))
+    
+    if not valid_candidates:
+        raise ValueError(f"No valid target layers found. Tried: {[c[0] for c in candidates]}")
+    
+    # Retornar el primer candidato válido
+    # (típicamente el más específico/profundo)
+    selected_name, selected_layer = valid_candidates[0]
+    logger.info(f"GradCAM target_layer auto-detected: {selected_name}")
+    return selected_layer
 
 
 def generate_gradcam(
@@ -424,17 +631,62 @@ def generate_gradcam(
     if target_layer is None:
         target_layer = _detect_target_layer(model)
 
+    # Intentar con el target_layer detectado
     reshape_fn = _vit_reshape_transform if _is_vit_backbone(model) else None
-    cam = GradCAM(model=model, target_layers=[target_layer], reshape_transform=reshape_fn)
-
-    targets = None
-    if centroid is not None:
-        targets = [EmbeddingSimilarityTarget(centroid)]
-
-    grayscale_cam = cam(input_tensor=image_tensor, targets=targets)
-    grayscale_cam = grayscale_cam[0, :]
-
-    return grayscale_cam
+    
+    try:
+        cam = GradCAM(model=model, target_layers=[target_layer], reshape_transform=reshape_fn)
+        targets = None
+        if centroid is not None:
+            targets = [EmbeddingSimilarityTarget(centroid)]
+        grayscale_cam = cam(input_tensor=image_tensor, targets=targets)
+        grayscale_cam = grayscale_cam[0, :]
+        return grayscale_cam
+    except ValueError as e:
+        if "Invalid grads shape" in str(e):
+            # El layer seleccionado no tiene shape 4D, intentar con alternativas
+            logger.warning(f"GradCAM failed with detected layer: {e}")
+            logger.info("Trying alternative layers...")
+            
+            # Intentar con capas alternativas conocidas
+            alternative_layers = []
+            backbone = model.backbone
+            
+            # Para ConvNeXt V2 (timm), probar stages individuales
+            if hasattr(backbone, 'stages'):
+                try:
+                    # Probar cada stage de atrás hacia adelante
+                    for i in range(len(backbone.stages) - 1, -1, -1):
+                        stage = backbone.stages[i]
+                        if hasattr(stage, '__getitem__') and len(stage) > 0:
+                            # Probar último bloque del stage
+                            alternative_layers.append(stage[-1])
+                            # También probar penúltimo
+                            if len(stage) > 1:
+                                alternative_layers.append(stage[-2])
+                except:
+                    pass
+            
+            # Probar cada alternativa
+            for alt_layer in alternative_layers:
+                try:
+                    logger.info(f"  Trying alternative layer: {type(alt_layer).__name__}")
+                    cam = GradCAM(model=model, target_layers=[alt_layer], reshape_transform=reshape_fn)
+                    targets = None
+                    if centroid is not None:
+                        targets = [EmbeddingSimilarityTarget(centroid)]
+                    grayscale_cam = cam(input_tensor=image_tensor, targets=targets)
+                    grayscale_cam = grayscale_cam[0, :]
+                    logger.info(f"  SUCCESS with {type(alt_layer).__name__}")
+                    return grayscale_cam
+                except Exception as inner_e:
+                    logger.debug(f"  Failed with {type(alt_layer).__name__}: {inner_e}")
+                    continue
+            
+            # Si todas las alternativas fallaron, propagar el error original
+            raise ValueError(f"GradCAM failed with all attempted layers. Original error: {e}")
+        else:
+            raise
 
 
 def overlay_gradcam_on_image(

@@ -1,8 +1,8 @@
 experiment:
-  name: resnet50_baseline
-  description: ResNet-50 baseline
+  name: deit_small_patch16_224_baseline
+  description: DeiT-S baseline (ViT supervisado)
 model:
-  backbone_name: resnet50
+  backbone_name: deit_small_patch16_224
   embedding_dim: 128
   pretrained: true
   use_attention: false
@@ -148,7 +148,7 @@ grain_detection:
   morph_kernel_size: 3
   min_circularity: 0.3
   crop_padding: 0.2
-  crop_size: 252
+  crop_size: 224
   use_mask: true
   masked_pooling: false
   distance_threshold: 0.7

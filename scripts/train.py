@@ -297,9 +297,13 @@ def estimate_training_time(config: dict, train_loader, val_loader, model, logger
     gradient_clip_norm = config['training'].get('gradient_clip_norm', 5.0)
     
     # Create lightweight single-process loaders for benchmarking
+    # Use smaller batch size for benchmark to avoid OOM and speed up estimation
+    bench_batch_size = min(batch_size, 32)  # Cap at 32 for faster benchmark
+    logger.info(f"Using batch_size={bench_batch_size} for benchmark (original: {batch_size})")
+    
     bench_train_loader = DataLoader(
         train_loader.dataset,
-        batch_size=batch_size,
+        batch_size=bench_batch_size,
         shuffle=True,
         num_workers=0,
         pin_memory=False,
@@ -307,7 +311,7 @@ def estimate_training_time(config: dict, train_loader, val_loader, model, logger
     )
     bench_val_loader = DataLoader(
         val_loader.dataset,
-        batch_size=batch_size,
+        batch_size=bench_batch_size,
         shuffle=False,
         num_workers=0,
         pin_memory=False,
@@ -321,41 +325,55 @@ def estimate_training_time(config: dict, train_loader, val_loader, model, logger
     logger.info(f"CUDA warmup ({warmup_batches} batches, not timed)...")
     bench_train_iter = iter(bench_train_loader)
     for i in range(warmup_batches):
+        logger.info(f"  Warmup batch {i+1}/{warmup_batches}: loading...")
         try:
             batch_data = next(bench_train_iter)
         except StopIteration:
             bench_train_iter = iter(bench_train_loader)
             batch_data = next(bench_train_iter)
+        logger.info(f"  Warmup batch {i+1}/{warmup_batches}: loaded, processing...")
         images, labels = batch_data[0], batch_data[1]
         images = images.to(device)
         labels = labels.to(device)
         bench_optimizer.zero_grad(set_to_none=True)
+        
+        logger.info(f"    -> Forward pass...")
         if use_amp:
             with autocast('cuda'):
                 embeddings = model(images)
+                logger.info(f"    -> Loss computation...")
                 loss = bench_loss_func(embeddings, labels)
+            logger.info(f"    -> Backward pass...")
             bench_scaler.scale(loss).backward()
             bench_scaler.unscale_(bench_optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip_norm)
+            logger.info(f"    -> Optimizer step...")
             bench_scaler.step(bench_optimizer)
             bench_scaler.update()
         else:
             embeddings = model(images)
+            logger.info(f"    -> Loss computation...")
             loss = bench_loss_func(embeddings, labels)
+            logger.info(f"    -> Backward pass...")
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip_norm)
+            logger.info(f"    -> Optimizer step...")
             bench_optimizer.step()
         if device.type == 'cuda':
             torch.cuda.synchronize()
+        logger.info(f"  Warmup batch {i+1}/{warmup_batches}: complete")
     logger.info("Warmup complete.")
     
     # --- Benchmark FULL training steps (forward + loss + backward + optimizer) ---
-    logger.info(f"Benchmarking {benchmark_batches} training steps (forward + loss + backward + optimizer)...")
+    actual_benchmark_batches = min(benchmark_batches, num_train_batches)
+    logger.info(f"Benchmarking {actual_benchmark_batches} training steps (forward + loss + backward + optimizer)...")
     train_times = []
     data_load_times = []
     
     t_data_start = time.perf_counter()
-    for i in range(min(benchmark_batches, num_train_batches)):
+    for i in range(actual_benchmark_batches):
+        if i % 2 == 0:
+            logger.info(f"  Benchmark batch {i+1}/{actual_benchmark_batches}...")
         try:
             batch_data = next(bench_train_iter)
         except StopIteration:

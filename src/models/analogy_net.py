@@ -113,6 +113,47 @@ class DINOv2Backbone(nn.Module):
             features = patch_tokens.mean(dim=1)  # (B, D)
         
         return features
+    
+    def forward_for_attention(self, x):
+        """
+        Standard forward pass preserving ALL tokens (CLS + register + patches).
+        Used exclusively for attention map extraction — NOT for training.
+        
+        Unlike self.forward() which uses get_intermediate_layers() + mean pooling
+        (optimized for metric learning embeddings), this method preserves the
+        CLS token needed for CLS-to-patch attention maps (Caron et al., ICCV 2021).
+        
+        NOTE: Facebook's DINOv2 forward_features() returns a dict, not a tensor.
+        We use prepare_tokens_with_masks() + blocks + norm to get a clean tensor.
+        
+        Args:
+            x: (B, 3, H, W) input images
+            
+        Returns:
+            (B, 1 + num_register_tokens + N_patches, D) tensor with CLS at position 0
+        """
+        raw = self.model
+        # Facebook's DINOv2: forward_features returns dict — bypass it
+        if hasattr(raw, 'prepare_tokens_with_masks'):
+            tokens = raw.prepare_tokens_with_masks(x)
+            for blk in raw.blocks:
+                tokens = blk(tokens)
+            tokens = raw.norm(tokens)
+            return tokens  # (B, 1 + num_reg + N_patches, D)
+        # timm ViT (fallback): forward_features returns tensor
+        elif hasattr(raw, 'forward_features'):
+            out = raw.forward_features(x)
+            if isinstance(out, dict):
+                # Shouldn't happen, but handle gracefully
+                raise TypeError(f"forward_features returned dict with keys: {list(out.keys())}")
+            return out
+        else:
+            return raw(x)
+    
+    @property
+    def num_register_tokens(self):
+        """Number of register tokens in the DINOv2 model (0 for standard, 4 for _reg variants)."""
+        return getattr(self.model, 'num_register_tokens', 0)
 
 
 class AnalogyNet(nn.Module):
