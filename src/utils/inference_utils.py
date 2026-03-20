@@ -595,22 +595,39 @@ def generate_gradcam(
     """
     Genera mapa de calor de atención para explicabilidad visual.
 
-    Para ViT/DINOv2: usa mapas de atención nativos del transformer
-    (Caron et al., ICCV 2021) con pesos de gradiente para task-specificity
-    (Chefer et al., CVPR 2021). Mucho más fiable que GradCAM en ViTs.
-
-    Para CNNs: usa Grad-CAM clásico (Selvaraju et al., ICCV 2017).
+    Delegates to the unified ``visual_explainer`` module which uses:
+      - ViT/DINOv2/DeiT: Gradient-weighted self-attention (Chefer et al., CVPR 2021)
+        with correct token topology parsing and bilinear upsampling.
+      - ConvNeXt: Grad-CAM with ``reshape_transform`` for 3-D stage outputs.
+      - ResNet/EfficientNet: Standard Grad-CAM (Selvaraju et al., ICCV 2017).
 
     Args:
         model: AnalogyNet
         image_tensor: (1, 3, H, W) normalizado
         device: torch.device
-        target_layer: Capa objetivo (solo para CNN fallback)
+        target_layer: Capa objetivo (solo para CNN fallback, ignored by new module)
         centroid: Centroide de clase (embed_dim,) para gradient weighting
 
     Returns:
         Heatmap numpy array (H, W) en [0, 1]
     """
+    try:
+        from src.utils.visual_explainer import create_explainer
+        explainer = create_explainer(model, device)
+        return explainer.generate_heatmap(image_tensor, centroid)
+    except Exception as e:
+        logger.warning(f"[generate_gradcam] New explainer failed ({e}), falling back to legacy")
+        return _generate_gradcam_legacy(model, image_tensor, device, target_layer, centroid)
+
+
+def _generate_gradcam_legacy(
+    model: nn.Module,
+    image_tensor: torch.Tensor,
+    device: torch.device,
+    target_layer=None,
+    centroid: torch.Tensor = None
+) -> np.ndarray:
+    """Legacy generate_gradcam kept as fallback."""
     model.eval()
     image_tensor = image_tensor.to(device)
 
@@ -644,30 +661,23 @@ def generate_gradcam(
         return grayscale_cam
     except ValueError as e:
         if "Invalid grads shape" in str(e):
-            # El layer seleccionado no tiene shape 4D, intentar con alternativas
             logger.warning(f"GradCAM failed with detected layer: {e}")
             logger.info("Trying alternative layers...")
             
-            # Intentar con capas alternativas conocidas
             alternative_layers = []
             backbone = model.backbone
             
-            # Para ConvNeXt V2 (timm), probar stages individuales
             if hasattr(backbone, 'stages'):
                 try:
-                    # Probar cada stage de atrás hacia adelante
                     for i in range(len(backbone.stages) - 1, -1, -1):
                         stage = backbone.stages[i]
                         if hasattr(stage, '__getitem__') and len(stage) > 0:
-                            # Probar último bloque del stage
                             alternative_layers.append(stage[-1])
-                            # También probar penúltimo
                             if len(stage) > 1:
                                 alternative_layers.append(stage[-2])
                 except:
                     pass
             
-            # Probar cada alternativa
             for alt_layer in alternative_layers:
                 try:
                     logger.info(f"  Trying alternative layer: {type(alt_layer).__name__}")
@@ -683,7 +693,6 @@ def generate_gradcam(
                     logger.debug(f"  Failed with {type(alt_layer).__name__}: {inner_e}")
                     continue
             
-            # Si todas las alternativas fallaron, propagar el error original
             raise ValueError(f"GradCAM failed with all attempted layers. Original error: {e}")
         else:
             raise

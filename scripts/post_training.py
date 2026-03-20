@@ -1087,13 +1087,14 @@ def generate_gradcam_gallery(model, centroids, val_loader, device, output_dir, c
         class_names: List of class names
         n_per_class: Number of samples per class to visualize
     """
-    from src.utils.inference_utils import generate_gradcam, overlay_gradcam_on_image, _detect_target_layer
+    from src.utils.inference_utils import overlay_gradcam_on_image
+    from src.utils.visual_explainer import create_explainer
 
     gallery_dir = Path(output_dir) / 'gradcam_gallery'
     gallery_dir.mkdir(parents=True, exist_ok=True)
 
     model.eval()
-    target_layer = _detect_target_layer(model)
+    explainer = create_explainer(model, device)  # created once, reused for all images
 
     mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
@@ -1156,9 +1157,8 @@ def generate_gradcam_gallery(model, centroids, val_loader, device, output_dir, c
 
             # Generate Grad-CAM with predicted class centroid
             pred_centroid = centroids[pred_lbl]
-            heatmap = generate_gradcam(
-                model, img_tensor.unsqueeze(0), device,
-                target_layer=target_layer, centroid=pred_centroid
+            heatmap = explainer.generate_heatmap(
+                img_tensor.unsqueeze(0), centroid=pred_centroid
             )
 
             # Overlay
@@ -1225,9 +1225,8 @@ def generate_gradcam_gallery(model, centroids, val_loader, device, output_dir, c
         img_np = img_denorm.permute(1, 2, 0).numpy()
 
         pred_centroid = centroids[pred_lbl]
-        heatmap = generate_gradcam(
-            model, img_tensor.unsqueeze(0), device,
-            target_layer=target_layer, centroid=pred_centroid
+        heatmap = explainer.generate_heatmap(
+            img_tensor.unsqueeze(0), centroid=pred_centroid
         )
         overlay = overlay_gradcam_on_image(
             (img_np * 255).astype(np.uint8), heatmap, alpha=0.5
@@ -1295,14 +1294,15 @@ def generate_fullimage_inference(model, centroids, device, config, output_dir, c
     import cv2
     from src.grain_detection.seg_format import SegFileReader
     from src.grain_detection.full_image_classifier import FullImageClassifier
-    from src.utils.inference_utils import generate_gradcam, overlay_gradcam_on_image, _detect_target_layer
+    from src.utils.inference_utils import overlay_gradcam_on_image
+    from src.utils.visual_explainer import create_explainer
     from src.data.transforms_enhanced import get_val_transforms
 
     gallery_dir = Path(output_dir) / 'fullimage_inference'
     gallery_dir.mkdir(parents=True, exist_ok=True)
 
     model.eval()
-    target_layer = _detect_target_layer(model) if with_gradcam else None
+    explainer = create_explainer(model, device) if with_gradcam else None
 
     # Get image size and build validation transform
     image_size = config['data'].get('image_size', 252)

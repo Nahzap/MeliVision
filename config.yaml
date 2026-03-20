@@ -1,8 +1,8 @@
 experiment:
-  name: deit_small_patch16_224_baseline
-  description: DeiT-S baseline (ViT supervisado)
+  name: convnext_v2_tiny_baseline
+  description: ConvNeXt V2 Tiny baseline (CNN moderno)
 model:
-  backbone_name: deit_small_patch16_224
+  backbone_name: convnext_v2_tiny
   embedding_dim: 128
   pretrained: true
   use_attention: false
@@ -19,8 +19,8 @@ data:
   test_dir: data/processed/test
   annotation_root: data/annotations
   classes_per_batch: 7
-  samples_per_class: 14
-  batch_size: 98
+  samples_per_class: 7
+  batch_size: 49
   num_workers: 8
   pin_memory: true
   drop_last: true
