@@ -58,11 +58,13 @@ def get_transforms_from_config(config: Dict, mode: str = 'val'):
     from src.data.transforms_enhanced import get_train_transforms, get_val_transforms
     
     transform_config = merge_configs(config['augmentation'], config['data'])
+    backbone_name = get_backbone_name(config)
     
     if mode == 'train':
-        return get_train_transforms(transform_config)
+        aug_mode = config.get('sota', {}).get('augmentation_mode', 'full')
+        return get_train_transforms(transform_config, mode=aug_mode, backbone_name=backbone_name)
     elif mode == 'val' or mode == 'test':
-        return get_val_transforms(transform_config)
+        return get_val_transforms(transform_config, backbone_name=backbone_name)
     else:
         raise ValueError(f"Unknown mode: {mode}. Use 'train' or 'val'")
 

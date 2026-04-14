@@ -1,15 +1,15 @@
 experiment:
-  name: convnext_v2_tiny_baseline
-  description: ConvNeXt V2 Tiny baseline (CNN moderno)
+  name: dinov2_vits14_baseline
+  description: DINOv2 ViT-S/14 baseline with ArcFace
 model:
-  backbone_name: convnext_v2_tiny
+  backbone_name: dinov2_vits14
   embedding_dim: 128
   pretrained: true
   use_attention: false
   freeze_backbone: false
   projection_head:
     hidden_dims:
-    - 512
+    - 256
     - 256
     use_batch_norm: true
     dropout: 0.1
@@ -19,13 +19,13 @@ data:
   test_dir: data/processed/test
   annotation_root: data/annotations
   classes_per_batch: 7
-  samples_per_class: 7
-  batch_size: 49
+  samples_per_class: 14
+  batch_size: 98
   num_workers: 8
   pin_memory: true
   drop_last: true
-  image_size: 224
-  resize_size: 224
+  image_size: 252
+  resize_size: 252
 augmentation:
   random_horizontal_flip: 0.5
   random_vertical_flip: 0.5
@@ -86,8 +86,9 @@ training:
   loss:
     type: arcface
     params:
-      margin: 0.5
-      scale: 64
+      alpha: 2.0
+      beta: 50.0
+      base: 0.5
   validation_metric: recall_at_1
   mining:
     enabled: true
@@ -150,7 +151,7 @@ grain_detection:
   crop_padding: 0.2
   crop_size: 224
   use_mask: true
-  masked_pooling: false
+  masked_pooling: true
   distance_threshold: 0.7
   dataset_mode: grain
 inference:

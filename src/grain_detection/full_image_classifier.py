@@ -276,35 +276,51 @@ class FullImageClassifier:
                 "saliency_map": saliency_map,
             }
 
-        # 2. Recortar y clasificar cada grano
+        # 2. Recortar, pre-procesar e inferir en batch (O(1) GPU)
         t2 = time.perf_counter()
         grain_results = []
+        tensor_list = []
+        crop_bgr_list = []
 
+        # 2.1. Preparar lista de tensores
         for grain in detected_grains:
-            # Extraer crop + aplicar máscara de contorno (fondo gris neutro)
             crop_bgr = self._extract_crop(image, grain)
             if self.use_mask and grain.contour is not None:
                 crop_bgr, _ = self._apply_contour_mask(crop_bgr, image, grain)
             crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
             crop_pil = Image.fromarray(crop_rgb)
 
-            # Embedding
             if self.transforms:
                 tensor = self.transforms(crop_pil)
             else:
                 from torchvision import transforms as T
                 tensor = T.ToTensor()(crop_pil)
+            
+            tensor_list.append(tensor)
+            if return_crops:
+                crop_bgr_list.append(crop_bgr)
 
-            tensor = tensor.unsqueeze(0).to(self.device)
-
+        # 2.2. Inferencia paralelizada en batches seguros
+        batch_size = 64
+        embeddings_list = []
+        for i in range(0, len(tensor_list), batch_size):
+            batch_chunk = torch.stack(tensor_list[i:i+batch_size]).to(self.device)
             with torch.no_grad():
-                embedding = self.model(tensor).cpu().numpy()
+                emb_chunk = self.model(batch_chunk).cpu().numpy()
+                embeddings_list.append(emb_chunk)
+        
+        batch_embeddings = np.vstack(embeddings_list)
+
+        # 2.3. Clasificación e interconexión diccionarios (O(N) CPU)
+        for i, grain in enumerate(detected_grains):
+            emb_1d = batch_embeddings[i]
+            emb_2d = np.expand_dims(emb_1d, axis=0)
 
             # Clasificar via k-NN
             prediction = self.knn.predict(
-                embedding, return_distances=True, return_neighbors=False
+                emb_2d, return_distances=True, return_neighbors=False
             )
-            distribution = self.knn.get_class_distribution(embedding)
+            distribution = self.knn.get_class_distribution(emb_2d)
 
             result = {
                 "index": grain.index,
@@ -316,10 +332,10 @@ class FullImageClassifier:
                 "confidence": prediction["confidence"],
                 "mean_distance": prediction["mean_distance"],
                 "class_distribution": distribution,
-                "embedding": embedding.squeeze(),
+                "embedding": emb_1d,
             }
             if return_crops:
-                result["crop"] = crop_bgr
+                result["crop"] = crop_bgr_list[i]
 
             grain_results.append(result)
 

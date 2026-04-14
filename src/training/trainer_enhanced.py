@@ -341,9 +341,15 @@ class MetricLearningTrainer:
     def _setup_hard_mining(self):
         """Setup Hard Negative Mining (OHEM) if enabled in config."""
         hard_mining_config = self.config.get('training', {}).get('hard_mining', {})
+        loss_type = self.config.get('loss', {}).get('type', 'multi_similarity')
         
         if not hard_mining_config.get('enabled', False):
             self.logger.info("Hard Negative Mining: Disabled")
+            return
+            
+        if loss_type == 'multi_similarity':
+            self.logger.info("Hard Negative Mining: Auto-disabled (Multi-Similarity loss handles it natively intra-graph).")
+            self.hard_miner = None
             return
         
         hard_ratio = hard_mining_config.get('ratio', 0.3)
@@ -395,19 +401,18 @@ class MetricLearningTrainer:
             loss_per_sample = torch.nn.functional.cross_entropy(output, labels, reduction='none')
             
         else:
-            # Fallback: distancia-based loss per sample
+            # Fallback vectorizado acelerado por GPU (O(1) operaciones Python)
             dist_mat = torch.cdist(embeddings, embeddings, p=2)
             labels_expanded = labels.unsqueeze(1)
             pos_mask = (labels_expanded == labels_expanded.t()) & (torch.eye(len(labels), device=embeddings.device) == 0)
             neg_mask = labels_expanded != labels_expanded.t()
             
-            loss_per_sample = torch.zeros(len(embeddings), device=embeddings.device)
+            # Max_pos_dist y Min_neg_dist matricial
+            pos_dist = torch.where(pos_mask, dist_mat, torch.zeros_like(dist_mat)).max(dim=1)[0]
+            neg_dist = torch.where(neg_mask, dist_mat, torch.full_like(dist_mat, float('inf'))).min(dim=1)[0]
             
-            for i in range(len(embeddings)):
-                if pos_mask[i].sum() > 0 and neg_mask[i].sum() > 0:
-                    pos_dist = dist_mat[i][pos_mask[i]].max()
-                    neg_dist = dist_mat[i][neg_mask[i]].min()
-                    loss_per_sample[i] = torch.clamp(pos_dist - neg_dist + 0.2, min=0.0)
+            # Margen de 0.2 constante
+            loss_per_sample = torch.clamp(pos_dist - neg_dist + 0.2, min=0.0)
         
         return loss_per_sample
     

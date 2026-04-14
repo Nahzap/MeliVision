@@ -12,7 +12,7 @@ Secciones:
 import logging
 import os
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -20,10 +20,10 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QLabel, QPushButton,
     QComboBox, QSlider, QSpinBox, QProgressBar, QFormLayout, QSplitter,
     QSizePolicy, QMessageBox, QScrollArea, QFrame, QListWidget, QListWidgetItem,
-    QCheckBox, QDoubleSpinBox
+    QCheckBox, QDoubleSpinBox, QShortcut
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize
-from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor, QPen
+from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QKeySequence
 
 from lib.styles import Styles, Colors
 
@@ -49,11 +49,18 @@ class ClickableImageLabel(QLabel):
     """
     left_clicked = pyqtSignal(int, int)
     right_clicked = pyqtSignal(int, int)
+    left_double_clicked = pyqtSignal(int, int)
+    right_double_clicked = pyqtSignal(int, int)
+    left_dragged = pyqtSignal(int, int)
+    right_dragged = pyqtSignal(int, int)
+    left_released = pyqtSignal(int, int)
+    right_released = pyqtSignal(int, int)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._orig_w = 0
         self._orig_h = 0
+        self.setMouseTracking(True)
 
     def set_original_size(self, w: int, h: int):
         self._orig_w = w
@@ -71,9 +78,51 @@ class ClickableImageLabel(QLabel):
             self.wheel_down.emit()
 
     def mousePressEvent(self, event):
+        mapped = self._map_event_to_orig(event.pos().x(), event.pos().y())
+        if mapped is None:
+            return super().mousePressEvent(event)
+        ox, oy = mapped
+
+        if event.button() == Qt.LeftButton:
+            self.left_clicked.emit(ox, oy)
+        elif event.button() == Qt.RightButton:
+            self.right_clicked.emit(ox, oy)
+
+    def mouseDoubleClickEvent(self, event):
+        mapped = self._map_event_to_orig(event.pos().x(), event.pos().y())
+        if mapped is None:
+            return super().mouseDoubleClickEvent(event)
+        ox, oy = mapped
+        if event.button() == Qt.LeftButton:
+            self.left_double_clicked.emit(ox, oy)
+        elif event.button() == Qt.RightButton:
+            self.right_double_clicked.emit(ox, oy)
+
+    def mouseMoveEvent(self, event):
+        mapped = self._map_event_to_orig(event.pos().x(), event.pos().y())
+        if mapped is not None:
+            ox, oy = mapped
+            btns = event.buttons()
+            if btns & Qt.LeftButton:
+                self.left_dragged.emit(ox, oy)
+            if btns & Qt.RightButton:
+                self.right_dragged.emit(ox, oy)
+        return super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        mapped = self._map_event_to_orig(event.pos().x(), event.pos().y())
+        if mapped is not None:
+            ox, oy = mapped
+            if event.button() == Qt.LeftButton:
+                self.left_released.emit(ox, oy)
+            elif event.button() == Qt.RightButton:
+                self.right_released.emit(ox, oy)
+        return super().mouseReleaseEvent(event)
+
+    def _map_event_to_orig(self, x: int, y: int) -> Optional[Tuple[int, int]]:
         pm = self.pixmap()
         if pm is None or pm.isNull() or self._orig_w == 0:
-            return super().mousePressEvent(event)
+            return None
 
         # Widget may be larger than pixmap — compute offset
         lw, lh = self.width(), self.height()
@@ -81,19 +130,15 @@ class ClickableImageLabel(QLabel):
         off_x = (lw - pw) // 2 if lw > pw else 0
         off_y = (lh - ph) // 2 if lh > ph else 0
 
-        rx = event.pos().x() - off_x
-        ry = event.pos().y() - off_y
+        rx = x - off_x
+        ry = y - off_y
         if rx < 0 or ry < 0 or rx >= pw or ry >= ph:
-            return super().mousePressEvent(event)
+            return None
 
         # Map to original image coords
         ox = int(rx / pw * self._orig_w)
         oy = int(ry / ph * self._orig_h)
-
-        if event.button() == Qt.LeftButton:
-            self.left_clicked.emit(ox, oy)
-        elif event.button() == Qt.RightButton:
-            self.right_clicked.emit(ox, oy)
+        return (ox, oy)
 
 
 class ManualContourWorker(QThread):
@@ -127,21 +172,90 @@ class ManualContourWorker(QThread):
                 self.finished.emit([])
                 return
 
+            click_in_crop_x = cx - x1
+            click_in_crop_y = cy - y1
+
             # Run detector on the local crop
             detector = PollenGrainDetector(config=self.config)
+            saliency = detector._sod.get_saliency_map(crop)
+            seeded = self._u2net_seeded_contour(
+                saliency, crop, click_in_crop_x, click_in_crop_y
+            )
+            if seeded is not None and len(seeded) >= 3:
+                bx, by, bw, bh = cv2.boundingRect(seeded.reshape(-1, 1, 2))
+                local_mask = np.zeros(saliency.shape, dtype=np.uint8)
+                cv2.drawContours(local_mask, [seeded.reshape(-1, 1, 2)], -1, 255, -1)
+                sal_prob = float(np.mean(saliency[local_mask > 0])) if np.any(local_mask > 0) else float(
+                    saliency[min(max(click_in_crop_y, 0), saliency.shape[0] - 1),
+                             min(max(click_in_crop_x, 0), saliency.shape[1] - 1)]
+                )
+                contour_global = seeded.copy()
+                contour_global[:, 0] += x1
+                contour_global[:, 1] += y1
+                grain_dict = {
+                    "index": 0,
+                    "class_index": 0,
+                    "bbox": (bx + x1, by + y1, bw, bh),
+                    "saliency": sal_prob,
+                    "contour": contour_global,
+                }
+                self.finished.emit([grain_dict])
+                return
+
             _, grains = detector.detect(crop)
 
             if not grains:
-                self.finished.emit([])
+                # Fallback SIEMPRE basado en U2NET (sin geometría inventada):
+                # construir región desde saliency conectada al punto semilla.
+                contour_seed = self._u2net_seeded_contour(
+                    saliency, crop, click_in_crop_x, click_in_crop_y
+                )
+                if contour_seed is None or len(contour_seed) < 3:
+                    self.finished.emit([])
+                    return
+
+                bx, by, bw, bh = cv2.boundingRect(contour_seed.reshape(-1, 1, 2))
+                local_mask = np.zeros(saliency.shape, dtype=np.uint8)
+                cv2.drawContours(local_mask, [contour_seed.reshape(-1, 1, 2)], -1, 255, -1)
+                sal_prob = float(np.mean(saliency[local_mask > 0])) if np.any(local_mask > 0) else float(
+                    saliency[min(max(click_in_crop_y, 0), saliency.shape[0] - 1),
+                             min(max(click_in_crop_x, 0), saliency.shape[1] - 1)]
+                )
+
+                contour_global = contour_seed.copy()
+                contour_global[:, 0] += x1
+                contour_global[:, 1] += y1
+
+                grain_dict = {
+                    "index": 0,
+                    "class_index": 0,
+                    "bbox": (bx + x1, by + y1, bw, bh),
+                    "saliency": sal_prob,
+                    "contour": contour_global,
+                }
+                self.finished.emit([grain_dict])
                 return
 
-            # Pick the grain closest to the click point (in crop coords)
-            click_in_crop_x = cx - x1
-            click_in_crop_y = cy - y1
-            best = min(grains, key=lambda g: (
-                (g.centroid[0] - click_in_crop_x) ** 2 +
-                (g.centroid[1] - click_in_crop_y) ** 2
-            ))
+            # Preferir contorno que contenga la semilla; fallback: centroide más cercano.
+            containing = []
+            for g in grains:
+                if g.contour is None or len(g.contour) < 3:
+                    continue
+                inside = cv2.pointPolygonTest(
+                    g.contour.reshape(-1, 1, 2).astype(np.int32),
+                    (float(click_in_crop_x), float(click_in_crop_y)),
+                    False,
+                )
+                if inside >= 0:
+                    containing.append(g)
+
+            if containing:
+                best = max(containing, key=lambda g: float(g.saliency_prob))
+            else:
+                best = min(grains, key=lambda g: (
+                    (g.centroid[0] - click_in_crop_x) ** 2 +
+                    (g.centroid[1] - click_in_crop_y) ** 2
+                ))
 
             # Map contour and bbox back to original image coords
             contour = best.contour.copy() if best.contour is not None else None
@@ -161,6 +275,122 @@ class ManualContourWorker(QThread):
         except Exception as e:
             import traceback
             self.error.emit(f"{e}\n{traceback.format_exc()}")
+
+    @staticmethod
+    def _u2net_seeded_contour(
+        saliency: np.ndarray, crop_bgr: np.ndarray, seed_x: int, seed_y: int
+    ) -> Optional[np.ndarray]:
+        """
+        Deriva UN único contorno externo desde saliency U2NET usando semilla.
+        - Sin Canny.
+        - Selección por componente conectada.
+        - Frontera externa elegida por área (Green/shoelace).
+        """
+        if saliency is None or saliency.size == 0:
+            return None
+
+        h, w = saliency.shape[:2]
+        sx = int(np.clip(seed_x, 0, w - 1))
+        sy = int(np.clip(seed_y, 0, h - 1))
+        seed_val = float(saliency[sy, sx])
+        mean_val = float(np.mean(saliency))
+        std_val = float(np.std(saliency))
+        min_area = max(30, int(0.002 * h * w))
+        max_area = max(min_area + 1, int(0.92 * h * w))
+
+        thresholds = [
+            max(0.30, seed_val * 0.98, mean_val + 0.8 * std_val),
+            max(0.24, seed_val * 0.90, mean_val + 0.5 * std_val),
+            max(0.19, seed_val * 0.80, mean_val + 0.2 * std_val),
+            max(0.15, seed_val * 0.70, mean_val),
+            max(0.12, seed_val * 0.60),
+            max(0.08, mean_val * 0.8),
+        ]
+
+        for thr in thresholds:
+            binary = (saliency >= thr).astype(np.uint8) * 255
+            kernel3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            kernel5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            # Suaviza ruido interno pero mantiene borde principal.
+            binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel3)
+            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel5)
+            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel5)
+
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, 8)
+            if num_labels <= 1:
+                continue
+
+            seed_label = int(labels[sy, sx])
+            if seed_label > 0 and min_area <= stats[seed_label, cv2.CC_STAT_AREA] <= max_area:
+                comp = (labels == seed_label).astype(np.uint8) * 255
+                cnt = ManualContourWorker._single_external_contour(comp)
+                if cnt is not None and len(cnt) >= 3:
+                    return cnt
+
+            # Si la semilla cae fuera, elegir componente más cercana al click
+            best_label = -1
+            best_d2 = float("inf")
+            for lbl in range(1, num_labels):
+                area = int(stats[lbl, cv2.CC_STAT_AREA])
+                if area < min_area or area > max_area:
+                    continue
+                cx, cy = centroids[lbl]
+                d2 = (cx - sx) ** 2 + (cy - sy) ** 2
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best_label = lbl
+
+            if best_label > 0:
+                comp = (labels == best_label).astype(np.uint8) * 255
+                cnt = ManualContourWorker._single_external_contour(comp)
+                if cnt is not None and len(cnt) >= 3:
+                    return cnt
+
+        return None
+
+    @staticmethod
+    def _single_external_contour(mask: np.ndarray) -> Optional[np.ndarray]:
+        """Devuelve un único contorno externo y uniforme de una máscara."""
+        if mask is None or mask.size == 0:
+            return None
+
+        filled = ManualContourWorker._fill_holes(mask)
+        contours, _ = cv2.findContours(filled, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if not contours:
+            return None
+
+        best = max(contours, key=lambda c: abs(ManualContourWorker._green_area(c.reshape(-1, 2))))
+        best = best.reshape(-1, 2).astype(np.int32)
+        # Suavizado leve para evitar contorno "dienteado" interno
+        eps = max(1.0, 0.0025 * cv2.arcLength(best.reshape(-1, 1, 2), True))
+        approx = cv2.approxPolyDP(best.reshape(-1, 1, 2), eps, True)
+        return approx.reshape(-1, 2).astype(np.int32)
+
+    @staticmethod
+    def _fill_holes(mask: np.ndarray) -> np.ndarray:
+        """Rellena huecos internos para obtener máscara uniforme."""
+        m = mask.copy().astype(np.uint8)
+        h, w = m.shape[:2]
+        ff = m.copy()
+        flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+        cv2.floodFill(ff, flood_mask, (0, 0), 255)
+        holes = cv2.bitwise_not(ff)
+        return cv2.bitwise_or(m, holes)
+
+    @staticmethod
+    def _green_area(contour_xy: np.ndarray) -> float:
+        """
+        Área orientada por Teorema de Green (shoelace):
+        A = 1/2 ∮ (x dy - y dx)
+        """
+        if contour_xy is None or len(contour_xy) < 3:
+            return 0.0
+        pts = contour_xy.astype(np.float64)
+        x = pts[:, 0]
+        y = pts[:, 1]
+        x2 = np.roll(x, -1)
+        y2 = np.roll(y, -1)
+        return 0.5 * float(np.sum(x * y2 - x2 * y))
 
 
 # Colores para contornos de granos (cíclicos)
@@ -315,8 +545,31 @@ class ContourAnalysisTab(QWidget):
         self._grains_history = []
         self._active_grain_idx = -1  # Grano activo para fusión incremental
 
+        # Estado de modo de edición
+        self._edit_mode = "auto"  # auto | manual_roi
+
+        # ROI manual (puntos ilimitados include/exclude)
+        self._roi_include_polygons = []
+        self._roi_exclude_polygons = []
+        self._roi_current_include = []
+        self._roi_current_exclude = []
+        self._manual_roi_seed_kind = None  # include | exclude
+        self._manual_roi_seed_point = None  # (x, y)
+        self._roi_include_mask = None  # acumulación unificada en tiempo real
+        self._roi_exclude_mask = None  # acumulación unificada en tiempo real
+        self._roi_block_mask = None  # anclas de exclusión (no expansión)
+        self._roi_block_points = []  # puntos rojos ancla
+        self._roi_last_include_seed = None  # última semilla de inclusión (x, y)
+        self._roi_suggest_points = []  # sugerencias de expansión (puntos azules)
+        self._seed_retry_depth = 0
+        self._pending_ai_seed = None  # (x, y, kind)
+        self._last_include_drag_pt = None
+        self._last_exclude_drag_pt = None
+        self._drag_step_px = 9
+
         self._init_ui()
         self.setFocusPolicy(Qt.StrongFocus)
+        self._setup_shortcuts()
 
         # Auto-cargar .seg existentes al iniciar (deferred para no bloquear)
         from PyQt5.QtCore import QTimer
@@ -325,6 +578,24 @@ class ContourAnalysisTab(QWidget):
 
     def keyPressEvent(self, event):
         key = event.key()
+        if self._is_manual_roi_mode():
+            if key in (Qt.Key_Return, Qt.Key_Enter):
+                # Enter cierra polígono activo; si no hay, aplica ROI.
+                if self._roi_current_include or self._roi_current_exclude:
+                    self._close_active_manual_polygon()
+                else:
+                    self._apply_manual_roi_to_grain()
+                return
+            if key == Qt.Key_C:
+                self._close_active_manual_polygon()
+                return
+            if key == Qt.Key_A:
+                self._apply_manual_roi_to_grain()
+                return
+            if key == Qt.Key_Escape:
+                self._cancel_manual_roi_session()
+                return
+
         if key in (Qt.Key_Return, Qt.Key_Enter):
             if self._seg_dirty:
                 self._on_save_seg()
@@ -334,6 +605,17 @@ class ContourAnalysisTab(QWidget):
             self._on_next_image()
         else:
             super().keyPressEvent(event)
+
+    def _setup_shortcuts(self):
+        """Atajos rápidos de ROI manual (fase 2)."""
+        self._shortcut_close_roi = QShortcut(QKeySequence("C"), self)
+        self._shortcut_close_roi.activated.connect(self._close_active_manual_polygon)
+
+        self._shortcut_apply_roi = QShortcut(QKeySequence("A"), self)
+        self._shortcut_apply_roi.activated.connect(self._apply_manual_roi_to_grain)
+
+        self._shortcut_cancel_roi = QShortcut(QKeySequence("Esc"), self)
+        self._shortcut_cancel_roi.activated.connect(self._cancel_manual_roi_session)
 
     def _init_ui(self):
         layout = QVBoxLayout()
@@ -367,6 +649,7 @@ class ContourAnalysisTab(QWidget):
         layout.addWidget(stats_widget)
 
         self.setLayout(layout)
+        self._on_edit_mode_changed(self.edit_mode_combo.currentIndex())
 
     # =========================================================================
     # Sección 1: Configuración de Segmentación
@@ -647,6 +930,12 @@ class ContourAnalysisTab(QWidget):
         self.image_label.setStyleSheet(f"border: 1px solid {Colors.BORDER_LIGHT}; background: {Colors.BG_WIDGET};")
         self.image_label.left_clicked.connect(self._on_image_left_click)
         self.image_label.right_clicked.connect(self._on_image_right_click)
+        self.image_label.left_double_clicked.connect(self._on_image_left_double_click)
+        self.image_label.right_double_clicked.connect(self._on_image_right_double_click)
+        self.image_label.left_dragged.connect(self._on_image_left_drag)
+        self.image_label.right_dragged.connect(self._on_image_right_drag)
+        self.image_label.left_released.connect(self._on_image_left_release)
+        self.image_label.right_released.connect(self._on_image_right_release)
         self.image_label.wheel_up.connect(self._on_prev_image)
         self.image_label.wheel_down.connect(self._on_next_image)
         center_layout.addWidget(self.image_label)
@@ -726,6 +1015,83 @@ class ContourAnalysisTab(QWidget):
 
         edit_layout.addStretch()
         right_layout.addLayout(edit_layout)
+
+        # --- Edición ROI Manual (fase 1 + fase 2) ---
+        manual_group = QGroupBox("ROI Manual")
+        manual_layout = QVBoxLayout()
+        manual_layout.setContentsMargins(6, 6, 6, 6)
+        manual_layout.setSpacing(4)
+
+        mode_layout = QHBoxLayout()
+        mode_layout.addWidget(QLabel("Modo:"))
+        self.edit_mode_combo = QComboBox()
+        self.edit_mode_combo.addItems([
+            "Auto asistido (U2NET)",
+            "ROI manual (incluir/excluir)",
+        ])
+        self.edit_mode_combo.currentIndexChanged.connect(self._on_edit_mode_changed)
+        mode_layout.addWidget(self.edit_mode_combo)
+        manual_layout.addLayout(mode_layout)
+
+        self.roi_snap_edges_cb = QCheckBox("Snap a borde (opcional)")
+        self.roi_snap_edges_cb.setChecked(True)
+        self.roi_snap_edges_cb.setToolTip("Ajusta cada click al borde más cercano detectado por Canny.")
+        manual_layout.addWidget(self.roi_snap_edges_cb)
+
+        self.roi_ai_assist_cb = QCheckBox("Asistencia AI por click (U2NET)")
+        self.roi_ai_assist_cb.setChecked(True)
+        self.roi_ai_assist_cb.setToolTip(
+            "Cada click se usa como semilla para proponer automáticamente una región local con U2NET."
+        )
+        manual_layout.addWidget(self.roi_ai_assist_cb)
+
+        self.roi_multi_component_cb = QCheckBox("Crear múltiples instancias desde ROI")
+        self.roi_multi_component_cb.setChecked(False)
+        self.roi_multi_component_cb.setToolTip(
+            "Si ROI final tiene varias islas, crea múltiples granos. "
+            "Desactivar para usar solo el contorno mayor."
+        )
+        manual_layout.addWidget(self.roi_multi_component_cb)
+
+        close_row = QHBoxLayout()
+        self.btn_close_include = QPushButton("Cerrar inclusión")
+        self.btn_close_include.clicked.connect(
+            lambda: self._close_manual_polygon("include")
+        )
+        close_row.addWidget(self.btn_close_include)
+
+        self.btn_close_exclude = QPushButton("Cerrar exclusión")
+        self.btn_close_exclude.clicked.connect(
+            lambda: self._close_manual_polygon("exclude")
+        )
+        close_row.addWidget(self.btn_close_exclude)
+        manual_layout.addLayout(close_row)
+
+        action_row = QHBoxLayout()
+        self.btn_apply_roi = QPushButton("Aplicar ROI")
+        self.btn_apply_roi.clicked.connect(self._apply_manual_roi_to_grain)
+        action_row.addWidget(self.btn_apply_roi)
+
+        self.btn_clear_roi = QPushButton("Limpiar ROI")
+        self.btn_clear_roi.clicked.connect(self._clear_manual_roi_points)
+        action_row.addWidget(self.btn_clear_roi)
+
+        self.btn_cancel_roi = QPushButton("Cancelar")
+        self.btn_cancel_roi.clicked.connect(self._cancel_manual_roi_session)
+        action_row.addWidget(self.btn_cancel_roi)
+        manual_layout.addLayout(action_row)
+
+        self.roi_hint_label = QLabel(
+            "Izq: incluir (semilla AI U2NET)  |  Der: ancla roja (bloquea expansión)\n"
+            "Si desactivas asistencia AI: clicks agregan puntos manuales include/exclude.\n"
+            "Atajos: C cerrar, A aplicar, Esc cancelar"
+        )
+        self.roi_hint_label.setStyleSheet("color: #888; font-size: 11px;")
+        self.roi_hint_label.setWordWrap(True)
+        manual_layout.addWidget(self.roi_hint_label)
+
+        manual_group.setLayout(manual_layout)
+        right_layout.addWidget(manual_group)
 
         right_layout.addStretch()
         right_container.setLayout(right_layout)
@@ -1339,6 +1705,7 @@ class ContourAnalysisTab(QWidget):
         
         # Limpiar historial al cambiar de imagen
         self._clear_history()
+        self._reset_manual_roi_session()
         
         # Buscar .seg en data/annotations/ (sistema centralizado)
         class_name = img_path.parent.name
@@ -1394,10 +1761,25 @@ class ContourAnalysisTab(QWidget):
         # Info de granos
         n = len(self._current_grains)
         active_info = f" [Grano #{self._active_grain_idx} en edición]" if self._active_grain_idx >= 0 else ""
+        if self._is_manual_roi_mode():
+            if self.roi_ai_assist_cb.isChecked():
+                hint = (
+                    "Izq: incluir (semilla AI U2NET) | "
+                    "Der: ancla roja (bloquea expansión verde) | "
+                    "Doble click: cerrar polígono"
+                )
+            else:
+                hint = "Izq: incluir puntos | Der: excluir puntos | Doble click: cerrar polígono"
+        else:
+            hint = "Click izq: añadir/fusionar región | Click der: eliminar contorno o UNDO"
         self.grain_info_label.setText(
             f"{n} grano{'s' if n != 1 else ''}{active_info} — "
-            f"Click izq: añadir/fusionar región | Click der: eliminar contorno o UNDO"
+            f"{hint}"
         )
+        if self._is_manual_roi_mode() and self.roi_ai_assist_cb.isChecked():
+            self.grain_info_label.setText(
+                self.grain_info_label.text() + " | Arrastre izq: sembrado AI continuo | Arrastre der: barrera continua"
+            )
 
         total = len(self._current_images)
         self.nav_label.setText(f"{self._current_image_idx + 1} / {total}")
@@ -1491,6 +1873,749 @@ class ContourAnalysisTab(QWidget):
         self.btn_save_seg.setEnabled(False)
         self.edit_status_label.setText("✓ Guardado")
         self.edit_status_label.setStyleSheet("color: #27ae60; font-size: 11px;")
+
+    def _is_manual_roi_mode(self) -> bool:
+        return self._edit_mode == "manual_roi"
+
+    def _is_ai_roi_assist_enabled(self) -> bool:
+        return self._is_manual_roi_mode() and hasattr(self, "roi_ai_assist_cb") and self.roi_ai_assist_cb.isChecked()
+
+    def _on_edit_mode_changed(self, index: int):
+        self._edit_mode = "manual_roi" if index == 1 else "auto"
+        manual_enabled = self._is_manual_roi_mode()
+        for w in (
+            self.roi_snap_edges_cb,
+            self.roi_ai_assist_cb,
+            self.roi_multi_component_cb,
+            self.btn_close_include,
+            self.btn_close_exclude,
+            self.btn_apply_roi,
+            self.btn_clear_roi,
+            self.btn_cancel_roi,
+            self.roi_hint_label,
+        ):
+            w.setEnabled(manual_enabled)
+
+        if not manual_enabled:
+            self._reset_manual_roi_session()
+        self._redraw_contours()
+
+    def _clear_manual_roi_points(self):
+        self._roi_include_polygons = []
+        self._roi_exclude_polygons = []
+        self._roi_current_include = []
+        self._roi_current_exclude = []
+        self._roi_include_mask = None
+        self._roi_exclude_mask = None
+        self._roi_block_mask = None
+        self._roi_block_points = []
+        self._redraw_contours()
+        if self._is_manual_roi_mode():
+            self.grain_info_label.setText("ROI manual limpio.")
+
+    def _cancel_manual_roi_session(self):
+        if not self._is_manual_roi_mode():
+            return
+        self._reset_manual_roi_session()
+        self._redraw_contours()
+        self.grain_info_label.setText("Edición ROI cancelada.")
+
+    def _reset_manual_roi_session(self):
+        self._roi_include_polygons = []
+        self._roi_exclude_polygons = []
+        self._roi_current_include = []
+        self._roi_current_exclude = []
+        self._manual_roi_seed_kind = None
+        self._manual_roi_seed_point = None
+        self._roi_include_mask = None
+        self._roi_exclude_mask = None
+        self._roi_block_mask = None
+        self._roi_block_points = []
+        self._roi_last_include_seed = None
+        self._roi_suggest_points = []
+        self._seed_retry_depth = 0
+        self._pending_ai_seed = None
+        self._last_include_drag_pt = None
+        self._last_exclude_drag_pt = None
+
+    def _close_manual_polygon(self, kind: str):
+        if not self._is_manual_roi_mode():
+            return
+        if kind == "include":
+            if len(self._roi_current_include) >= 3:
+                self._roi_include_polygons.append(self._roi_current_include.copy())
+            self._roi_current_include = []
+        elif kind == "exclude":
+            if len(self._roi_current_exclude) >= 3:
+                self._roi_exclude_polygons.append(self._roi_current_exclude.copy())
+            self._roi_current_exclude = []
+        self._redraw_contours()
+
+    def _close_active_manual_polygon(self):
+        if not self._is_manual_roi_mode():
+            return
+        if len(self._roi_current_include) >= 3:
+            self._close_manual_polygon("include")
+            self.grain_info_label.setText("Polígono de inclusión cerrado.")
+            return
+        if len(self._roi_current_exclude) >= 3:
+            self._close_manual_polygon("exclude")
+            self.grain_info_label.setText("Polígono de exclusión cerrado.")
+            return
+        self.grain_info_label.setText("No hay polígono activo con al menos 3 puntos.")
+
+    def _maybe_snap_to_edge(self, x: int, y: int, radius: int = 12) -> Tuple[int, int]:
+        """Ajusta el punto al borde local más cercano (opcional)."""
+        if (
+            not self._is_manual_roi_mode()
+            or self._current_image_bgr is None
+            or not self.roi_snap_edges_cb.isChecked()
+        ):
+            return (x, y)
+
+        img = self._current_image_bgr
+        h, w = img.shape[:2]
+        x1 = max(0, x - radius)
+        y1 = max(0, y - radius)
+        x2 = min(w, x + radius + 1)
+        y2 = min(h, y + radius + 1)
+        roi = img[y1:y2, x1:x2]
+        if roi.size == 0:
+            return (x, y)
+
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 80, 160)
+        ys, xs = np.where(edges > 0)
+        if len(xs) == 0:
+            return (x, y)
+
+        abs_xs = xs + x1
+        abs_ys = ys + y1
+        d2 = (abs_xs - x) ** 2 + (abs_ys - y) ** 2
+        k = int(np.argmin(d2))
+        return (int(abs_xs[k]), int(abs_ys[k]))
+
+    def _ensure_roi_masks(self):
+        """Inicializa máscaras acumuladas de ROI con tamaño de imagen actual."""
+        if self._current_image_bgr is None:
+            return
+        h, w = self._current_image_bgr.shape[:2]
+        if self._roi_include_mask is None or self._roi_include_mask.shape != (h, w):
+            self._roi_include_mask = np.zeros((h, w), dtype=np.uint8)
+        if self._roi_exclude_mask is None or self._roi_exclude_mask.shape != (h, w):
+            self._roi_exclude_mask = np.zeros((h, w), dtype=np.uint8)
+        if self._roi_block_mask is None or self._roi_block_mask.shape != (h, w):
+            self._roi_block_mask = np.zeros((h, w), dtype=np.uint8)
+
+    def _add_exclusion_anchor(self, x: int, y: int, radius: int = 4):
+        """
+        Agrega ancla roja de exclusión:
+        - bloquea expansión futura de inclusión en ese punto;
+        - elimina localmente ese punto del área verde ya acumulada.
+        """
+        self._ensure_roi_masks()
+        if self._roi_block_mask is None:
+            return
+        cx, cy = int(x), int(y)
+        # Frente de puntos: cada ancla agrega disco + posible conexión al punto previo.
+        cv2.circle(self._roi_block_mask, (cx, cy), int(radius), 255, -1)
+        if self._roi_block_points:
+            px, py = self._roi_block_points[-1]
+            dist = float(((cx - px) ** 2 + (cy - py) ** 2) ** 0.5)
+            if dist <= 120.0:
+                thickness = max(2, int(radius * 2))
+                cv2.line(
+                    self._roi_block_mask,
+                    (int(px), int(py)),
+                    (cx, cy),
+                    255,
+                    thickness=thickness,
+                )
+        self._roi_block_points.append((cx, cy))
+        if self._roi_include_mask is not None:
+            inhibit = self._get_anchor_inhibit_mask()
+            self._roi_include_mask[inhibit > 0] = 0
+            self._prune_disconnected_include_regions()
+
+    def _get_anchor_inhibit_mask(self, dilation_px: int = 6) -> np.ndarray:
+        """Construye máscara de inhibición a partir de anclas rojas."""
+        self._ensure_roi_masks()
+        if self._roi_block_mask is None:
+            return None
+        if dilation_px <= 0:
+            return self._roi_block_mask.copy()
+        k = 2 * int(dilation_px) + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        return cv2.dilate(self._roi_block_mask, kernel, iterations=1)
+
+    def _prune_disconnected_include_regions(self, seed: Optional[Tuple[int, int]] = None):
+        """
+        Elimina regiones verdes inconexas, conservando solo el componente principal.
+        Prioridad:
+        1) componente que contiene la semilla indicada;
+        2) componente que contiene la última semilla de inclusión;
+        3) componente de mayor área.
+        """
+        if self._roi_include_mask is None:
+            return
+        mask = self._roi_include_mask
+        if np.count_nonzero(mask) == 0:
+            return
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+        if num_labels <= 2:
+            return
+
+        h, w = mask.shape[:2]
+
+        def _label_at(pt):
+            if pt is None:
+                return 0
+            x, y = int(pt[0]), int(pt[1])
+            if x < 0 or y < 0 or x >= w or y >= h:
+                return 0
+            return int(labels[y, x])
+
+        keep_label = _label_at(seed)
+        if keep_label <= 0:
+            keep_label = _label_at(self._roi_last_include_seed)
+        if keep_label <= 0:
+            comps = [(lbl, int(stats[lbl, cv2.CC_STAT_AREA])) for lbl in range(1, num_labels)]
+            comps = [c for c in comps if c[1] > 0]
+            if not comps:
+                return
+            keep_label = max(comps, key=lambda c: c[1])[0]
+
+        pruned = np.zeros_like(mask, dtype=np.uint8)
+        pruned[labels == keep_label] = 255
+        self._roi_include_mask = pruned
+
+    def _apply_ai_exclusion_contour(self, contour: np.ndarray, seed: Optional[Tuple[int, int]] = None):
+        """
+        Aplica exclusión asistida por U2NET de forma controlada:
+        - toma la región propuesta por U2NET;
+        - selecciona el componente conectado más relevante para la semilla;
+        - restringe la sustracción al entorno de la máscara verde (evita recortes lejanos).
+        """
+        self._ensure_roi_masks()
+        if contour is None or len(contour) < 3 or self._roi_include_mask is None:
+            return
+
+        h, w = self._roi_include_mask.shape[:2]
+        cand = np.zeros((h, w), dtype=np.uint8)
+        pts = contour.reshape(-1, 1, 2).astype(np.int32)
+        cv2.drawContours(cand, [pts], -1, 255, -1)
+
+        # Elegir componente conectado guiado por semilla (o más cercano).
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(cand, 8)
+        chosen = None
+        if num_labels > 1:
+            if seed is not None:
+                sx = int(np.clip(seed[0], 0, w - 1))
+                sy = int(np.clip(seed[1], 0, h - 1))
+                lbl = int(labels[sy, sx])
+                if lbl > 0 and stats[lbl, cv2.CC_STAT_AREA] >= 3:
+                    chosen = (labels == lbl).astype(np.uint8) * 255
+            if chosen is None:
+                # fallback: componente más cercana a semilla o mayor área
+                if seed is not None:
+                    sx, sy = seed
+                    best_lbl = -1
+                    best_d2 = float("inf")
+                    for lbl in range(1, num_labels):
+                        area = int(stats[lbl, cv2.CC_STAT_AREA])
+                        if area < 3:
+                            continue
+                        cx, cy = centroids[lbl]
+                        d2 = (cx - sx) ** 2 + (cy - sy) ** 2
+                        if d2 < best_d2:
+                            best_d2 = d2
+                            best_lbl = lbl
+                    if best_lbl > 0:
+                        chosen = (labels == best_lbl).astype(np.uint8) * 255
+                if chosen is None:
+                    areas = [(lbl, int(stats[lbl, cv2.CC_STAT_AREA])) for lbl in range(1, num_labels)]
+                    areas = [x for x in areas if x[1] >= 3]
+                    if areas:
+                        best_lbl = max(areas, key=lambda x: x[1])[0]
+                        chosen = (labels == best_lbl).astype(np.uint8) * 255
+        else:
+            chosen = cand
+
+        if chosen is None:
+            return
+
+        # Exclusión LOCAL alrededor de la semilla para evitar "comerse" toda la máscara.
+        include_local = cv2.bitwise_and(chosen, self._roi_include_mask)
+        if np.count_nonzero(include_local) == 0:
+            # Si no intersecta con verde, al menos bloquear su región para siguientes expansiones.
+            self._roi_block_mask = cv2.bitwise_or(self._roi_block_mask, chosen)
+            return
+
+        x, y, bw, bh = cv2.boundingRect(chosen)
+        local_radius = int(np.clip(0.22 * max(bw, bh), 10, 42))
+        if seed is not None:
+            sx = int(np.clip(seed[0], 0, w - 1))
+            sy = int(np.clip(seed[1], 0, h - 1))
+        else:
+            sx = int(np.clip(x + bw // 2, 0, w - 1))
+            sy = int(np.clip(y + bh // 2, 0, h - 1))
+
+        local_circle = np.zeros((h, w), dtype=np.uint8)
+        cv2.circle(local_circle, (sx, sy), local_radius, 255, -1)
+        remove_mask = cv2.bitwise_and(include_local, local_circle)
+
+        if np.count_nonzero(remove_mask) == 0:
+            # fallback local: punto más cercano dentro de include_local
+            ys, xs = np.where(include_local > 0)
+            if len(xs) == 0:
+                return
+            d2 = (xs - sx) ** 2 + (ys - sy) ** 2
+            k = int(np.argmin(d2))
+            px, py = int(xs[k]), int(ys[k])
+            local_circle = np.zeros((h, w), dtype=np.uint8)
+            cv2.circle(local_circle, (px, py), max(8, local_radius // 2), 255, -1)
+            remove_mask = cv2.bitwise_and(include_local, local_circle)
+
+        if np.count_nonzero(remove_mask) == 0:
+            return
+
+        # Límite de seguridad: no retirar más de una fracción por click.
+        include_area = int(np.count_nonzero(self._roi_include_mask))
+        max_remove = max(40, int(0.18 * include_area))
+        rem_area = int(np.count_nonzero(remove_mask))
+        if rem_area > max_remove and seed is not None:
+            ys, xs = np.where(remove_mask > 0)
+            d2 = (xs - sx) ** 2 + (ys - sy) ** 2
+            order = np.argsort(d2)
+            keep_idx = order[:max_remove]
+            limited = np.zeros((h, w), dtype=np.uint8)
+            limited[ys[keep_idx], xs[keep_idx]] = 255
+            remove_mask = limited
+
+        # Quitar realmente de la máscara verde y bloquear re-expansión local.
+        self._roi_include_mask[remove_mask > 0] = 0
+        self._roi_block_mask = cv2.bitwise_or(self._roi_block_mask, remove_mask)
+        self._prune_disconnected_include_regions(seed=self._roi_last_include_seed)
+
+    def _accumulate_roi_seed_contour(self, kind: str, contour: np.ndarray, seed: Optional[Tuple[int, int]] = None):
+        """
+        Acumula la región de una semilla en máscaras unificadas (unión progresiva).
+        Esto evita que queden submáscaras separadas sin integración.
+        """
+        self._ensure_roi_masks()
+        if contour is None or len(contour) < 3:
+            return
+
+        poly = contour.reshape(-1, 2).astype(np.int32)
+        fill = np.zeros_like(self._roi_include_mask, dtype=np.uint8)
+        cv2.drawContours(fill, [poly.reshape(-1, 1, 2)], -1, 255, -1)
+
+        if kind == "include":
+            # Las anclas rojas bloquean expansión de la zona verde
+            inhibit = self._get_anchor_inhibit_mask()
+            if inhibit is not None:
+                fill = cv2.bitwise_and(fill, cv2.bitwise_not(inhibit))
+            self._roi_include_mask = cv2.bitwise_or(self._roi_include_mask, fill)
+            self._roi_last_include_seed = seed
+            self._prune_disconnected_include_regions(seed=seed)
+            # En modo AI, evitar duplicar geometría en listas de polígonos
+            # (la máscara acumulada es la fuente de verdad).
+            if not self._is_ai_roi_assist_enabled():
+                self._roi_include_polygons.append([(int(p[0]), int(p[1])) for p in poly])
+        else:
+            self._roi_exclude_mask = cv2.bitwise_or(self._roi_exclude_mask, fill)
+            if not self._is_ai_roi_assist_enabled():
+                self._roi_exclude_polygons.append([(int(p[0]), int(p[1])) for p in poly])
+
+    def _request_ai_roi_seed(self, x_orig: int, y_orig: int, kind: str):
+        """Lanza propuesta local U2NET para click-semilla include/exclude."""
+        if self._current_image_bgr is None:
+            return
+        if hasattr(self, "_manual_worker") and self._manual_worker is not None and self._manual_worker.isRunning():
+            self._pending_ai_seed = (int(x_orig), int(y_orig), kind)
+            return
+        if not self._check_weights_exist():
+            return
+
+        sx, sy = self._maybe_snap_to_edge(x_orig, y_orig)
+        self._manual_roi_seed_kind = kind
+        self._manual_roi_seed_point = (sx, sy)
+
+        config = self._get_config()
+        self.grain_info_label.setText(
+            f"U2-Net proponiendo región {'inclusión' if kind == 'include' else 'exclusión'} en ({sx}, {sy})..."
+        )
+        self._manual_worker = ManualContourWorker(
+            self._current_image_bgr, sx, sy, config, crop_radius=300
+        )
+        self._manual_worker.finished.connect(self._on_manual_roi_seed_result)
+        self._manual_worker.error.connect(self._on_manual_roi_seed_error)
+        self._manual_worker.start()
+
+    def _drain_pending_ai_seed(self):
+        if self._pending_ai_seed is None:
+            return
+        x, y, kind = self._pending_ai_seed
+        self._pending_ai_seed = None
+        self._request_ai_roi_seed(x, y, kind)
+
+    def _is_far_enough_from_last(self, last_pt: Optional[Tuple[int, int]], x: int, y: int) -> bool:
+        if last_pt is None:
+            return True
+        dx = int(x) - int(last_pt[0])
+        dy = int(y) - int(last_pt[1])
+        return (dx * dx + dy * dy) >= (self._drag_step_px * self._drag_step_px)
+
+    def _suggest_expansion_points(
+        self, seed: Optional[Tuple[int, int]], max_points: int = 6
+    ) -> List[Tuple[int, int]]:
+        """
+        Sugiere puntos de expansión alrededor del borde del área verde actual.
+        Prioriza vecindad de la semilla fallida y cobertura del frente de crecimiento.
+        """
+        if self._roi_include_mask is None or np.count_nonzero(self._roi_include_mask) == 0:
+            return []
+
+        mask = self._roi_include_mask
+        h, w = mask.shape[:2]
+        ring = cv2.dilate(
+            mask,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+            iterations=1,
+        )
+        ring = cv2.bitwise_and(ring, cv2.bitwise_not(mask))
+        ys, xs = np.where(ring > 0)
+        if len(xs) == 0:
+            return []
+
+        if seed is not None:
+            sx = int(np.clip(seed[0], 0, w - 1))
+            sy = int(np.clip(seed[1], 0, h - 1))
+        else:
+            sx, sy = w // 2, h // 2
+
+        d2 = (xs - sx) ** 2 + (ys - sy) ** 2
+        order = np.argsort(d2)
+        candidates = [(int(xs[i]), int(ys[i])) for i in order[: min(len(order), 2000)]]
+
+        picked = []
+        min_sep2 = 18 * 18
+        for p in candidates:
+            if all((p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 >= min_sep2 for q in picked):
+                picked.append(p)
+            if len(picked) >= max_points:
+                break
+        return picked
+
+    def _on_manual_roi_seed_result(self, grain_dicts):
+        """Callback de semilla AI: agrega contorno propuesto a include o exclude."""
+        kind = self._manual_roi_seed_kind
+        seed = self._manual_roi_seed_point
+        self._manual_roi_seed_kind = None
+        self._manual_roi_seed_point = None
+
+        if kind not in ("include", "exclude"):
+            self.grain_info_label.setText("Semilla AI sin contexto de edición.")
+            return
+
+        contour = None
+        if grain_dicts:
+            contour = grain_dicts[0].get("contour")
+
+        if contour is None or len(contour) < 3:
+            if kind == "include" and self._is_ai_roi_assist_enabled() and self._seed_retry_depth < 2:
+                self._seed_retry_depth += 1
+                suggestions = self._suggest_expansion_points(seed, max_points=6)
+                self._roi_suggest_points = suggestions
+                self._redraw_contours()
+                if suggestions:
+                    nx, ny = suggestions[0]
+                    self.grain_info_label.setText(
+                        f"No se detectó en semilla {seed}. Sugerencia de expansión en ({nx}, {ny}) "
+                        f"[reintento {self._seed_retry_depth}/2]."
+                    )
+                    self._request_ai_roi_seed(nx, ny, "include")
+                    return
+            self.grain_info_label.setText(
+                "U2-Net no pudo derivar región válida para esta semilla."
+            )
+            return
+
+        if kind == "exclude" and self._is_ai_roi_assist_enabled():
+            self._apply_ai_exclusion_contour(contour, seed=seed)
+        else:
+            self._accumulate_roi_seed_contour(kind, contour, seed=seed)
+            if kind == "include":
+                self._seed_retry_depth = 0
+                self._roi_suggest_points = []
+
+        self._redraw_contours()
+        incl_stat = (
+            np.count_nonzero(self._roi_include_mask) if self._roi_include_mask is not None else len(self._roi_include_polygons)
+        )
+        excl_stat = (
+            len(self._roi_block_points) if self._is_ai_roi_assist_enabled()
+            else (np.count_nonzero(self._roi_exclude_mask) if self._roi_exclude_mask is not None else len(self._roi_exclude_polygons))
+        )
+        self.grain_info_label.setText(
+            f"Región AI {'incluida' if kind == 'include' else 'excluida'} desde semilla {seed}. "
+            f"Incl: {incl_stat} | Excl/anclas: {excl_stat}"
+        )
+        self._drain_pending_ai_seed()
+
+    def _on_manual_roi_seed_error(self, error_msg: str):
+        self._manual_roi_seed_kind = None
+        self._manual_roi_seed_point = None
+        self.grain_info_label.setText(f"Error U2-Net semilla ROI: {error_msg[:80]}")
+        logger.error(f"[ManualROI] Error semilla AI: {error_msg}")
+        self._drain_pending_ai_seed()
+
+    def _build_manual_roi_mask(self) -> Optional[np.ndarray]:
+        from src.grain_detection.manual_roi import rasterize_polygons
+
+        if self._current_image_bgr is None:
+            return None
+        h, w = self._current_image_bgr.shape[:2]
+
+        # Polígonos manuales (solo cuando NO se usa asistencia AI por semilla)
+        if self._is_ai_roi_assist_enabled():
+            include_mask_poly = np.zeros((h, w), dtype=np.uint8)
+            exclude_mask_poly = np.zeros((h, w), dtype=np.uint8)
+        else:
+            include_polys = self._roi_include_polygons.copy()
+            exclude_polys = self._roi_exclude_polygons.copy()
+            # Cerrar implícitamente polígonos en curso al aplicar si tienen >=3 puntos
+            if len(self._roi_current_include) >= 3:
+                include_polys.append(self._roi_current_include.copy())
+            if len(self._roi_current_exclude) >= 3:
+                exclude_polys.append(self._roi_current_exclude.copy())
+            include_mask_poly = rasterize_polygons((h, w), include_polys)
+            exclude_mask_poly = rasterize_polygons((h, w), exclude_polys)
+
+        include_mask = include_mask_poly
+        exclude_mask = exclude_mask_poly
+
+        # Integrar también acumulación unificada de semillas AI
+        if self._roi_include_mask is not None and self._roi_include_mask.shape == (h, w):
+            include_mask = cv2.bitwise_or(include_mask, self._roi_include_mask)
+        if self._roi_exclude_mask is not None and self._roi_exclude_mask.shape == (h, w):
+            exclude_mask = cv2.bitwise_or(exclude_mask, self._roi_exclude_mask)
+        if self._roi_block_mask is not None and self._roi_block_mask.shape == (h, w):
+            exclude_mask = cv2.bitwise_or(exclude_mask, self._roi_block_mask)
+
+        if np.count_nonzero(include_mask) == 0:
+            return None
+        keep_mask = cv2.bitwise_and(include_mask, cv2.bitwise_not(exclude_mask))
+        return keep_mask
+
+    def _draw_manual_roi_overlay(self, base_image: np.ndarray) -> np.ndarray:
+        """Dibuja overlay semitransparente de ROI manual sobre la imagen."""
+        out = base_image.copy()
+        overlay = out.copy()
+        ai_mode = self._is_ai_roi_assist_enabled()
+
+        def _draw_poly(polys, color_fill, color_line):
+            for poly in polys:
+                if len(poly) >= 3:
+                    pts = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
+                    cv2.fillPoly(overlay, [pts], color_fill)
+                    cv2.polylines(out, [pts], isClosed=True, color=color_line, thickness=2)
+
+        # En modo manual puro, mostrar polígonos explícitos.
+        # En modo AI, la fuente de verdad son las máscaras acumuladas.
+        if not ai_mode:
+            _draw_poly(self._roi_include_polygons, (0, 140, 0), (0, 255, 0))
+            for poly in self._roi_exclude_polygons:
+                if len(poly) >= 3:
+                    pts = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
+                    cv2.polylines(out, [pts], isClosed=True, color=(0, 0, 255), thickness=2)
+
+        # Máscara verde acumulada unificada
+        if self._roi_include_mask is not None:
+            overlay[self._roi_include_mask > 0] = (0, 140, 0)
+        # Zona bloqueada/excluida en rojo suave para depuración visual
+        if self._roi_block_mask is not None:
+            overlay[self._roi_block_mask > 0] = (0, 0, 120)
+
+        cv2.addWeighted(overlay, 0.25, out, 0.75, 0.0, out)
+
+        # Dibujar anclas rojas explícitas
+        for px, py in self._roi_block_points:
+            cv2.circle(out, (int(px), int(py)), 4, (0, 0, 255), 2)
+
+        # Sugerencias de expansión (puntos azules)
+        for sx, sy in self._roi_suggest_points:
+            cv2.circle(out, (int(sx), int(sy)), 4, (255, 120, 0), 2)
+
+        def _draw_open(points, color):
+            if not points:
+                return
+            pts = np.array(points, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.polylines(out, [pts], isClosed=False, color=color, thickness=2)
+            for p in points:
+                cv2.circle(out, (int(p[0]), int(p[1])), 3, color, -1)
+
+        _draw_open(self._roi_current_include, (0, 255, 0))
+        _draw_open(self._roi_current_exclude, (0, 0, 255))
+        return out
+
+    def _apply_manual_roi_to_grain(self):
+        """Aplica ROI manual include/exclude al grano activo o crea instancias nuevas."""
+        if not self._is_manual_roi_mode() or self._current_image_bgr is None:
+            return
+
+        mask = self._build_manual_roi_mask()
+        if mask is None:
+            self.grain_info_label.setText("ROI manual vacío: falta polígono de inclusión.")
+            return
+
+        from src.grain_detection.manual_roi import extract_contours_from_mask, contour_bbox
+
+        contours = extract_contours_from_mask(mask, min_area=3.0)
+        if not contours:
+            self.grain_info_label.setText("ROI resultante vacío tras aplicar exclusión.")
+            return
+
+        self._push_history()
+        multi = self.roi_multi_component_cb.isChecked()
+        contour_list = contours if multi else contours[:1]
+
+        # Selección inteligente de destino:
+        # - si la ROI nueva solapa fuertemente un grano existente, se interpreta como edición;
+        # - si no solapa, se agrega como nuevo objeto (evita reemplazos erróneos).
+        target_idx = self._find_best_overlapping_grain(mask)
+
+        if target_idx >= 0:
+            base_sal = float(self._current_grains[target_idx].get("saliency", 0.5))
+        else:
+            base_sal = 0.5
+
+        created = []
+        for c in contour_list:
+            bx, by, bw, bh = contour_bbox(c)
+            created.append(
+                {
+                    "index": 0,
+                    "class_index": 0,
+                    "bbox": (bx, by, bw, bh),
+                    "saliency": base_sal,
+                    "contour": c.astype(np.int32),
+                }
+            )
+
+        if target_idx >= 0:
+            # Reemplaza grano target y opcionalmente agrega componentes extra.
+            self._current_grains[target_idx] = created[0]
+            for extra in created[1:]:
+                self._current_grains.append(extra)
+            self._selected_grain_idx = target_idx
+            self._active_grain_idx = target_idx
+        else:
+            self._current_grains.extend(created)
+            self._selected_grain_idx = len(self._current_grains) - len(created)
+            self._active_grain_idx = self._selected_grain_idx
+
+        for i, g in enumerate(self._current_grains):
+            g["index"] = i
+
+        self._mark_dirty()
+        self._reset_manual_roi_session()
+        self._redraw_contours()
+        self._show_selected_grain()
+        self.grain_info_label.setText(
+            f"ROI aplicado. {len(created)} instancia{'s' if len(created) != 1 else ''} "
+            f"actualizada{'s' if len(created) != 1 else ''}."
+        )
+
+    def _find_best_overlapping_grain(self, roi_mask: np.ndarray, min_overlap: float = 0.25) -> int:
+        """
+        Retorna el índice del grano con mayor solapamiento con roi_mask.
+        Si no hay solapamiento suficiente, retorna -1 para forzar creación de nuevo objeto.
+        """
+        if roi_mask is None or not self._current_grains:
+            return -1
+
+        best_idx = -1
+        best_score = 0.0
+        h, w = roi_mask.shape[:2]
+
+        for idx, grain in enumerate(self._current_grains):
+            contour = grain.get("contour")
+            if contour is None or len(contour) < 3:
+                continue
+
+            gmask = np.zeros((h, w), dtype=np.uint8)
+            pts = contour.reshape(-1, 1, 2).astype(np.int32)
+            cv2.drawContours(gmask, [pts], -1, 255, -1)
+
+            inter = cv2.bitwise_and(roi_mask, gmask)
+            inter_area = float(np.count_nonzero(inter))
+            grain_area = float(np.count_nonzero(gmask))
+            if grain_area <= 0:
+                continue
+
+            # fracción del grano cubierta por ROI nueva
+            overlap = inter_area / grain_area
+            if overlap > best_score:
+                best_score = overlap
+                best_idx = idx
+
+        return best_idx if best_score >= min_overlap else -1
+
+    def _delete_grain_near_point(self, x_orig: int, y_orig: int) -> bool:
+        """
+        Elimina el grano cercano al punto (si corresponde). Retorna True si eliminó.
+        """
+        if self._current_image_bgr is None or not self._current_grains:
+            return False
+
+        best_idx = -1
+        best_dist = float("inf")
+        for i, grain in enumerate(self._current_grains):
+            bx, by, bw, bh = grain["bbox"]
+            cx = bx + bw // 2
+            cy = by + bh // 2
+            dist = ((x_orig - cx) ** 2 + (y_orig - cy) ** 2) ** 0.5
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = i
+
+        if best_idx < 0:
+            return False
+
+        grain = self._current_grains[best_idx]
+        bx, by, bw, bh = grain["bbox"]
+        max_dist = max(bw, bh) * 1.5
+        if best_dist > max_dist:
+            return False
+
+        self._push_history()
+        removed = self._current_grains.pop(best_idx)
+        logger.info(f"[ManualContour] Eliminado grano #{best_idx} por click derecho, bbox={removed['bbox']}")
+
+        for i, g in enumerate(self._current_grains):
+            g["index"] = i
+
+        self._mark_dirty()
+        self._redraw_contours()
+
+        if len(self._current_grains) == 0:
+            self._selected_grain_idx = -1
+            self._active_grain_idx = -1
+            self.crop_label.setText("Sin granos")
+            self.grain_meta_label.setText("")
+            self.grain_nav_label.setText("—")
+        else:
+            self._selected_grain_idx = min(best_idx, len(self._current_grains) - 1)
+            if self._active_grain_idx == best_idx:
+                self._active_grain_idx = -1
+            self._show_selected_grain()
+
+        self.grain_info_label.setText(
+            f"Grano #{best_idx} eliminado. {len(self._current_grains)} restantes."
+        )
+        return True
 
     def _on_delete_grain(self):
         """Elimina el grano seleccionado de la anotación actual."""
@@ -1641,8 +2766,24 @@ class ContourAnalysisTab(QWidget):
     # =========================================================================
 
     def _on_image_left_click(self, x_orig, y_orig):
-        """Left-click: propose a new contour at (x_orig, y_orig) using U2-Net."""
+        """Click izquierdo: auto U2NET o agregar punto de inclusión (ROI manual)."""
         if self._current_image_bgr is None:
+            return
+
+        if self._is_manual_roi_mode():
+            if self.roi_ai_assist_cb.isChecked():
+                self._seed_retry_depth = 0
+                self._roi_suggest_points = []
+                self._last_include_drag_pt = (int(x_orig), int(y_orig))
+                self._request_ai_roi_seed(x_orig, y_orig, "include")
+            else:
+                sx, sy = self._maybe_snap_to_edge(x_orig, y_orig)
+                self._last_include_drag_pt = (int(sx), int(sy))
+                self._roi_current_include.append((sx, sy))
+                self._redraw_contours()
+                self.grain_info_label.setText(
+                    f"Inclusión manual: {len(self._roi_current_include)} punto(s) en polígono activo."
+                )
             return
 
         # Prevent multiple concurrent workers
@@ -1662,6 +2803,20 @@ class ContourAnalysisTab(QWidget):
         self._manual_worker.finished.connect(self._on_manual_contour_result)
         self._manual_worker.error.connect(self._on_manual_contour_error)
         self._manual_worker.start()
+
+    def _on_image_left_double_click(self, x_orig, y_orig):
+        """Doble click izquierdo: cierra polígono de inclusión en ROI manual."""
+        if not self._is_manual_roi_mode():
+            return
+        self._close_manual_polygon("include")
+        self.grain_info_label.setText("Polígono de inclusión cerrado.")
+
+    def _on_image_right_double_click(self, x_orig, y_orig):
+        """Doble click derecho: cierra polígono de exclusión en ROI manual."""
+        if not self._is_manual_roi_mode():
+            return
+        self._close_manual_polygon("exclude")
+        self.grain_info_label.setText("Polígono de exclusión cerrado.")
 
     def _on_manual_contour_result(self, grain_dicts):
         """Callback when U2-Net manual contour suggestion finishes.
@@ -1768,7 +2923,7 @@ class ContourAnalysisTab(QWidget):
         logger.error(f"[ManualContour] Error: {error_msg}")
 
     def _on_image_right_click(self, x_orig, y_orig):
-        """Right-click: ELIMINAR contorno cercano al click, o UNDO si no hay contorno cerca.
+        """Click derecho: excluir punto (ROI manual) o eliminar/undo (modo auto).
         
         Comportamiento inteligente:
         1. Si hay un grano cercano al click → ELIMINAR ese grano
@@ -1776,59 +2931,40 @@ class ContourAnalysisTab(QWidget):
         """
         if self._current_image_bgr is None:
             return
-        
-        # Buscar grano más cercano al click
-        best_idx = -1
-        best_dist = float('inf')
-        
-        for i, grain in enumerate(self._current_grains):
-            bx, by, bw, bh = grain["bbox"]
-            cx = bx + bw // 2
-            cy = by + bh // 2
-            dist = ((x_orig - cx) ** 2 + (y_orig - cy) ** 2) ** 0.5
-            if dist < best_dist:
-                best_dist = dist
-                best_idx = i
-        
-        # Si hay un grano y el click está razonablemente cerca, ELIMINAR
-        if best_idx >= 0:
-            grain = self._current_grains[best_idx]
-            bx, by, bw, bh = grain["bbox"]
-            max_dist = max(bw, bh) * 1.5  # 1.5x el lado más grande del bbox
-            
-            if best_dist <= max_dist:
-                # Guardar estado antes de eliminar
-                self._push_history()
-                
-                # Eliminar el grano
-                removed = self._current_grains.pop(best_idx)
-                logger.info(f"[ManualContour] Eliminado grano #{best_idx} por click derecho, bbox={removed['bbox']}")
-                
-                # Re-indexar
-                for i, g in enumerate(self._current_grains):
-                    g["index"] = i
-                
-                self._mark_dirty()
-                self._redraw_contours()
-                
-                # Ajustar selección
-                if len(self._current_grains) == 0:
-                    self._selected_grain_idx = -1
-                    self._active_grain_idx = -1
-                    self.crop_label.setText("Sin granos")
-                    self.grain_meta_label.setText("")
-                    self.grain_nav_label.setText("—")
-                else:
-                    self._selected_grain_idx = min(best_idx, len(self._current_grains) - 1)
-                    if self._active_grain_idx == best_idx:
-                        self._active_grain_idx = -1  # Desactivar si se eliminó el grano activo
-                    self._show_selected_grain()
-                
-                self.grain_info_label.setText(
-                    f"Grano #{best_idx} eliminado. {len(self._current_grains)} restantes. "
-                    f"Click der en vacío para UNDO."
-                )
+
+        if self._is_manual_roi_mode():
+            has_mask_work = self._roi_include_mask is not None and np.count_nonzero(self._roi_include_mask) > 0
+            has_include_work = bool(self._roi_include_polygons or self._roi_current_include or has_mask_work)
+
+            # Si no se está construyendo inclusión, mantener comportamiento de borrado
+            # para evitar confusión entre objetos ya creados.
+            if not has_include_work and self._delete_grain_near_point(x_orig, y_orig):
                 return
+
+            if self.roi_ai_assist_cb.isChecked():
+                sx, sy = self._maybe_snap_to_edge(x_orig, y_orig)
+                self._last_exclude_drag_pt = (int(sx), int(sy))
+                self._add_exclusion_anchor(sx, sy, radius=4)
+                self._redraw_contours()
+                self.grain_info_label.setText(
+                    f"Barrera roja extendida en ({sx}, {sy}). Bloquea expansión del ROI verde."
+                )
+            else:
+                sx, sy = self._maybe_snap_to_edge(x_orig, y_orig)
+                self._last_exclude_drag_pt = (int(sx), int(sy))
+                self._roi_current_exclude.append((sx, sy))
+                self._redraw_contours()
+                self.grain_info_label.setText(
+                    f"Exclusión manual: {len(self._roi_current_exclude)} punto(s) en polígono activo."
+                )
+            return
+
+        # Modo auto: primero intentar eliminar grano cercano
+        if self._delete_grain_near_point(x_orig, y_orig):
+            self.grain_info_label.setText(
+                f"{self.grain_info_label.text()} Click der en vacío para UNDO."
+            )
+            return
         
         # Si NO hay grano cercano, hacer UNDO
         if not self._grains_history:
@@ -1867,6 +3003,46 @@ class ContourAnalysisTab(QWidget):
         )
         logger.info(f"[ManualContour] UNDO ejecutado. Historial: {n_history} estados")
 
+    def _on_image_left_drag(self, x_orig, y_orig):
+        """Arrastre izquierdo: sembrado continuo para inclusión."""
+        if self._current_image_bgr is None or not self._is_manual_roi_mode():
+            return
+        if not self._is_far_enough_from_last(self._last_include_drag_pt, x_orig, y_orig):
+            return
+
+        if self.roi_ai_assist_cb.isChecked():
+            self._last_include_drag_pt = (int(x_orig), int(y_orig))
+            self._request_ai_roi_seed(x_orig, y_orig, "include")
+        else:
+            sx, sy = self._maybe_snap_to_edge(x_orig, y_orig)
+            self._last_include_drag_pt = (int(sx), int(sy))
+            self._roi_current_include.append((sx, sy))
+            self._redraw_contours()
+
+    def _on_image_right_drag(self, x_orig, y_orig):
+        """Arrastre derecho: barrera roja continua o exclusión manual continua."""
+        if self._current_image_bgr is None or not self._is_manual_roi_mode():
+            return
+        if not self._is_far_enough_from_last(self._last_exclude_drag_pt, x_orig, y_orig):
+            return
+
+        if self.roi_ai_assist_cb.isChecked():
+            sx, sy = self._maybe_snap_to_edge(x_orig, y_orig)
+            self._last_exclude_drag_pt = (int(sx), int(sy))
+            self._add_exclusion_anchor(sx, sy, radius=4)
+            self._redraw_contours()
+        else:
+            sx, sy = self._maybe_snap_to_edge(x_orig, y_orig)
+            self._last_exclude_drag_pt = (int(sx), int(sy))
+            self._roi_current_exclude.append((sx, sy))
+            self._redraw_contours()
+
+    def _on_image_left_release(self, x_orig, y_orig):
+        self._last_include_drag_pt = None
+
+    def _on_image_right_release(self, x_orig, y_orig):
+        self._last_exclude_drag_pt = None
+
     def _redraw_contours(self):
         """Re-dibuja los contornos sobre la imagen actual sin recargar."""
         if self._current_image_bgr is None:
@@ -1885,14 +3061,28 @@ class ContourAnalysisTab(QWidget):
             cv2.putText(annotated, f"#{i}", (bx, by - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
+        if self._is_manual_roi_mode():
+            annotated = self._draw_manual_roi_overlay(annotated)
+
         pixmap = numpy_to_qpixmap(annotated, max_width=700, max_height=500)
         self.image_label.setPixmap(pixmap)
 
         n = len(self._current_grains)
         edit_tag = " ● Editado" if self._seg_dirty else ""
+        if self._is_manual_roi_mode():
+            if self.roi_ai_assist_cb.isChecked():
+                click_mode = "semilla U2NET + ancla roja"
+            else:
+                click_mode = "puntos manuales"
+            hint = (
+                f"Modo ROI manual ({click_mode}): Izq incluir | Der ancla/excluir | "
+                f"C cerrar | A aplicar | Esc cancelar"
+            )
+        else:
+            hint = "Click izq: proponer contorno | Click der: eliminar contorno"
         self.grain_info_label.setText(
             f"{n} grano{'s' if n != 1 else ''}{edit_tag} — "
-            f"Click izq: proponer contorno | Click der: eliminar contorno"
+            f"{hint}"
         )
 
     # =========================================================================
