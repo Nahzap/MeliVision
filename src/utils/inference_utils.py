@@ -728,6 +728,91 @@ def overlay_gradcam_on_image(
     return blended
 
 
+def project_heatmap_to_full_image(
+    crop_heatmap: np.ndarray,
+    grain_bbox: Tuple[int, int, int, int],
+    crop_padding: float,
+    full_image_shape: Tuple[int, int]
+) -> np.ndarray:
+    """
+    Proyecta un heatmap de un recorte (crop) de vuelta a las dimensiones
+    de la imagen completa original, usando las coordenadas del bounding box.
+    
+    Args:
+        crop_heatmap: Heatmap generado sobre el tensor del crop (H_crop, W_crop)
+        grain_bbox: Tupla (x, y, w, h) del grano en la imagen original
+        crop_padding: Padding usado al recortar (ej. 0.2)
+        full_image_shape: Forma de la imagen completa (H, W, ...)
+        
+    Returns:
+        Heatmap de tamaño (full_H, full_W) proyectado en la ubicación del grano.
+    """
+    import cv2
+    
+    h_img, w_img = full_image_shape[:2]
+    bx, by, bw, bh = grain_bbox
+
+    pad_x = int(bw * crop_padding)
+    pad_y = int(bh * crop_padding)
+    side = max(bw + 2 * pad_x, bh + 2 * pad_y)
+
+    cx = bx + bw // 2
+    cy = by + bh // 2
+    x1 = cx - side // 2
+    y1 = cy - side // 2
+    x2 = x1 + side
+    y2 = y1 + side
+
+    # Redimensionar el heatmap (que típicamente es 224x224 o similar) al tamaño real del recorte (side x side)
+    heatmap_resized = cv2.resize(crop_heatmap, (side, side), interpolation=cv2.INTER_LINEAR)
+
+    # Crear lienzo en blanco del tamaño de la imagen original
+    full_heatmap = np.zeros((h_img, w_img), dtype=np.float32)
+
+    # Calcular intersección válida con la imagen original (evitar bordes fuera de límite)
+    valid_x1 = max(0, x1)
+    valid_y1 = max(0, y1)
+    valid_x2 = min(w_img, x2)
+    valid_y2 = min(h_img, y2)
+
+    crop_x1 = valid_x1 - x1
+    crop_y1 = valid_y1 - y1
+    crop_x2 = side - (x2 - valid_x2)
+    crop_y2 = side - (y2 - valid_y2)
+
+    if valid_x2 > valid_x1 and valid_y2 > valid_y1:
+        full_heatmap[valid_y1:valid_y2, valid_x1:valid_x2] = heatmap_resized[crop_y1:crop_y2, crop_x1:crop_x2]
+
+    return full_heatmap
+
+
+def overlay_full_image_gradcam(
+    full_image: np.ndarray,
+    heatmaps_and_bboxes: List[Tuple[np.ndarray, Tuple[int, int, int, int]]],
+    crop_padding: float = 0.2,
+    alpha: float = 0.5
+) -> np.ndarray:
+    """
+    Superpone múltiples heatmaps de granos sobre la imagen original completa.
+    
+    Args:
+        full_image: Imagen BGR original completa (H, W, 3)
+        heatmaps_and_bboxes: Lista de tuplas (crop_heatmap, (x, y, w, h))
+        crop_padding: Padding usado en la extracción de recortes
+        alpha: Transparencia de la superposición
+    """
+    full_canvas = np.zeros(full_image.shape[:2], dtype=np.float32)
+    
+    for crop_heatmap, bbox in heatmaps_and_bboxes:
+        projected_hm = project_heatmap_to_full_image(
+            crop_heatmap, bbox, crop_padding, full_image.shape
+        )
+        # Combinar heatmaps (pueden superponerse)
+        full_canvas = np.maximum(full_canvas, projected_hm)
+        
+    return overlay_gradcam_on_image(full_image, full_canvas, alpha=alpha)
+
+
 def get_embedding_with_tta(
     model: nn.Module,
     image_path: str,

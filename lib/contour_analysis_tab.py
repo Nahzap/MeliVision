@@ -11,6 +11,8 @@ Secciones:
 
 import logging
 import os
+import json
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -72,10 +74,16 @@ class ClickableImageLabel(QLabel):
 
     def wheelEvent(self, event):
         delta = event.angleDelta().y()
-        if delta > 0:
-            self.wheel_up.emit()
-        elif delta < 0:
-            self.wheel_down.emit()
+        # Navegación de imágenes SOLO con Ctrl + wheel.
+        # Wheel sin Ctrl queda disponible para el comportamiento normal del widget.
+        if event.modifiers() & Qt.ControlModifier:
+            if delta > 0:
+                self.wheel_up.emit()
+            elif delta < 0:
+                self.wheel_down.emit()
+            event.accept()
+            return
+        super().wheelEvent(event)
 
     def mousePressEvent(self, event):
         mapped = self._map_event_to_orig(event.pos().x(), event.pos().y())
@@ -145,6 +153,8 @@ class ManualContourWorker(QThread):
     """Run U2-Net on a local crop around a click point (non-blocking)."""
     finished = pyqtSignal(list)   # list of grain dicts (may be empty)
     error = pyqtSignal(str)
+    _detector_cache_lock = threading.Lock()
+    _detector_cache = {}
 
     def __init__(self, image_bgr, click_x, click_y, config, crop_radius=250):
         super().__init__()
@@ -156,125 +166,122 @@ class ManualContourWorker(QThread):
 
     def run(self):
         try:
-            from src.grain_detection.grain_detector import PollenGrainDetector
             h_img, w_img = self.image_bgr.shape[:2]
             cx, cy = self.click_x, self.click_y
-            r = self.crop_radius
+            radii = [
+                int(self.crop_radius),
+                int(self.crop_radius * 1.6),
+                int(self.crop_radius * 2.2),
+            ]
 
-            # Extract local crop around the click point
-            x1 = max(0, cx - r)
-            y1 = max(0, cy - r)
-            x2 = min(w_img, cx + r)
-            y2 = min(h_img, cy + r)
-            crop = self.image_bgr[y1:y2, x1:x2]
+            detector = self._get_or_create_detector(self.config)
+            best_candidate = None
 
-            if crop.size == 0:
-                self.finished.emit([])
-                return
+            for r in radii:
+                r = int(max(80, min(max(h_img, w_img), r)))
+                x1 = max(0, cx - r)
+                y1 = max(0, cy - r)
+                x2 = min(w_img, cx + r)
+                y2 = min(h_img, cy + r)
+                crop = self.image_bgr[y1:y2, x1:x2]
+                if crop.size == 0:
+                    continue
 
-            click_in_crop_x = cx - x1
-            click_in_crop_y = cy - y1
-
-            # Run detector on the local crop
-            detector = PollenGrainDetector(config=self.config)
-            saliency = detector._sod.get_saliency_map(crop)
-            seeded = self._u2net_seeded_contour(
-                saliency, crop, click_in_crop_x, click_in_crop_y
-            )
-            if seeded is not None and len(seeded) >= 3:
-                bx, by, bw, bh = cv2.boundingRect(seeded.reshape(-1, 1, 2))
-                local_mask = np.zeros(saliency.shape, dtype=np.uint8)
-                cv2.drawContours(local_mask, [seeded.reshape(-1, 1, 2)], -1, 255, -1)
-                sal_prob = float(np.mean(saliency[local_mask > 0])) if np.any(local_mask > 0) else float(
-                    saliency[min(max(click_in_crop_y, 0), saliency.shape[0] - 1),
-                             min(max(click_in_crop_x, 0), saliency.shape[1] - 1)]
-                )
-                contour_global = seeded.copy()
-                contour_global[:, 0] += x1
-                contour_global[:, 1] += y1
-                grain_dict = {
-                    "index": 0,
-                    "class_index": 0,
-                    "bbox": (bx + x1, by + y1, bw, bh),
-                    "saliency": sal_prob,
-                    "contour": contour_global,
-                }
-                self.finished.emit([grain_dict])
-                return
-
-            _, grains = detector.detect(crop)
-
-            if not grains:
-                # Fallback SIEMPRE basado en U2NET (sin geometría inventada):
-                # construir región desde saliency conectada al punto semilla.
-                contour_seed = self._u2net_seeded_contour(
+                click_in_crop_x = cx - x1
+                click_in_crop_y = cy - y1
+                saliency = detector._sod.get_saliency_map(crop)
+                seeded = self._u2net_seeded_contour(
                     saliency, crop, click_in_crop_x, click_in_crop_y
                 )
-                if contour_seed is None or len(contour_seed) < 3:
-                    self.finished.emit([])
-                    return
+                if seeded is None or len(seeded) < 3:
+                    continue
 
-                bx, by, bw, bh = cv2.boundingRect(contour_seed.reshape(-1, 1, 2))
-                local_mask = np.zeros(saliency.shape, dtype=np.uint8)
-                cv2.drawContours(local_mask, [contour_seed.reshape(-1, 1, 2)], -1, 255, -1)
-                sal_prob = float(np.mean(saliency[local_mask > 0])) if np.any(local_mask > 0) else float(
-                    saliency[min(max(click_in_crop_y, 0), saliency.shape[0] - 1),
-                             min(max(click_in_crop_x, 0), saliency.shape[1] - 1)]
+                area_ratio = self._contour_area_ratio(seeded, crop.shape[0], crop.shape[1])
+                touch_border = self._contour_touches_crop_border(
+                    seeded, crop.shape[0], crop.shape[1], margin=2
                 )
+                if area_ratio > 0.72:
+                    # Rechazar propuestas que cubren casi todo el recorte.
+                    continue
+                candidate = self._build_grain_dict_from_local(
+                    seeded, saliency, click_in_crop_x, click_in_crop_y, x1, y1
+                )
+                if not touch_border:
+                    self.finished.emit([candidate])
+                    return
+                best_candidate = candidate
 
-                contour_global = contour_seed.copy()
-                contour_global[:, 0] += x1
-                contour_global[:, 1] += y1
-
-                grain_dict = {
-                    "index": 0,
-                    "class_index": 0,
-                    "bbox": (bx + x1, by + y1, bw, bh),
-                    "saliency": sal_prob,
-                    "contour": contour_global,
-                }
-                self.finished.emit([grain_dict])
+            if best_candidate is not None:
+                self.finished.emit([best_candidate])
                 return
 
-            # Preferir contorno que contenga la semilla; fallback: centroide más cercano.
-            containing = []
-            for g in grains:
-                if g.contour is None or len(g.contour) < 3:
-                    continue
-                inside = cv2.pointPolygonTest(
-                    g.contour.reshape(-1, 1, 2).astype(np.int32),
-                    (float(click_in_crop_x), float(click_in_crop_y)),
-                    False,
-                )
-                if inside >= 0:
-                    containing.append(g)
-
-            if containing:
-                best = max(containing, key=lambda g: float(g.saliency_prob))
-            else:
-                best = min(grains, key=lambda g: (
-                    (g.centroid[0] - click_in_crop_x) ** 2 +
-                    (g.centroid[1] - click_in_crop_y) ** 2
-                ))
-
-            # Map contour and bbox back to original image coords
-            contour = best.contour.copy() if best.contour is not None else None
-            if contour is not None:
-                contour[:, 0] += x1
-                contour[:, 1] += y1
-
-            bx, by, bw, bh = best.bbox
-            grain_dict = {
-                "index": 0,
-                "class_index": 0,
-                "bbox": (bx + x1, by + y1, bw, bh),
-                "saliency": best.saliency_prob,
-                "contour": contour,
-            }
-            self.finished.emit([grain_dict])
+            self.finished.emit([])
         except Exception as e:
             import traceback
             self.error.emit(f"{e}\n{traceback.format_exc()}")
+
+    @classmethod
+    def _get_or_create_detector(cls, config):
+        from src.grain_detection.grain_detector import PollenGrainDetector
+
+        key = json.dumps(config or {}, sort_keys=True, default=str)
+        with cls._detector_cache_lock:
+            detector = cls._detector_cache.get(key)
+            if detector is None:
+                detector = PollenGrainDetector(config=config)
+                cls._detector_cache[key] = detector
+        return detector
+
+    @staticmethod
+    def _build_grain_dict_from_local(
+        contour_local: np.ndarray,
+        saliency: np.ndarray,
+        click_x: int,
+        click_y: int,
+        x_offset: int,
+        y_offset: int,
+    ) -> Dict:
+        bx, by, bw, bh = cv2.boundingRect(contour_local.reshape(-1, 1, 2))
+        local_mask = np.zeros(saliency.shape, dtype=np.uint8)
+        cv2.drawContours(local_mask, [contour_local.reshape(-1, 1, 2)], -1, 255, -1)
+        sal_prob = float(np.mean(saliency[local_mask > 0])) if np.any(local_mask > 0) else float(
+            saliency[
+                min(max(click_y, 0), saliency.shape[0] - 1),
+                min(max(click_x, 0), saliency.shape[1] - 1),
+            ]
+        )
+        contour_global = contour_local.copy()
+        contour_global[:, 0] += x_offset
+        contour_global[:, 1] += y_offset
+        return {
+            "index": 0,
+            "class_index": 0,
+            "bbox": (bx + x_offset, by + y_offset, bw, bh),
+            "saliency": sal_prob,
+            "contour": contour_global,
+        }
+
+    @staticmethod
+    def _contour_touches_crop_border(
+        contour_local: np.ndarray, h: int, w: int, margin: int = 1
+    ) -> bool:
+        if contour_local is None or len(contour_local) < 3:
+            return True
+        x = contour_local[:, 0]
+        y = contour_local[:, 1]
+        return bool(
+            np.any(x <= margin)
+            or np.any(y <= margin)
+            or np.any(x >= (w - 1 - margin))
+            or np.any(y >= (h - 1 - margin))
+        )
+
+    @staticmethod
+    def _contour_area_ratio(contour_local: np.ndarray, h: int, w: int) -> float:
+        if contour_local is None or len(contour_local) < 3 or h <= 0 or w <= 0:
+            return 0.0
+        area = abs(cv2.contourArea(contour_local.reshape(-1, 1, 2).astype(np.int32)))
+        return float(area) / float(h * w)
 
     @staticmethod
     def _u2net_seeded_contour(
@@ -296,7 +303,9 @@ class ManualContourWorker(QThread):
         mean_val = float(np.mean(saliency))
         std_val = float(np.std(saliency))
         min_area = max(30, int(0.002 * h * w))
-        max_area = max(min_area + 1, int(0.92 * h * w))
+        # Evitar que la propuesta salte al fondo completo del recorte.
+        max_ratio = float(np.clip(0.35 + 0.35 * seed_val, 0.40, 0.70))
+        max_area = max(min_area + 1, int(max_ratio * h * w))
 
         thresholds = [
             max(0.30, seed_val * 0.98, mean_val + 0.8 * std_val),
@@ -323,8 +332,13 @@ class ManualContourWorker(QThread):
             seed_label = int(labels[sy, sx])
             if seed_label > 0 and min_area <= stats[seed_label, cv2.CC_STAT_AREA] <= max_area:
                 comp = (labels == seed_label).astype(np.uint8) * 255
+                comp = ManualContourWorker._grow_mask_with_saliency(
+                    comp, saliency, seed_val=seed_val, max_iter=24
+                )
                 cnt = ManualContourWorker._single_external_contour(comp)
-                if cnt is not None and len(cnt) >= 3:
+                if cnt is not None and len(cnt) >= 3 and ManualContourWorker._is_valid_seeded_contour(
+                    cnt, h, w, sx, sy, max_ratio=max_ratio
+                ):
                     return cnt
 
             # Si la semilla cae fuera, elegir componente más cercana al click
@@ -341,12 +355,45 @@ class ManualContourWorker(QThread):
                     best_label = lbl
 
             if best_label > 0:
+                # Evitar componentes demasiado lejanas a la semilla.
+                cx, cy = centroids[best_label]
+                diag = float((h * h + w * w) ** 0.5)
+                if ((cx - sx) ** 2 + (cy - sy) ** 2) ** 0.5 > 0.38 * diag:
+                    continue
                 comp = (labels == best_label).astype(np.uint8) * 255
+                comp = ManualContourWorker._grow_mask_with_saliency(
+                    comp, saliency, seed_val=seed_val, max_iter=20
+                )
                 cnt = ManualContourWorker._single_external_contour(comp)
-                if cnt is not None and len(cnt) >= 3:
+                if cnt is not None and len(cnt) >= 3 and ManualContourWorker._is_valid_seeded_contour(
+                    cnt, h, w, sx, sy, max_ratio=max_ratio
+                ):
                     return cnt
 
         return None
+
+    @staticmethod
+    def _is_valid_seeded_contour(
+        contour_xy: np.ndarray, h: int, w: int, sx: int, sy: int, max_ratio: float
+    ) -> bool:
+        """Filtra contornos que suelen corresponder a fondo/recorte completo."""
+        if contour_xy is None or len(contour_xy) < 3:
+            return False
+        cnt = contour_xy.reshape(-1, 1, 2).astype(np.int32)
+        area = abs(cv2.contourArea(cnt))
+        ratio = float(area) / float(max(1, h * w))
+        if ratio > max_ratio:
+            return False
+
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        if bw >= int(0.96 * w) and bh >= int(0.96 * h):
+            return False
+
+        # La semilla debe estar dentro o muy cerca del contorno propuesto.
+        inside = cv2.pointPolygonTest(cnt, (float(sx), float(sy)), True)
+        if inside < -6.0:
+            return False
+        return True
 
     @staticmethod
     def _single_external_contour(mask: np.ndarray) -> Optional[np.ndarray]:
@@ -365,6 +412,39 @@ class ManualContourWorker(QThread):
         eps = max(1.0, 0.0025 * cv2.arcLength(best.reshape(-1, 1, 2), True))
         approx = cv2.approxPolyDP(best.reshape(-1, 1, 2), eps, True)
         return approx.reshape(-1, 2).astype(np.int32)
+
+    @staticmethod
+    def _grow_mask_with_saliency(
+        mask: np.ndarray, saliency: np.ndarray, seed_val: float, max_iter: int = 20
+    ) -> np.ndarray:
+        """
+        Expande máscara guiada por saliency para cubrir mejor objetos grandes.
+        Crece solo donde saliency es compatible con región objetivo.
+        """
+        if mask is None or saliency is None:
+            return mask
+        out = mask.copy().astype(np.uint8)
+        if np.count_nonzero(out) == 0:
+            return out
+
+        mean_val = float(np.mean(saliency))
+        std_val = float(np.std(saliency))
+        # Umbral de crecimiento conservador pero útil para completar borde.
+        grow_thr = max(0.07, min(seed_val * 0.80, mean_val + 0.12 * std_val))
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        for _ in range(max_iter):
+            ring = cv2.dilate(out, kernel, iterations=1)
+            ring = cv2.bitwise_and(ring, cv2.bitwise_not(out))
+            candidates = (saliency >= grow_thr).astype(np.uint8) * 255
+            add = cv2.bitwise_and(ring, candidates)
+            if np.count_nonzero(add) == 0:
+                break
+            out = cv2.bitwise_or(out, add)
+
+        # Limpieza suave final
+        out = cv2.morphologyEx(out, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+        return out
 
     @staticmethod
     def _fill_holes(mask: np.ndarray) -> np.ndarray:
@@ -540,6 +620,7 @@ class ContourAnalysisTab(QWidget):
         self._current_image_bgr = None
         self._seg_dirty = False  # True si se editó el .seg actual sin guardar
         self._current_seg_path = None  # Ruta del .seg cargado
+        self._class_to_image_indices = {}  # navegación rápida por clase
         
         # Historial de cambios para UNDO (stack de estados de grains)
         self._grains_history = []
@@ -562,10 +643,13 @@ class ContourAnalysisTab(QWidget):
         self._roi_last_include_seed = None  # última semilla de inclusión (x, y)
         self._roi_suggest_points = []  # sugerencias de expansión (puntos azules)
         self._seed_retry_depth = 0
-        self._pending_ai_seed = None  # (x, y, kind)
+        self._pending_ai_seeds = []  # cola FIFO [(x, y, kind), ...]
         self._last_include_drag_pt = None
         self._last_exclude_drag_pt = None
         self._drag_step_px = 9
+        self._preserve_union_mode = True  # no descartar propuestas previas implícitamente
+        self._roi_seed_trace = []  # historial visual permanente de semillas usadas
+        self._active_seed_trace_idx = -1
 
         self._init_ui()
         self.setFocusPolicy(Qt.StrongFocus)
@@ -919,6 +1003,24 @@ class ContourAnalysisTab(QWidget):
         self.btn_next.setMaximumWidth(32)
         self.btn_next.clicked.connect(self._on_next_image)
         nav_layout.addWidget(self.btn_next)
+
+        # Navegación rápida por clase + número de imagen en clase
+        nav_layout.addWidget(QLabel("Clase:"))
+        self.quick_class_combo = QComboBox()
+        self.quick_class_combo.setMinimumWidth(140)
+        self.quick_class_combo.currentTextChanged.connect(self._on_quick_class_changed)
+        nav_layout.addWidget(self.quick_class_combo)
+
+        nav_layout.addWidget(QLabel("Img#:"))
+        self.quick_image_spin = QSpinBox()
+        self.quick_image_spin.setRange(1, 1)
+        self.quick_image_spin.setMaximumWidth(70)
+        self.quick_image_spin.valueChanged.connect(self._on_quick_image_number_changed)
+        nav_layout.addWidget(self.quick_image_spin)
+
+        self.quick_image_total_label = QLabel("/1")
+        self.quick_image_total_label.setMinimumWidth(36)
+        nav_layout.addWidget(self.quick_image_total_label)
 
         nav_layout.addStretch()
         center_layout.addLayout(nav_layout)
@@ -1636,6 +1738,10 @@ class ContourAnalysisTab(QWidget):
 
         self._current_images = images
         self._current_image_idx = 0
+        self._class_to_image_indices = {}
+        for idx, img in enumerate(images):
+            cls = img.parent.name
+            self._class_to_image_indices.setdefault(cls, []).append(idx)
 
         # Poblar combo de imágenes con clase como prefijo y estado de .seg
         self.image_combo.blockSignals(True)
@@ -1650,6 +1756,7 @@ class ContourAnalysisTab(QWidget):
             self.image_combo.addItem(f"[{cls_name}] {img.stem} [sin .seg]", str(img))
         
         self.image_combo.blockSignals(False)
+        self._refresh_quick_class_controls()
 
         if images:
             self.image_combo.setCurrentIndex(0)
@@ -1662,6 +1769,11 @@ class ContourAnalysisTab(QWidget):
             )
             self.grain_info_label.setText("")
             self.nav_label.setText("0 / 0")
+            self.quick_image_spin.blockSignals(True)
+            self.quick_image_spin.setRange(1, 1)
+            self.quick_image_spin.setValue(1)
+            self.quick_image_spin.blockSignals(False)
+            self.quick_image_total_label.setText("/0")
 
     def _on_image_changed(self, image_name):
         """Cuando cambia la imagen seleccionada en el combo."""
@@ -1679,6 +1791,75 @@ class ContourAnalysisTab(QWidget):
         if self._current_image_idx < len(self._current_images) - 1:
             self._current_image_idx += 1
             self.image_combo.setCurrentIndex(self._current_image_idx)
+
+    def _refresh_quick_class_controls(self):
+        """Refresca combos de navegación rápida clase/índice."""
+        self.quick_class_combo.blockSignals(True)
+        current_cls = None
+        if self._current_images and 0 <= self._current_image_idx < len(self._current_images):
+            current_cls = self._current_images[self._current_image_idx].parent.name
+
+        self.quick_class_combo.clear()
+        for cls in sorted(self._class_to_image_indices.keys()):
+            self.quick_class_combo.addItem(cls)
+
+        if current_cls and current_cls in self._class_to_image_indices:
+            idx = self.quick_class_combo.findText(current_cls)
+            if idx >= 0:
+                self.quick_class_combo.setCurrentIndex(idx)
+        self.quick_class_combo.blockSignals(False)
+        self._update_quick_image_controls()
+
+    def _update_quick_image_controls(self):
+        """Ajusta spinner de índice según clase activa en quick nav."""
+        cls = self.quick_class_combo.currentText()
+        indices = self._class_to_image_indices.get(cls, [])
+        n = len(indices)
+        self.quick_image_spin.blockSignals(True)
+        if n <= 0:
+            self.quick_image_spin.setRange(1, 1)
+            self.quick_image_spin.setValue(1)
+            self.quick_image_total_label.setText("/0")
+            self.quick_image_spin.blockSignals(False)
+            return
+
+        self.quick_image_spin.setRange(1, n)
+        if self._current_images and 0 <= self._current_image_idx < len(self._current_images):
+            if self._current_image_idx in indices:
+                pos = indices.index(self._current_image_idx) + 1
+            else:
+                pos = 1
+        else:
+            pos = 1
+        self.quick_image_spin.setValue(pos)
+        self.quick_image_total_label.setText(f"/{n}")
+        self.quick_image_spin.blockSignals(False)
+
+    def _on_quick_class_changed(self, class_name: str):
+        """Salta a la primera imagen de la clase seleccionada."""
+        if not class_name:
+            return
+        indices = self._class_to_image_indices.get(class_name, [])
+        if not indices:
+            self._update_quick_image_controls()
+            return
+        target_idx = indices[0]
+        self._current_image_idx = target_idx
+        self.image_combo.setCurrentIndex(target_idx)
+        self._update_quick_image_controls()
+
+    def _on_quick_image_number_changed(self, value: int):
+        """Salta a la imagen N de la clase seleccionada."""
+        cls = self.quick_class_combo.currentText()
+        indices = self._class_to_image_indices.get(cls, [])
+        if not indices:
+            return
+        pos = int(np.clip(value, 1, len(indices))) - 1
+        target_idx = indices[pos]
+        if target_idx == self._current_image_idx:
+            return
+        self._current_image_idx = target_idx
+        self.image_combo.setCurrentIndex(target_idx)
 
     def _load_current_image(self):
         """Carga la imagen actual y dibuja contornos."""
@@ -1766,12 +1947,12 @@ class ContourAnalysisTab(QWidget):
                 hint = (
                     "Izq: incluir (semilla AI U2NET) | "
                     "Der: ancla roja (bloquea expansión verde) | "
-                    "Doble click: cerrar polígono"
+                    "Doble click: cerrar polígono | Ctrl+Wheel: navegar imágenes"
                 )
             else:
-                hint = "Izq: incluir puntos | Der: excluir puntos | Doble click: cerrar polígono"
+                hint = "Izq: incluir puntos | Der: excluir puntos | Doble click: cerrar polígono | Ctrl+Wheel: navegar imágenes"
         else:
-            hint = "Click izq: añadir/fusionar región | Click der: eliminar contorno o UNDO"
+            hint = "Click izq: añadir/fusionar región | Click der: eliminar contorno o UNDO | Ctrl+Wheel: navegar imágenes"
         self.grain_info_label.setText(
             f"{n} grano{'s' if n != 1 else ''}{active_info} — "
             f"{hint}"
@@ -1783,6 +1964,7 @@ class ContourAnalysisTab(QWidget):
 
         total = len(self._current_images)
         self.nav_label.setText(f"{self._current_image_idx + 1} / {total}")
+        self._sync_quick_controls_to_current_image()
 
         # Seleccionar primer grano
         if self._current_grains:
@@ -1793,6 +1975,18 @@ class ContourAnalysisTab(QWidget):
             self.crop_label.setText("Sin granos")
             self.grain_meta_label.setText("")
             self.grain_nav_label.setText("—")
+
+    def _sync_quick_controls_to_current_image(self):
+        """Sincroniza quick class/spin al índice de imagen actual."""
+        if not self._current_images or self._current_image_idx >= len(self._current_images):
+            return
+        cls = self._current_images[self._current_image_idx].parent.name
+        idx_cls = self.quick_class_combo.findText(cls)
+        if idx_cls >= 0 and self.quick_class_combo.currentIndex() != idx_cls:
+            self.quick_class_combo.blockSignals(True)
+            self.quick_class_combo.setCurrentIndex(idx_cls)
+            self.quick_class_combo.blockSignals(False)
+        self._update_quick_image_controls()
 
     def _on_prev_grain(self):
         if self._current_grains and self._selected_grain_idx > 0:
@@ -1934,9 +2128,11 @@ class ContourAnalysisTab(QWidget):
         self._roi_last_include_seed = None
         self._roi_suggest_points = []
         self._seed_retry_depth = 0
-        self._pending_ai_seed = None
+        self._pending_ai_seeds = []
         self._last_include_drag_pt = None
         self._last_exclude_drag_pt = None
+        self._roi_seed_trace = []
+        self._active_seed_trace_idx = -1
 
     def _close_manual_polygon(self, kind: str):
         if not self._is_manual_roi_mode():
@@ -2035,7 +2231,7 @@ class ContourAnalysisTab(QWidget):
         if self._roi_include_mask is not None:
             inhibit = self._get_anchor_inhibit_mask()
             self._roi_include_mask[inhibit > 0] = 0
-            self._prune_disconnected_include_regions()
+            self._harmonize_include_mask(seed=self._roi_last_include_seed)
 
     def _get_anchor_inhibit_mask(self, dilation_px: int = 6) -> np.ndarray:
         """Construye máscara de inhibición a partir de anclas rojas."""
@@ -2089,6 +2285,49 @@ class ContourAnalysisTab(QWidget):
         pruned = np.zeros_like(mask, dtype=np.uint8)
         pruned[labels == keep_label] = 255
         self._roi_include_mask = pruned
+
+    def _fill_holes_binary(self, mask: np.ndarray) -> np.ndarray:
+        """Rellena huecos internos en máscara binaria."""
+        if mask is None or mask.size == 0:
+            return mask
+        m = mask.copy().astype(np.uint8)
+        h, w = m.shape[:2]
+        ff = m.copy()
+        flood = np.zeros((h + 2, w + 2), dtype=np.uint8)
+        cv2.floodFill(ff, flood, (0, 0), 255)
+        holes = cv2.bitwise_not(ff)
+        return cv2.bitwise_or(m, holes)
+
+    def _harmonize_include_mask(self, seed: Optional[Tuple[int, int]] = None):
+        """
+        Uniformiza máscara verde acumulada para objetos grandes:
+        - cierre morfológico para unir segmentos próximos,
+        - relleno de huecos internos,
+        - eliminación de islas inconexas.
+        """
+        if self._roi_include_mask is None:
+            return
+        if np.count_nonzero(self._roi_include_mask) == 0:
+            return
+
+        area = np.count_nonzero(self._roi_include_mask)
+        # Kernel adaptativo: crece suavemente con el tamaño del objeto.
+        k = int(np.clip(np.sqrt(area) / 45.0, 3, 9))
+        if k % 2 == 0:
+            k += 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+
+        self._roi_include_mask = cv2.morphologyEx(self._roi_include_mask, cv2.MORPH_CLOSE, kernel)
+        self._roi_include_mask = self._fill_holes_binary(self._roi_include_mask)
+
+        # Reaplicar barrera de anclas tras armonizar
+        inhibit = self._get_anchor_inhibit_mask()
+        if inhibit is not None:
+            self._roi_include_mask[inhibit > 0] = 0
+
+        # Modo unión persistente: no descartar componentes previos automáticamente.
+        if not self._preserve_union_mode:
+            self._prune_disconnected_include_regions(seed=seed)
 
     def _apply_ai_exclusion_contour(self, contour: np.ndarray, seed: Optional[Tuple[int, int]] = None):
         """
@@ -2196,7 +2435,7 @@ class ContourAnalysisTab(QWidget):
         # Quitar realmente de la máscara verde y bloquear re-expansión local.
         self._roi_include_mask[remove_mask > 0] = 0
         self._roi_block_mask = cv2.bitwise_or(self._roi_block_mask, remove_mask)
-        self._prune_disconnected_include_regions(seed=self._roi_last_include_seed)
+        self._harmonize_include_mask(seed=self._roi_last_include_seed)
 
     def _accumulate_roi_seed_contour(self, kind: str, contour: np.ndarray, seed: Optional[Tuple[int, int]] = None):
         """
@@ -2218,7 +2457,7 @@ class ContourAnalysisTab(QWidget):
                 fill = cv2.bitwise_and(fill, cv2.bitwise_not(inhibit))
             self._roi_include_mask = cv2.bitwise_or(self._roi_include_mask, fill)
             self._roi_last_include_seed = seed
-            self._prune_disconnected_include_regions(seed=seed)
+            self._harmonize_include_mask(seed=seed)
             # En modo AI, evitar duplicar geometría en listas de polígonos
             # (la máscara acumulada es la fuente de verdad).
             if not self._is_ai_roi_assist_enabled():
@@ -2232,15 +2471,34 @@ class ContourAnalysisTab(QWidget):
         """Lanza propuesta local U2NET para click-semilla include/exclude."""
         if self._current_image_bgr is None:
             return
+        trace_entry = {
+            "x": int(x_orig),
+            "y": int(y_orig),
+            "kind": kind,
+            "status": "queued",
+        }
+        self._roi_seed_trace.append(trace_entry)
+        trace_idx = len(self._roi_seed_trace) - 1
+
         if hasattr(self, "_manual_worker") and self._manual_worker is not None and self._manual_worker.isRunning():
-            self._pending_ai_seed = (int(x_orig), int(y_orig), kind)
+            seed = (int(x_orig), int(y_orig), kind)
+            if not self._pending_ai_seeds or self._pending_ai_seeds[-1] != seed:
+                self._pending_ai_seeds.append(seed)
+            self.grain_info_label.setText(
+                f"U2-Net ocupado. Semilla en cola ({len(self._pending_ai_seeds)} pendiente/s)."
+            )
             return
         if not self._check_weights_exist():
+            self._roi_seed_trace[trace_idx]["status"] = "failed"
             return
 
         sx, sy = self._maybe_snap_to_edge(x_orig, y_orig)
         self._manual_roi_seed_kind = kind
         self._manual_roi_seed_point = (sx, sy)
+        self._active_seed_trace_idx = trace_idx
+        self._roi_seed_trace[trace_idx]["x"] = int(sx)
+        self._roi_seed_trace[trace_idx]["y"] = int(sy)
+        self._roi_seed_trace[trace_idx]["status"] = "running"
 
         config = self._get_config()
         self.grain_info_label.setText(
@@ -2254,10 +2512,9 @@ class ContourAnalysisTab(QWidget):
         self._manual_worker.start()
 
     def _drain_pending_ai_seed(self):
-        if self._pending_ai_seed is None:
+        if not self._pending_ai_seeds:
             return
-        x, y, kind = self._pending_ai_seed
-        self._pending_ai_seed = None
+        x, y, kind = self._pending_ai_seeds.pop(0)
         self._request_ai_roi_seed(x, y, kind)
 
     def _is_far_enough_from_last(self, last_pt: Optional[Tuple[int, int]], x: int, y: int) -> bool:
@@ -2314,8 +2571,12 @@ class ContourAnalysisTab(QWidget):
         seed = self._manual_roi_seed_point
         self._manual_roi_seed_kind = None
         self._manual_roi_seed_point = None
+        trace_idx = self._active_seed_trace_idx
+        self._active_seed_trace_idx = -1
 
         if kind not in ("include", "exclude"):
+            if 0 <= trace_idx < len(self._roi_seed_trace):
+                self._roi_seed_trace[trace_idx]["status"] = "failed"
             self.grain_info_label.setText("Semilla AI sin contexto de edición.")
             return
 
@@ -2324,6 +2585,8 @@ class ContourAnalysisTab(QWidget):
             contour = grain_dicts[0].get("contour")
 
         if contour is None or len(contour) < 3:
+            if 0 <= trace_idx < len(self._roi_seed_trace):
+                self._roi_seed_trace[trace_idx]["status"] = "failed"
             if kind == "include" and self._is_ai_roi_assist_enabled() and self._seed_retry_depth < 2:
                 self._seed_retry_depth += 1
                 suggestions = self._suggest_expansion_points(seed, max_points=6)
@@ -2349,6 +2612,8 @@ class ContourAnalysisTab(QWidget):
             if kind == "include":
                 self._seed_retry_depth = 0
                 self._roi_suggest_points = []
+        if 0 <= trace_idx < len(self._roi_seed_trace):
+            self._roi_seed_trace[trace_idx]["status"] = "ok"
 
         self._redraw_contours()
         incl_stat = (
@@ -2367,6 +2632,10 @@ class ContourAnalysisTab(QWidget):
     def _on_manual_roi_seed_error(self, error_msg: str):
         self._manual_roi_seed_kind = None
         self._manual_roi_seed_point = None
+        trace_idx = self._active_seed_trace_idx
+        self._active_seed_trace_idx = -1
+        if 0 <= trace_idx < len(self._roi_seed_trace):
+            self._roi_seed_trace[trace_idx]["status"] = "failed"
         self.grain_info_label.setText(f"Error U2-Net semilla ROI: {error_msg[:80]}")
         logger.error(f"[ManualROI] Error semilla AI: {error_msg}")
         self._drain_pending_ai_seed()
@@ -2447,6 +2716,22 @@ class ContourAnalysisTab(QWidget):
         # Sugerencias de expansión (puntos azules)
         for sx, sy in self._roi_suggest_points:
             cv2.circle(out, (int(sx), int(sy)), 4, (255, 120, 0), 2)
+
+        # Historial permanente de semillas propuestas
+        for s in self._roi_seed_trace:
+            sx = int(s.get("x", 0))
+            sy = int(s.get("y", 0))
+            status = s.get("status", "queued")
+            kind = s.get("kind", "include")
+            if status == "ok":
+                color = (0, 220, 0) if kind == "include" else (0, 0, 220)
+            elif status == "failed":
+                color = (0, 165, 255)  # naranja
+            elif status == "running":
+                color = (255, 255, 0)  # amarillo
+            else:
+                color = (220, 220, 220)  # queued
+            cv2.circle(out, (sx, sy), 2, color, -1)
 
         def _draw_open(points, color):
             if not points:
@@ -3076,10 +3361,10 @@ class ContourAnalysisTab(QWidget):
                 click_mode = "puntos manuales"
             hint = (
                 f"Modo ROI manual ({click_mode}): Izq incluir | Der ancla/excluir | "
-                f"C cerrar | A aplicar | Esc cancelar"
+                f"C cerrar | A aplicar | Esc cancelar | Ctrl+Wheel navegar"
             )
         else:
-            hint = "Click izq: proponer contorno | Click der: eliminar contorno"
+            hint = "Click izq: proponer contorno | Click der: eliminar contorno | Ctrl+Wheel navegar"
         self.grain_info_label.setText(
             f"{n} grano{'s' if n != 1 else ''}{edit_tag} — "
             f"{hint}"

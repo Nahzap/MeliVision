@@ -1,4 +1,4 @@
-"""
+﻿"""
 Enhanced Metric Learning Trainer with SOTA Techniques (2024)
 Supports Multi-Similarity Loss, ArcFace, Triplet Loss, and advanced training strategies
 
@@ -27,6 +27,7 @@ from src.losses.sg_softmax import SGSoftmaxLoss
 from src.losses.dada_wrapper import DADAWrapper
 from src.training.ema_teacher import EMATeacher, SelfDistillationLoss
 from src.training.hard_mining import HardNegativeMiner
+from src.utils.training_alarms import TrainingAlarmManager
 
 
 class MetricLearningTrainer:
@@ -52,7 +53,8 @@ class MetricLearningTrainer:
         val_loader,
         config: Dict,
         logger: Optional[logging.Logger] = None,
-        checkpoint_dir: Optional[str] = None
+        checkpoint_dir: Optional[str] = None,
+        data_engine=None,
     ):
         """
         Initialize trainer with model and configuration.
@@ -68,6 +70,7 @@ class MetricLearningTrainer:
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
+        self.data_engine = data_engine
         self.config = config
         self.logger = logger or self._setup_logger()
         
@@ -83,15 +86,17 @@ class MetricLearningTrainer:
             self.logger.info(f"Model VRAM after load: {torch.cuda.memory_allocated(self.device)/1e6:.0f} MB")
         
         # Loss function setup (SOTA 2024)
-        self.loss_func = self._setup_loss_function()
+        self.loss_func = self._setup_loss_function().to(self.device)
         
         # Miner setup (if needed)
         self.miner = self._setup_miner()
         
-        # SOTA Regularizers (2022-2024)
+        # SOTA Regularizers (active)
         self.nir_reg = self._setup_nir()
         self.hier_reg = self._setup_hier()
         self.dada_wrapper = self._setup_dada()
+        # Dimensional Slicing (SlicedMSLoss) reemplaza amplitude/uniformity/
+        # decorrelation/disentanglement — ver docs/2026-06-09_INFORME_MODIFICACIONES_PIPELINE_MULTI_SLICE.md
         
         # Optimizer setup
         self.optimizer = self._setup_optimizer()
@@ -117,6 +122,9 @@ class MetricLearningTrainer:
         self.train_losses = []
         self.val_losses = []
         self.best_val_loss = float('inf')
+        self.gradient_accumulation_steps = config.get('gradient_accumulation_steps', 1)
+        if self.gradient_accumulation_steps > 1:
+            self.logger.info(f"Gradient Accumulation: {self.gradient_accumulation_steps} steps (effective batch = {self.gradient_accumulation_steps}x)")
         self.best_recall_at_1 = 0.0
         self.val_metrics_history = []
         self.epochs_without_improvement = 0
@@ -139,9 +147,23 @@ class MetricLearningTrainer:
         Path(self.checkpoint_dir).mkdir(parents=True, exist_ok=True)
         
         self._logged_first_batch = False
+        self.expected_train_workers = int(self.config.get('expected_train_workers', -1))
+        self.expected_val_workers = int(self.config.get('expected_val_workers', -1))
+        self.batch_stall_threshold_sec = float(self.config.get('batch_stall_threshold_sec', 8.0))
+        self.alarm_manager = TrainingAlarmManager(
+            run_dir=self.config.get('run_dir'),
+            logger=self.logger,
+        )
         
         self.logger.info(f"Trainer initialized with loss: {self.config['loss']['type']}")
         self.logger.info(f"Checkpoints will be saved to: {self.checkpoint_dir}")
+        self.alarm_manager.info(
+            "TRAINER_INIT",
+            "Trainer initialized with worker regime tracking.",
+            expected_train_workers=self.expected_train_workers,
+            expected_val_workers=self.expected_val_workers,
+            batch_stall_threshold_sec=self.batch_stall_threshold_sec,
+        )
     
     def _setup_logger(self) -> logging.Logger:
         """Setup default logger"""
@@ -204,12 +226,33 @@ class MetricLearningTrainer:
             if num_classes is None:
                 raise ValueError("num_classes required for ArcFace loss")
             
-            self.logger.info(f"Using ArcFace Loss with {num_classes} classes")
+            margin = params.get('margin', 28.6)
+            scale = params.get('scale', 64)
+            
+            if self.config.get('sota', {}).get('embedding_space') == 'hyperbolic':
+                from src.losses.hyperbolic_arcface import HyperbolicArcFaceLoss
+                curvature = self.config.get('sota', {}).get('hyperbolic_curvature', 1.0)
+                self.logger.info(
+                    f"Using Hyperbolic ArcFace Loss with {num_classes} classes "
+                    f"(margin={margin}, scale={scale}, curvature={curvature})"
+                )
+                return HyperbolicArcFaceLoss(
+                    num_classes=num_classes,
+                    embedding_size=self.config.get('embedding_dim', 128),
+                    margin=params.get('hyperbolic_margin', 0.2),
+                    scale=scale,
+                    curvature=curvature,
+                )
+
+            self.logger.info(
+                f"Using ArcFace Loss with {num_classes} classes "
+                f"(margin={margin}Â°, scale={scale})"
+            )
             return losses.ArcFaceLoss(
                 num_classes=num_classes,
                 embedding_size=self.config.get('embedding_dim', 128),
-                margin=params.get('margin', 0.5),
-                scale=params.get('scale', 64)
+                margin=margin,
+                scale=scale,
             )
         
         elif loss_type == 'sg_softmax':
@@ -227,20 +270,97 @@ class MetricLearningTrainer:
             )
             return self._sg_softmax_loss
         
+        elif loss_type == 'ldm_ms':
+            # Learnable Dynamic Margin MS Loss
+            from src.losses.ldm_loss import LearnableDynamicMarginMSLoss
+            num_classes = self.config.get('num_classes')
+            if num_classes is None:
+                raise ValueError("num_classes required for LDM-MS loss")
+            self.logger.info(f"Using LDM-MS Loss with {num_classes} classes")
+            self._ldm_ms_loss = LearnableDynamicMarginMSLoss(
+                num_classes=num_classes,
+                alpha=params.get('alpha', 2.0),
+                beta=params.get('beta', 50.0),
+                base_margin=params.get('base', 0.5)
+            )
+            return self._ldm_ms_loss
+
+        elif loss_type == 'hybrid_proxy_ms':
+            # Hybrid Proxy MS Loss (SG-Softmax + MS Loss/LDM)
+            from src.losses.hybrid_loss import HybridProxyMSLoss
+            num_classes = self.config.get('num_classes')
+            if num_classes is None:
+                raise ValueError("num_classes required for Hybrid Proxy MS loss")
+            self.logger.info(f"Using Hybrid Proxy MS Loss with {num_classes} classes")
+            self._hybrid_loss = HybridProxyMSLoss(
+                embedding_dim=self.config.get('embedding_dim', 128),
+                num_classes=num_classes,
+                proxy_scale=params.get('proxy_scale', 30.0),
+                proxy_margin=params.get('proxy_margin', 0.4),
+                ms_alpha=params.get('alpha', 2.0),
+                ms_beta=params.get('beta', 50.0),
+                ms_base_margin=params.get('base', 0.5),
+                w_global=params.get('w_global', 1.0),
+                w_local=params.get('w_local', 1.0),
+                use_ldm=params.get('use_ldm', True)
+            )
+            return self._hybrid_loss
+        
+        elif loss_type == 'sliced_ms':
+            # Sliced MS Loss: Spectral Embedding Expansion (Ko & Gu, CVPR 2020)
+            from src.losses.sliced_ms_loss import SlicedMSLoss
+            num_classes = self.config.get('num_classes')
+            if num_classes is None:
+                raise ValueError("num_classes required for Sliced MS loss")
+            self.logger.info(f"Using Sliced MS Loss with {num_classes} classes")
+            self._sliced_ms_loss = SlicedMSLoss(
+                num_classes=num_classes,
+                num_slices=params.get('num_slices', 4),
+                embedding_dim=self.config.get('embedding_dim', 128),
+                alpha=params.get('alpha', 2.0),
+                beta=params.get('beta', 50.0),
+                base_margin=params.get('base_margin', 0.5)
+            )
+            return self._sliced_ms_loss
+        
+        elif loss_type == 'sliced_proxy':
+            # Sliced Proxy Loss: Dimensional Slicing (CVPR 2019) + SG-Softmax (AAAI 2023)
+            from src.losses.sliced_proxy_loss import SlicedProxyLoss
+            num_classes = self.config.get('num_classes')
+            if num_classes is None:
+                raise ValueError("num_classes required for Sliced Proxy loss")
+            self.logger.info(f"Using Sliced Proxy Loss with {num_classes} classes")
+            self._sliced_proxy_loss = SlicedProxyLoss(
+                num_classes=num_classes,
+                num_slices=params.get('num_slices', 4),
+                embedding_dim=self.config.get('embedding_dim', 128),
+                scale=params.get('proxy_scale', 30.0),
+                margin=params.get('proxy_margin', 0.2)
+            )
+            return self._sliced_proxy_loss
+        
         else:
             raise ValueError(f"Unknown loss type: {loss_type}")
     
+    def _get_loss_type(self) -> str:
+        """Loss type from flattened trainer config (train.py merges training.*)."""
+        return self.config.get('loss', {}).get('type', 'multi_similarity')
+
     def _setup_miner(self) -> Optional[nn.Module]:
         """
         Setup mining strategy if needed.
         Multi-Similarity Loss doesn't require mining.
         """
-        loss_type = self.config.get('loss', {}).get('type', 'multi_similarity')
-        
-        # Multi-Similarity handles mining internally
-        if loss_type == 'multi_similarity':
+        loss_type = self._get_loss_type()
+
+        # Proxy / angular losses do not use triplet miners (saves VRAM per batch)
+        if loss_type in ('multi_similarity', 'arcface', 'proxy_anchor', 'sg_softmax', 'sliced_proxy'):
+            if loss_type != 'multi_similarity':
+                self.logger.info(
+                    f"Triplet miner skipped for loss '{loss_type}' (not used with this loss)"
+                )
             return None
-        
+
         # Setup miner for Triplet Loss
         mining_config = self.config.get('mining', {})
         if not mining_config.get('enabled', True):
@@ -340,18 +460,25 @@ class MetricLearningTrainer:
     
     def _setup_hard_mining(self):
         """Setup Hard Negative Mining (OHEM) if enabled in config."""
-        hard_mining_config = self.config.get('training', {}).get('hard_mining', {})
-        loss_type = self.config.get('loss', {}).get('type', 'multi_similarity')
-        
+        hard_mining_config = self.config.get('hard_mining', {})
+        loss_type = self._get_loss_type()
+
         if not hard_mining_config.get('enabled', False):
             self.logger.info("Hard Negative Mining: Disabled")
             return
-            
+
         if loss_type == 'multi_similarity':
             self.logger.info("Hard Negative Mining: Auto-disabled (Multi-Similarity loss handles it natively intra-graph).")
             self.hard_miner = None
             return
-        
+
+        if loss_type not in ('arcface', 'triplet'):
+            self.logger.info(
+                f"Hard Negative Mining: Auto-disabled (not supported with loss '{loss_type}')."
+            )
+            self.hard_miner = None
+            return
+
         hard_ratio = hard_mining_config.get('ratio', 0.3)
         min_samples = hard_mining_config.get('min_samples', 32)
         warmup_epochs = hard_mining_config.get('warmup_epochs', 0)
@@ -365,41 +492,72 @@ class MetricLearningTrainer:
         )
         
         self.logger.info(
-            f"Hard Negative Mining: Enabled (ratio={hard_ratio}, "
-            f"min_samples={min_samples}, warmup={warmup_epochs})"
+            f"Hard Negative Mining: Enabled for '{loss_type}' "
+            f"(ratio={hard_ratio}, min_samples={min_samples}, warmup={warmup_epochs})"
         )
+
+    def _compute_training_loss(
+        self,
+        embeddings: torch.Tensor,
+        labels: torch.Tensor,
+        images: torch.Tensor,
+        masks: torch.Tensor = None,
+        prenorm_embeddings: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        Training loss with optional OHEM (hard negative mining).
+
+        ArcFace: per-sample CE on angular-margin logits via loss_func.compute_loss(),
+        then mean only over the hardest examples in the batch.
+        Validation always uses the full-batch loss (see validate()).
+        """
+        if self.hard_miner is None:
+            return self._compute_total_loss(embeddings, labels, images, masks=masks, prenorm_embeddings=prenorm_embeddings)
+
+        loss_per_sample = self._compute_loss_per_sample(embeddings, labels)
+        hard_mask = self.hard_miner.mine_hard_examples(loss_per_sample)
+        if not hard_mask.any():
+            base_loss = loss_per_sample.sum() / len(loss_per_sample)
+        else:
+            base_loss = loss_per_sample[hard_mask].sum() / len(loss_per_sample)
+            
+        return self._compute_total_loss(embeddings, labels, images, masks=masks, base_loss=base_loss, prenorm_embeddings=prenorm_embeddings)
     
     def _compute_loss_per_sample(self, embeddings: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         """
-        Computa pérdida por sample individual (sin reducción) para Hard Negative Mining.
+        Computa pÃ©rdida por sample individual (sin reducciÃ³n) para Hard Negative Mining.
         
         Args:
             embeddings: Tensor (B, D) de embeddings normalizados
             labels: Tensor (B,) de etiquetas
         
         Returns:
-            loss_per_sample: Tensor (B,) con pérdida de cada sample
+            loss_per_sample: Tensor (B,) con pÃ©rdida de cada sample
         """
-        loss_type = self.config.get('training', {}).get('loss', {}).get('type', 'multi_similarity')
-        
+        loss_type = self._get_loss_type()
+
         if loss_type == 'arcface':
-            # ArcFace: Cross-entropy per sample
-            W = self.loss_func.W.weight
-            embeddings_norm = torch.nn.functional.normalize(embeddings, p=2, dim=1)
-            cosine = embeddings_norm @ W.t()
-            
-            margin = self.loss_func.margin
-            scale = self.loss_func.scale
-            
-            one_hot = torch.zeros_like(cosine)
-            one_hot.scatter_(1, labels.view(-1, 1), 1)
-            
-            sine = torch.sqrt(1.0 - torch.pow(cosine, 2).clamp(0, 1))
-            phi = cosine * torch.cos(torch.tensor(margin, device=cosine.device)) - sine * torch.sin(torch.tensor(margin, device=cosine.device))
-            
-            output = torch.where(one_hot.bool(), phi, cosine) * scale
-            loss_per_sample = torch.nn.functional.cross_entropy(output, labels, reduction='none')
-            
+            # Use library implementation: W is nn.Parameter (num_classes, emb), not Linear.weight
+            if self.loss_func.__class__.__name__ == 'ArcFaceLoss':
+                loss_dict = self.loss_func.compute_loss(
+                    embeddings, labels, None, embeddings, labels
+                )
+            else:
+                loss_dict = self.loss_func.compute_loss(
+                    embeddings,
+                    labels,
+                    indices_tuple=None,
+                    ref_emb=embeddings,
+                    ref_labels=labels,
+                )
+            loss_per_sample = loss_dict['loss']['losses']
+
+        elif loss_type in ('proxy_anchor', 'sg_softmax'):
+            raise NotImplementedError(
+                f"Hard negative mining is not supported with loss '{loss_type}'. "
+                "Set training.hard_mining.enabled to false or switch to arcface."
+            )
+
         else:
             # Fallback vectorizado acelerado por GPU (O(1) operaciones Python)
             dist_mat = torch.cdist(embeddings, embeddings, p=2)
@@ -411,8 +569,9 @@ class MetricLearningTrainer:
             pos_dist = torch.where(pos_mask, dist_mat, torch.zeros_like(dist_mat)).max(dim=1)[0]
             neg_dist = torch.where(neg_mask, dist_mat, torch.full_like(dist_mat, float('inf'))).min(dim=1)[0]
             
-            # Margen de 0.2 constante
-            loss_per_sample = torch.clamp(pos_dist - neg_dist + 0.2, min=0.0)
+            # Hardcoded 0.2 margin fallback, we use actual margin if loss_func exposes it
+            margin = getattr(self.loss_func, 'margin', 0.2)
+            loss_per_sample = torch.clamp(pos_dist - neg_dist + margin, min=0.0)
         
         return loss_per_sample
     
@@ -451,12 +610,52 @@ class MetricLearningTrainer:
             proxy_lr = lr * 100
             param_groups.append({'params': self._sg_softmax_loss.proxies, 'lr': proxy_lr})
             self.logger.info(f"SG-Softmax: model lr={lr:.2e}, proxy lr={proxy_lr:.2e}")
+            
+        if hasattr(self, '_ldm_ms_loss'):
+            # LDM margin learning rate (often higher than model lr)
+            margin_lr = lr * 10
+            param_groups.append({'params': [self._ldm_ms_loss.pos_margin, self._ldm_ms_loss.neg_margin], 'lr': margin_lr, 'weight_decay': 0.0})
+            self.logger.info(f"LDM-MS: added learnable margins to optimizer (lr={margin_lr:.2e})")
+
+        if hasattr(self, '_hybrid_loss'):
+            # Proxies
+            proxy_lr = lr * 100
+            param_groups.append({'params': self._hybrid_loss.proxy_loss.proxies, 'lr': proxy_lr})
+            self.logger.info(f"Hybrid: added proxies to optimizer (lr={proxy_lr:.2e})")
+            # Margins (if using LDM)
+            if self._hybrid_loss.use_ldm:
+                margin_lr = lr * 10
+                param_groups.append({'params': [self._hybrid_loss.ms_loss.pos_margin, self._hybrid_loss.ms_loss.neg_margin], 'lr': margin_lr, 'weight_decay': 0.0})
+                self.logger.info(f"Hybrid: added learnable margins to optimizer (lr={margin_lr:.2e})")
+        
+        if hasattr(self, '_sliced_ms_loss'):
+            margin_lr = lr * 10
+            margin_params = self._sliced_ms_loss.get_learnable_margins()
+            param_groups.append({'params': margin_params, 'lr': margin_lr, 'weight_decay': 0.0})
+            self.logger.info(f"SlicedMS: added {len(margin_params)} learnable margins to optimizer (lr={margin_lr:.2e})")
+            
+        if hasattr(self, '_sliced_proxy_loss'):
+            proxy_lr = lr * 100
+            proxy_params = self._sliced_proxy_loss.get_proxies()
+            param_groups.append({'params': proxy_params, 'lr': proxy_lr, 'weight_decay': 0.0})
+            self.logger.info(f"SlicedProxy: added {len(proxy_params)} learnable proxy matrices to optimizer (lr={proxy_lr:.2e})")
         
         # HIER proxies
         if self.hier_reg is not None:
             param_groups.append({'params': self.hier_reg.parameters(), 'lr': lr * 10})
             self.logger.info(f"HIER proxies added to optimizer (lr={lr*10:.2e})")
-        
+
+        # ArcFace / large-margin losses: trainable class weight matrix W
+        if self._get_loss_type() == 'arcface' and hasattr(self.loss_func, 'parameters'):
+            arcface_params = list(self.loss_func.parameters())
+            if arcface_params:
+                param_groups.append(
+                    {'params': arcface_params, 'lr': lr, 'name': 'arcface_weights'}
+                )
+                self.logger.info(
+                    f"ArcFace weights added to optimizer ({len(arcface_params)} tensors, lr={lr:.2e})"
+                )
+
         if optimizer_type == 'adamw':
             optimizer = torch.optim.AdamW(
                 param_groups,
@@ -489,9 +688,12 @@ class MetricLearningTrainer:
         
         if scheduler_type == 'cosine':
             # Cosine Annealing (SOTA recommendation)
+            epochs = self.config.get('epochs', 50)
+            warmup = self.config.get('warmup_epochs', 0)
+            t_max = max(1, epochs - warmup)
             return torch.optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer,
-                T_max=params.get('T_max', 50),
+                T_max=t_max,
                 eta_min=params.get('eta_min', 1e-6)
             )
         elif scheduler_type == 'reduce_on_plateau':
@@ -512,6 +714,40 @@ class MetricLearningTrainer:
         else:
             return None
     
+    def _reset_cuda_peak_memory(self):
+        if self.device.type == 'cuda':
+            torch.cuda.reset_peak_memory_stats(self.device)
+
+    def _log_cuda_memory(self, stage: str):
+        if self.device.type != 'cuda':
+            return
+        alloc_mb = torch.cuda.memory_allocated(self.device) / 1e6
+        reserved_mb = torch.cuda.memory_reserved(self.device) / 1e6
+        peak_alloc_mb = torch.cuda.max_memory_allocated(self.device) / 1e6
+        peak_reserved_mb = torch.cuda.max_memory_reserved(self.device) / 1e6
+        self.logger.info(
+            f"  VRAM [{stage}]: active={alloc_mb:.0f} MB | reserved={reserved_mb:.0f} MB | "
+            f"peak_active={peak_alloc_mb:.0f} MB | peak_reserved={peak_reserved_mb:.0f} MB"
+        )
+        if peak_reserved_mb > 7200:
+            self.alarm_manager.warning(
+                "VRAM_PEAK_HIGH",
+                "GPU reserved memory near 8GB limit.",
+                stage=stage,
+                peak_reserved_mb=round(peak_reserved_mb, 1),
+                peak_allocated_mb=round(peak_alloc_mb, 1),
+            )
+
+    def _iter_optimized_parameters(self):
+        """All parameters updated by the optimizer (model + loss heads)."""
+        seen = set()
+        for group in self.optimizer.param_groups:
+            for param in group['params']:
+                pid = id(param)
+                if pid not in seen:
+                    seen.add(pid)
+                    yield param
+
     def _warmup_lr(self, epoch: int):
         """
         Apply learning rate warmup for first few epochs.
@@ -520,7 +756,7 @@ class MetricLearningTrainer:
         """
         warmup_epochs = self.config.get('warmup_epochs', 5)
         if epoch < warmup_epochs:
-            progress = epoch / warmup_epochs  # 0 → 1
+            progress = (epoch + 1) / warmup_epochs  # reach full LR on last warmup epoch
             lr_strs = []
             for param_group in self.optimizer.param_groups:
                 base_lr = param_group.get('initial_lr', param_group['lr'])
@@ -529,233 +765,431 @@ class MetricLearningTrainer:
                 name = param_group.get('name', 'default')
                 lr_strs.append(f"{name}={warmup_lr:.2e}")
             self.logger.info(f"Warmup LR: {', '.join(lr_strs)}")
+        elif epoch == warmup_epochs:
+            lr_strs = []
+            for param_group in self.optimizer.param_groups:
+                base_lr = param_group.get('initial_lr', param_group['lr'])
+                param_group['lr'] = base_lr
+                name = param_group.get('name', 'default')
+                lr_strs.append(f"{name}={base_lr:.2e}")
+            self.logger.info(f"Warmup complete â€” restored LR: {', '.join(lr_strs)}")
     
-    def _compute_total_loss(self, embeddings, labels, images):
+    def _compute_total_loss(self, embeddings, labels, images, masks=None, base_loss=None, prenorm_embeddings=None):
         """
         Compute total loss = base loss + SOTA regularizers.
-        
-        Integrates:
-        - Base metric loss (MS, Triplet, ProxyAnchor, ArcFace, SG-Softmax)
-        - NIR regularization (Roth et al., CVPR 2022)
-        - HIER regularization (Kim et al., CVPR 2023)
-        - DADA alignment (Ren et al., AAAI 2024)
-        - Self-distillation (Zeng et al., 2024)
         """
         # Base loss
-        if self.dada_wrapper is not None:
-            loss = self.dada_wrapper(embeddings, labels)
-        elif self.miner is not None:
-            hard_pairs = self.miner(embeddings, labels)
-            loss = self.loss_func(embeddings, labels, hard_pairs)
+        if base_loss is not None:
+            loss = base_loss
         else:
-            loss = self.loss_func(embeddings, labels)
+            if self.miner is not None:
+                hard_pairs = self.miner(embeddings, labels)
+                loss = self.loss_func(embeddings, labels, hard_pairs)
+            else:
+                loss = self.loss_func(embeddings, labels)
+        
+        # DADA Alignment
+        if self.dada_wrapper is not None:
+            # We don't have augmented_embeddings currently. If we did:
+            # mmd_loss = self.dada_wrapper._compute_mmd(embeddings, augmented_embeddings)
+            # loss += self.dada_wrapper.lambda_dada * mmd_loss
+            pass
         
         # NIR: Non-Isotropy Regularization
         if self.nir_reg is not None:
             nir_loss = self.nir_reg(embeddings, labels)
-            loss = loss + nir_loss
+            loss += nir_loss
         
         # HIER: Hierarchical Regularization
         if self.hier_reg is not None:
             hier_loss = self.hier_reg(embeddings, labels)
-            loss = loss + hier_loss
+            loss += hier_loss
         
         # Self-distillation with EMA Teacher
         if self.ema_teacher is not None and self.sd_loss is not None:
-            teacher_embeddings = self.ema_teacher.get_teacher_embeddings(images)
+            teacher_embeddings = self.ema_teacher.get_teacher_embeddings(images, masks=masks)
             sd_loss_val = self.sd_loss(embeddings, teacher_embeddings)
-            loss = loss + sd_loss_val
+            loss += sd_loss_val
         
         return loss
+
+    @staticmethod
+    def _is_dataloader_worker_failure(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return (
+            "dataloader worker" in msg
+            and "exited unexpectedly" in msg
+        )
+
+    def _raise_if_dataloader_worker_failure(self, exc: Exception, stage: str):
+        if self._is_dataloader_worker_failure(exc):
+            workers = getattr(self.train_loader, "num_workers", "?")
+            self.alarm_manager.error(
+                "WORKER_CRASH",
+                "DataLoader worker process crashed.",
+                stage=stage,
+                configured_workers=workers,
+                error=str(exc),
+            )
+            raise RuntimeError(
+                f"DataLoader worker crash during {stage}. "
+                f"Configured num_workers={workers}. "
+                "Training was paused without fallback. "
+                "Fix multiprocessing/dataset issues or adjust num_workers manually."
+            ) from exc
+        raise exc
+
+    def _assert_worker_regime(self, stage: str):
+        train_workers = int(getattr(self.train_loader, "num_workers", -1))
+        val_workers = int(getattr(self.val_loader, "num_workers", -1))
+
+        if self.expected_train_workers >= 0 and train_workers != self.expected_train_workers:
+            self.alarm_manager.error(
+                "WORKER_REGIME_DRIFT",
+                "Train DataLoader worker count drift detected.",
+                stage=stage,
+                expected=self.expected_train_workers,
+                actual=train_workers,
+            )
+            raise RuntimeError(
+                f"Train DataLoader workers drifted from {self.expected_train_workers} to {train_workers}."
+            )
+        if self.expected_val_workers >= 0 and val_workers != self.expected_val_workers:
+            self.alarm_manager.error(
+                "WORKER_REGIME_DRIFT",
+                "Validation DataLoader worker count drift detected.",
+                stage=stage,
+                expected=self.expected_val_workers,
+                actual=val_workers,
+            )
+            raise RuntimeError(
+                f"Val DataLoader workers drifted from {self.expected_val_workers} to {val_workers}."
+            )
+
+        self.alarm_manager.info(
+            "WORKER_REGIME_OK",
+            "Worker regime verified.",
+            stage=stage,
+            train_workers=train_workers,
+            val_workers=val_workers,
+        )
+
+    def _check_alive_workers(self, loader, expected_workers: int, stage: str):
+        if expected_workers <= 0:
+            return
+        iterator = getattr(loader, "_iterator", None)
+        workers = getattr(iterator, "_workers", None) if iterator is not None else None
+        if workers is None:
+            return
+        alive = sum(1 for w in workers if w.is_alive())
+        if alive < expected_workers:
+            self.alarm_manager.error(
+                "WORKER_COUNT_DROPPED",
+                "One or more DataLoader workers are no longer alive.",
+                stage=stage,
+                expected_workers=expected_workers,
+                alive_workers=alive,
+            )
+            raise RuntimeError(
+                f"DataLoader workers dropped: alive={alive}, expected={expected_workers}."
+            )
     
     def train_epoch(self) -> float:
         """Train one epoch with mixed precision and SOTA regularizers."""
+        self._assert_worker_regime(stage="train_epoch_start")
+        self._reset_cuda_peak_memory()
         self.model.train()
         total_loss = 0
         num_batches = 0
-        
+        grad_norm = 0.0
+
         # GPU utilization tracking
         data_time_total = 0.0
         gpu_time_total = 0.0
         t_data_start = time.time()
-        
+
         pbar = tqdm(self.train_loader, desc=f'Epoch {self.current_epoch+1} [Train]')
-        
-        for batch_idx, batch_data in enumerate(pbar):
-            # Support both (images, labels) and (images, labels, masks)
-            if len(batch_data) == 3:
-                images, labels, masks = batch_data
-                masks = masks.to(self.device, non_blocking=True)
-            else:
-                images, labels = batch_data
-                masks = None
-            data_time_total += time.time() - t_data_start
-            
-            images = images.to(self.device, non_blocking=True)
-            labels = labels.to(self.device, non_blocking=True)
-            
-            # First-batch diagnostic (once per training run)
-            if not self._logged_first_batch:
-                self._logged_first_batch = True
-                n_classes_batch = len(torch.unique(labels))
-                self.logger.info(f"  [DIAG] First batch shapes: images={tuple(images.shape)}, labels={tuple(labels.shape)}")
-                self.logger.info(f"  [DIAG] Batch: {images.shape[0]} samples, {n_classes_batch} unique classes")
-                self.logger.info(f"  [DIAG] Image range: [{images.min():.3f}, {images.max():.3f}] (post-normalize)")
-                self.logger.info(f"  [DIAG] Masks: {'provided '+str(tuple(masks.shape)) if masks is not None else 'None (standard pooling)'}")
-                self.logger.info(f"  [DIAG] AMP: {self.use_amp}, device: {self.device}")
-            
-            t_gpu_start = time.time()
-            self.optimizer.zero_grad(set_to_none=True)
-            
-            if self.use_amp:
-                with autocast('cuda'):
-                    embeddings = self.model(images, mask=masks)
-                    
-                    # Hard Negative Mining: computar pérdida sin reducción si está habilitado
-                    if self.hard_miner is not None:
-                        # Computar pérdida por sample (sin reducción)
-                        loss_per_sample = self._compute_loss_per_sample(embeddings, labels)
-                        
-                        # Seleccionar hard examples
-                        hard_mask = self.hard_miner.mine_hard_examples(loss_per_sample)
-                        
-                        # Loss final: promedio de hard examples
-                        loss = loss_per_sample[hard_mask].mean()
-                    else:
-                        # Modo estándar: todas las muestras
-                        loss = self._compute_total_loss(embeddings, labels, images)
-                
-                self.scaler.scale(loss).backward()
-                self.scaler.unscale_(self.optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    max_norm=self.gradient_clip_norm
-                )
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                embeddings = self.model(images, mask=masks)
-                
-                # Hard Negative Mining (sin AMP)
-                if self.hard_miner is not None:
-                    loss_per_sample = self._compute_loss_per_sample(embeddings, labels)
-                    hard_mask = self.hard_miner.mine_hard_examples(loss_per_sample)
-                    loss = loss_per_sample[hard_mask].mean()
-                else:
-                    loss = self._compute_total_loss(embeddings, labels, images)
-                
-                loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    max_norm=self.gradient_clip_norm
-                )
-                self.optimizer.step()
-            
-            if self.device.type == 'cuda':
-                torch.cuda.synchronize()
-            gpu_time_total += time.time() - t_gpu_start
-            
-            # Update EMA teacher after each step
-            if self.ema_teacher is not None:
-                self.ema_teacher.update(self.model)
-            
-            total_loss += loss.item()
-            num_batches += 1
-            
-            pbar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'avg': f'{total_loss/num_batches:.4f}',
-                'gnorm': f'{grad_norm:.2f}'
-            })
-            t_data_start = time.time()
-        
-        avg_loss = total_loss / num_batches
-        
-        # Log GPU utilization stats
-        total_time = data_time_total + gpu_time_total
-        if total_time > 0:
-            gpu_pct = gpu_time_total / total_time * 100
-            self.logger.info(
-                f"  GPU: {gpu_pct:.0f}% util ({gpu_time_total:.1f}s compute, {data_time_total:.1f}s data)"
-            )
-            if self.device.type == 'cuda':
-                self.logger.info(
-                    f"  VRAM: {torch.cuda.memory_allocated(self.device)/1e6:.0f} MB / "
-                    f"{torch.cuda.max_memory_allocated(self.device)/1e6:.0f} MB peak"
-                )
-        self.logger.info(f"  Train loss: {avg_loss:.6f} (last grad_norm: {grad_norm:.3f})")
-        
-        return avg_loss
-    
-    def validate(self) -> Tuple[float, Dict]:
-        """
-        Validate the model. Computes loss and SOTA metrics.
-        
-        Returns:
-            Tuple of (avg_loss, metrics_dict) with R@1, R@5, mAP@R, NMI, F1-macro
-        """
-        from src.utils.metrics_utils import compute_all_metrics
-        
-        self.model.eval()
-        total_loss = 0
-        num_batches = 0
-        all_embeddings = []
-        all_labels = []
-        
-        with torch.no_grad():
-            pbar = tqdm(self.val_loader, desc=f'Epoch {self.current_epoch+1} [Val]')
-            
-            for batch_data in pbar:
+
+        try:
+            for batch_idx, batch_data in enumerate(pbar):
+                # Support both (images, labels) and (images, labels, masks)
                 if len(batch_data) == 3:
                     images, labels, masks = batch_data
                     masks = masks.to(self.device, non_blocking=True)
                 else:
                     images, labels = batch_data
                     masks = None
+                data_time_total += time.time() - t_data_start
+                self._check_alive_workers(
+                    self.train_loader,
+                    expected_workers=self.expected_train_workers,
+                    stage=f"train_batch_{batch_idx}",
+                )
+                if (time.time() - t_data_start) > self.batch_stall_threshold_sec:
+                    self.alarm_manager.warning(
+                        "BATCH_DATA_STALL",
+                        "Batch data wait exceeded stall threshold.",
+                        stage="train",
+                        batch_idx=batch_idx,
+                        wait_sec=round(time.time() - t_data_start, 3),
+                        threshold_sec=self.batch_stall_threshold_sec,
+                    )
+
                 images = images.to(self.device, non_blocking=True)
                 labels = labels.to(self.device, non_blocking=True)
+
+                # First-batch diagnostic (once per training run)
+                if not self._logged_first_batch:
+                    self._logged_first_batch = True
+                    n_classes_batch = len(torch.unique(labels))
+                    self.logger.info(f"  [DIAG] First batch shapes: images={tuple(images.shape)}, labels={tuple(labels.shape)}")
+                    self.logger.info(f"  [DIAG] Batch: {images.shape[0]} samples, {n_classes_batch} unique classes")
+                    self.logger.info(f"  [DIAG] Image range: [{images.min():.3f}, {images.max():.3f}] (post-normalize)")
+                    self.logger.info(f"  [DIAG] Masks: {'provided '+str(tuple(masks.shape)) if masks is not None else 'None (standard pooling)'}")
+                    self.logger.info(f"  [DIAG] AMP: {self.use_amp}, device: {self.device}")
+
+                t_gpu_start = time.time()
                 
-                embeddings = self.model(images, mask=masks)
+                # Gradient Accumulation: only zero_grad at the start of each accumulation cycle
+                accum_step = batch_idx % self.gradient_accumulation_steps
+                if accum_step == 0:
+                    self.optimizer.zero_grad(set_to_none=True)
+
+                optimizer_stepped = False
+                is_accumulation_boundary = (accum_step == self.gradient_accumulation_steps - 1) or (batch_idx == len(self.train_loader) - 1)
                 
-                all_embeddings.append(embeddings.cpu().numpy())
-                all_labels.append(labels.cpu().numpy())
-                
-                if self.miner is not None:
-                    hard_pairs = self.miner(embeddings, labels)
-                    loss = self.loss_func(embeddings, labels, hard_pairs)
+                if self.use_amp:
+                    with autocast('cuda'):
+                        embeddings, prenorm_embeddings = self.model(images, mask=masks, return_prenorm=True)
+                        loss = self._compute_training_loss(embeddings, labels, images, masks=masks, prenorm_embeddings=prenorm_embeddings)
+                    
+                    # Scale loss by accumulation steps for correct gradient magnitude
+                    scaled_loss = loss / self.gradient_accumulation_steps
+                    self.scaler.scale(scaled_loss).backward()
+                    
+                    if is_accumulation_boundary:
+                        self.scaler.unscale_(self.optimizer)
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            self._iter_optimized_parameters(),
+                            max_norm=self.gradient_clip_norm
+                        )
+                        scale_before = self.scaler.get_scale()
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                        scale_after = self.scaler.get_scale()
+                        optimizer_stepped = (scale_before <= scale_after)
+                    else:
+                        grad_norm = torch.tensor(0.0)
                 else:
-                    loss = self.loss_func(embeddings, labels)
-                
+                    embeddings, prenorm_embeddings = self.model(images, mask=masks, return_prenorm=True)
+                    loss = self._compute_training_loss(embeddings, labels, images, masks=masks, prenorm_embeddings=prenorm_embeddings)
+                    
+                    scaled_loss = loss / self.gradient_accumulation_steps
+                    scaled_loss.backward()
+                    
+                    if is_accumulation_boundary:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            self._iter_optimized_parameters(),
+                            max_norm=self.gradient_clip_norm
+                        )
+                        self.optimizer.step()
+                        optimizer_stepped = True
+                    else:
+                        grad_norm = torch.tensor(0.0)
+
+                gpu_time_total += time.time() - t_gpu_start
+
+                if optimizer_stepped:
+                    # Update EMA teacher after each actual optimizer step
+                    if self.ema_teacher is not None:
+                        self.ema_teacher.update(self.model)
+
                 total_loss += loss.item()
                 num_batches += 1
+
+                pbar.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'avg': f'{total_loss/num_batches:.4f}',
+                    'gnorm': f'{grad_norm:.2f}'
+                })
+                t_data_start = time.time()
                 
-                pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-        
+                if optimizer_stepped and self.config.get('scheduler') == 'onecycle' and self.scheduler is not None:
+                    self.scheduler.step()
+        except torch.cuda.OutOfMemoryError as e:
+            self.alarm_manager.error("CUDA_OOM", "Out of memory during training.", stage="train", error=str(e))
+            torch.cuda.empty_cache()
+            raise e
+        except RuntimeError as e:
+            self._raise_if_dataloader_worker_failure(e, stage="training")
+
+        avg_loss = total_loss / max(1, num_batches)
+        if self.hard_miner is not None:
+            mining_stats = self.hard_miner.get_stats()
+            self.logger.info(
+                f"  OHEM: selected {mining_stats.get('avg_mining_ratio', 0):.1%} of samples/batch "
+                f"(hard_loss={mining_stats.get('avg_loss_hard', 0):.4f}, "
+                f"easy_loss={mining_stats.get('avg_loss_easy', 0):.4f})"
+            )
+        if not np.isfinite(float(grad_norm)):
+            self.alarm_manager.warning(
+                "GRAD_NORM_NON_FINITE",
+                "Gradient norm became non-finite.",
+                grad_norm=str(grad_norm),
+            )
+
+        # Log GPU utilization stats (single sync â€” avoids per-batch GPU idle in Task Manager)
+        if self.device.type == 'cuda':
+            torch.cuda.synchronize()
+        total_time = data_time_total + gpu_time_total
+        if total_time > 0:
+            gpu_pct = gpu_time_total / total_time * 100
+            self.logger.info(
+                f"  GPU: {gpu_pct:.0f}% util ({gpu_time_total:.1f}s compute, {data_time_total:.1f}s data)"
+            )
+            batches_per_sec = num_batches / max(gpu_time_total, 1e-6)
+            self.logger.info(
+                f"  Throughput: {num_batches} batches, ~{batches_per_sec:.2f} train-steps/s (GPU-bound if >1.5)"
+            )
+            self._log_cuda_memory(stage="train_epoch_end")
+            if self.expected_train_workers >= 8 and gpu_pct < 45:
+                self.alarm_manager.warning(
+                    "LOW_GPU_UTIL_WITH_HIGH_WORKERS",
+                    "GPU utilization is low despite high worker regime.",
+                    gpu_util_pct=round(gpu_pct, 2),
+                    expected_train_workers=self.expected_train_workers,
+                    data_time_sec=round(data_time_total, 2),
+                    gpu_time_sec=round(gpu_time_total, 2),
+                )
+        self.logger.info(f"  Train loss: {avg_loss:.6f} (last grad_norm: {grad_norm:.3f})")
+
+        return avg_loss
+
+    def validate(self) -> Tuple[float, Dict]:
+        """
+        Validate the model: forward pass on val set, then full SOTA metrics on embeddings.
+
+        Computes ArcFace val loss and mandatory retrieval/clustering metrics each epoch.
+
+        Returns:
+            Tuple of (avg_loss, metrics_dict) with R@1, R@5, mAP@R, NMI, F1-macro
+        """
+        import torch.nn.functional as F
+        from src.utils.metrics_utils import compute_all_metrics
+
+        self._assert_worker_regime(stage="validation_start")
+        self._check_alive_workers(
+            self.val_loader,
+            expected_workers=self.expected_val_workers,
+            stage="validation_start",
+        )
+        self.model.eval()
+        total_loss = 0.0
+        num_batches = 0
+        emb_chunks = []
+        label_chunks = []
+        val_data_time = 0.0
+        val_gpu_time = 0.0
+        t_batch_wait = time.time()
+
+        t_embed_start = time.time()
+        with torch.inference_mode():
+            pbar = tqdm(self.val_loader, desc=f'Epoch {self.current_epoch+1} [Val]')
+            try:
+                for batch_idx, batch_data in enumerate(pbar):
+                    batch_wait = time.time() - t_batch_wait
+                    val_data_time += batch_wait
+                    if batch_idx == 0:
+                        self.logger.info(
+                            f"  Val first-batch wait: {batch_wait:.1f}s "
+                            f"(workers={self.expected_val_workers})"
+                        )
+                    if batch_idx > 0 and batch_wait > self.batch_stall_threshold_sec:
+                        self.alarm_manager.warning(
+                            "BATCH_DATA_STALL",
+                            "Val batch data wait exceeded stall threshold.",
+                            stage="validation",
+                            batch_idx=batch_idx,
+                            wait_sec=round(batch_wait, 3),
+                            threshold_sec=self.batch_stall_threshold_sec,
+                        )
+
+                    if len(batch_data) == 3:
+                        images, labels, masks = batch_data
+                        masks = masks.to(self.device, non_blocking=True)
+                    else:
+                        images, labels = batch_data
+                        masks = None
+                    images = images.to(self.device, non_blocking=True)
+                    labels = labels.to(self.device, non_blocking=True)
+
+                    t_gpu_start = time.time()
+                    if self.use_amp and self.device.type == "cuda":
+                        with autocast("cuda"):
+                            embeddings = self.model(images, mask=masks)
+                            loss = self.loss_func(embeddings, labels)
+                    else:
+                        embeddings = self.model(images, mask=masks)
+                        loss = self.loss_func(embeddings, labels)
+
+                    # Keep on GPU to prevent CPU-GPU sync bottlenecks (do NOT L2-normalize before metric losses)
+                    emb_chunks.append(embeddings.detach())
+                    label_chunks.append(labels.detach())
+
+                    total_loss += loss.item()
+                    val_gpu_time += time.time() - t_gpu_start
+                    pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+                    num_batches += 1
+                    t_batch_wait = time.time()
+            except torch.cuda.OutOfMemoryError as e:
+                self.alarm_manager.error("CUDA_OOM", "Out of memory during validation.", stage="validation", error=str(e))
+                torch.cuda.empty_cache()
+                raise e
+            except RuntimeError as e:
+                self._raise_if_dataloader_worker_failure(e, stage="validation")
+
+        embed_sec = time.time() - t_embed_start
+
         if num_batches == 0:
             self.logger.warning("Validation set is empty (0 batches). Skipping validation metrics.")
             return 0.0, {'val_loss': 0.0, 'recall_at_1': 0.0, 'recall_at_5': 0.0}
-        
+
         avg_loss = total_loss / num_batches
-        
-        embeddings_np = np.vstack(all_embeddings)
-        labels_np = np.concatenate(all_labels)
-        
-        # Compute ALL SOTA metrics (CVPR 2016-2024)
+
+        embeddings_np = torch.cat(emb_chunks, dim=0).cpu().numpy()
+        labels_np = torch.cat(label_chunks, dim=0).cpu().numpy()
+        del emb_chunks, label_chunks
+
         class_names = getattr(self.val_loader.dataset, 'classes', None)
-        sota_metrics = compute_all_metrics(
-            embeddings_np, 
-            labels_np, 
-            k_list=[1, 5, 10],
-            class_names=class_names
-        )
+        t_metrics_start = time.time()
+        loss_type = self.config.get('loss', {}).get('type', 'arcface')
+        # For standard retrieval, use cosine distance (or hyperbolic if explicitly enabled)
+        embedding_space = self.config.get('sota', {}).get('embedding_space', 'euclidean')
+        nn_metric = 'hyperbolic' if (loss_type == 'arcface' and embedding_space == 'hyperbolic') else 'cosine'
         
+        sota_metrics = compute_all_metrics(
+            embeddings_np,
+            labels_np,
+            nn_metric=nn_metric,
+            k_list=[1, 5, 10],
+            class_names=class_names,
+            include_per_class=False,
+            nmi_n_init=3,
+        )
+        metrics_sec = time.time() - t_metrics_start
+        compute_sec = max(0.0, embed_sec - val_data_time)
+        self.logger.info(
+            f"  Val timing: total={embed_sec:.1f}s, data_wait={val_data_time:.1f}s, "
+            f"gpu={val_gpu_time:.1f}s, metrics={metrics_sec:.1f}s (n={embeddings_np.shape[0]})"
+        )
+
         # Embedding diagnostics
         norms = np.linalg.norm(embeddings_np, axis=1)
         self.logger.info(
             f"  Val embeddings: n={embeddings_np.shape[0]}, dim={embeddings_np.shape[1]}, "
-            f"norm: {norms.mean():.4f}±{norms.std():.4f}"
+            f"norm: {norms.mean():.4f}Â±{norms.std():.4f}"
         )
-        
+
         metrics = {
             'val_loss': avg_loss,
             'R@1': sota_metrics.get('R@1', 0.0),
@@ -763,9 +1197,16 @@ class MetricLearningTrainer:
             'R@10': sota_metrics.get('R@10', 0.0),
             'mAP@R': sota_metrics.get('mAP@R', 0.0),
             'NMI': sota_metrics.get('NMI', 0.0),
-            'F1_macro': sota_metrics.get('F1_macro', 0.0)
+            'F1_macro': sota_metrics.get('F1_macro', 0.0),
+            'Accuracy': sota_metrics.get('Accuracy', 0.0),
+            'Balanced_Accuracy': sota_metrics.get('Balanced_Accuracy', 0.0),
+            'Precision_macro': sota_metrics.get('Precision_macro', 0.0),
+            'Precision_weighted': sota_metrics.get('Precision_weighted', 0.0),
+            'F1_weighted': sota_metrics.get('F1_weighted', 0.0),
         }
-        
+        del embeddings_np, labels_np, sota_metrics
+
+        self._log_cuda_memory(stage="validation_end")
         return avg_loss, metrics
     
     def _extract_reference_embeddings(self):
@@ -778,9 +1219,14 @@ class MetricLearningTrainer:
         
         with torch.no_grad():
             for batch_data in tqdm(self.train_loader, desc="Building reference"):
-                images, labels = batch_data[0], batch_data[1]
-                images = images.to(self.device)
-                embeddings = self.model(images)
+                if len(batch_data) == 3:
+                    images, labels, masks = batch_data
+                    masks = masks.to(self.device, non_blocking=True)
+                else:
+                    images, labels = batch_data[0], batch_data[1]
+                    masks = None
+                images = images.to(self.device, non_blocking=True)
+                embeddings = self.model(images, mask=masks)
                 embeddings_list.append(embeddings.cpu().numpy())
                 labels_list.append(labels.numpy())
         
@@ -814,7 +1260,9 @@ class MetricLearningTrainer:
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
             'config': self.config,
-            'scaler_state_dict': self.scaler.state_dict() if self.scaler else None
+            'scaler_state_dict': self.scaler.state_dict() if self.scaler else None,
+            'loss_state_dict': self.loss_func.state_dict(),
+            'loss_type': self._get_loss_type(),
         }
         
         # Guardar embeddings de referencia para inferencia
@@ -833,6 +1281,12 @@ class MetricLearningTrainer:
         checkpoint = torch.load(filepath, map_location=self.device)
         
         self.model.load_state_dict(checkpoint['model_state_dict'])
+        if checkpoint.get('loss_state_dict'):
+            try:
+                self.loss_func.load_state_dict(checkpoint['loss_state_dict'])
+                self.logger.info("Loss state restored from checkpoint")
+            except Exception as exc:
+                self.logger.warning(f"Could not restore loss state: {exc}")
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         
         if self.scheduler and checkpoint.get('scheduler_state_dict'):
@@ -842,8 +1296,11 @@ class MetricLearningTrainer:
             self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
         
         self.current_epoch = checkpoint['epoch']
-        self.train_losses = checkpoint.get('train_losses', [])
-        self.val_losses = checkpoint.get('val_losses', [])
+        # Maintain history if already populated (e.g., during early stopping rollback)
+        if not self.train_losses:
+            self.train_losses = checkpoint.get('train_losses', [])
+        if not self.val_losses:
+            self.val_losses = checkpoint.get('val_losses', [])
         
         self.logger.info(f"Checkpoint loaded: {filepath} (epoch {self.current_epoch})")
     
@@ -858,6 +1315,8 @@ class MetricLearningTrainer:
         Returns:
             Tuple of (train_losses, val_losses)
         """
+        from src.data.dataloader_utils import free_training_memory
+
         if resume_from:
             self.load_checkpoint(resume_from)
             start_epoch = self.current_epoch + 1
@@ -877,6 +1336,8 @@ class MetricLearningTrainer:
                 'epoch', 'train_loss', 'val_loss', 
                 'recall_at_1', 'recall_at_5', 'recall_at_10',
                 'mAP@R', 'NMI', 'F1_macro',
+                'accuracy', 'balanced_accuracy',
+                'precision_macro', 'precision_weighted', 'F1_weighted',
                 'learning_rate', 'is_best', 'best_recall_at_1', 'epoch_time_sec'
             ])
         self.logger.info(f"Metrics CSV: {self.metrics_csv_path}")
@@ -884,6 +1345,14 @@ class MetricLearningTrainer:
         for epoch in range(start_epoch, epochs):
             self.current_epoch = epoch
             epoch_start_time = time.time()
+            self.alarm_manager.info(
+                "EPOCH_HEARTBEAT",
+                "Epoch started.",
+                epoch=epoch + 1,
+                total_epochs=epochs,
+                expected_train_workers=self.expected_train_workers,
+                expected_val_workers=self.expected_val_workers,
+            )
             
             self.logger.info(f"\n{'='*70}")
             self.logger.info(f"Epoch {epoch+1}/{epochs}")
@@ -891,12 +1360,24 @@ class MetricLearningTrainer:
             
             # Learning rate warmup
             self._warmup_lr(epoch)
-            
+
+            if self.hard_miner is not None:
+                self.hard_miner.set_epoch(epoch)
+
+            # Free val workers before train so only one worker pool runs at a time.
+            if self.data_engine is not None:
+                self.data_engine.release_val_workers()
+
             # Train
             train_loss = self.train_epoch()
             self.train_losses.append(train_loss)
-            
-            # Validate
+
+            # Validate every epoch — full SOTA metrics always computed after embeddings.
+            if self.data_engine is not None:
+                self.data_engine.release_train_workers()
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
+
             val_loss, val_metrics = self.validate()
             self.val_losses.append(val_loss)
             self.val_metrics_history.append(val_metrics)
@@ -918,6 +1399,11 @@ class MetricLearningTrainer:
             map_at_r = val_metrics.get('mAP@R', 0.0)
             nmi = val_metrics.get('NMI', 0.0)
             f1_macro = val_metrics.get('F1_macro', 0.0)
+            accuracy = val_metrics.get('Accuracy', 0.0)
+            balanced_accuracy = val_metrics.get('Balanced_Accuracy', 0.0)
+            precision_macro = val_metrics.get('Precision_macro', 0.0)
+            precision_weighted = val_metrics.get('Precision_weighted', 0.0)
+            f1_weighted = val_metrics.get('F1_weighted', 0.0)
             
             # Log SOTA metrics
             self.logger.info(f"\n--- SOTA Metrics (CVPR 2016-2024) ---")
@@ -929,6 +1415,11 @@ class MetricLearningTrainer:
             self.logger.info(f"  mAP@R:      {map_at_r:.4f}")
             self.logger.info(f"  NMI:        {nmi:.4f}")
             self.logger.info(f"  F1-Macro:   {f1_macro:.4f}")
+            self.logger.info(f"  Accuracy:   {accuracy:.4f}")
+            self.logger.info(f"  BalAcc:     {balanced_accuracy:.4f}")
+            self.logger.info(f"  Prec-Macro: {precision_macro:.4f}")
+            self.logger.info(f"  Prec-Wght:  {precision_weighted:.4f}")
+            self.logger.info(f"  F1-Wght:    {f1_weighted:.4f}")
             self.logger.info(f"  LR:         {current_lr:.2e}")
             
             # Determine if this is the best model
@@ -950,7 +1441,7 @@ class MetricLearningTrainer:
                 self.epochs_without_improvement += 1
                 self.logger.info(f"  -- No improvement for {self.epochs_without_improvement} epochs")
             
-            # Save epoch metrics to CSV (progressive — survives interruptions)
+            # Save epoch metrics to CSV (progressive â€” survives interruptions)
             epoch_time = time.time() - epoch_start_time
             with open(self.metrics_csv_path, 'a', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
@@ -958,11 +1449,40 @@ class MetricLearningTrainer:
                     epoch + 1, f'{train_loss:.6f}', f'{val_loss:.6f}',
                     f'{recall_at_1:.6f}', f'{recall_at_5:.6f}', f'{recall_at_10:.6f}',
                     f'{map_at_r:.6f}', f'{nmi:.6f}', f'{f1_macro:.6f}',
+                    f'{accuracy:.6f}', f'{balanced_accuracy:.6f}',
+                    f'{precision_macro:.6f}', f'{precision_weighted:.6f}', f'{f1_weighted:.6f}',
                     f'{current_lr:.2e}', is_best, f'{self.best_recall_at_1:.6f}',
                     f'{epoch_time:.1f}'
                 ])
+            self.alarm_manager.info(
+                "EPOCH_COMPLETED",
+                "Epoch metrics persisted.",
+                epoch=epoch + 1,
+                epoch_time_sec=round(epoch_time, 2),
+                is_best=bool(is_best),
+                recall_at_1=round(float(recall_at_1), 6),
+                recall_at_5=round(float(recall_at_5), 6),
+                map_at_r=round(float(map_at_r), 6),
+                nmi=round(float(nmi), 6),
+                f1_macro=round(float(f1_macro), 6),
+                val_loss=round(float(val_loss), 6),
+            )
+
+            # Progressive charts (CSV always updated; plots less often to save RAM/time).
+            plot_every = int(self.config.get("progressive_plot_every_epochs", 2))
+            is_last_epoch = (epoch + 1) >= epochs
+            if plot_every > 0 and (is_last_epoch or (epoch + 1) % plot_every == 0):
+                try:
+                    from scripts.post_training import plot_training_curves
+                    post_dir = Path(run_dir) / 'images' / 'post_training'
+                    post_dir.mkdir(parents=True, exist_ok=True)
+                    plot_training_curves(str(self.metrics_csv_path), str(post_dir))
+                    self.logger.info(f"  Training curves updated: {post_dir}")
+                    free_training_memory("post_plot_curves")
+                except Exception as curve_err:
+                    self.logger.warning(f"  Could not update training curves: {curve_err}")
             
-            # Periodic checkpoint (no reference embeddings — only on final save)
+            # Periodic checkpoint (no reference embeddings â€” only on final save)
             if (epoch + 1) % self.config.get('save_every_n_epochs', 10) == 0:
                 self.save_checkpoint(epoch, val_loss, str(Path(self.checkpoint_dir) / f'checkpoint_epoch_{epoch+1}.pth'), save_reference=False)
             
@@ -970,6 +1490,12 @@ class MetricLearningTrainer:
             if self.epochs_without_improvement >= self.early_stopping_patience:
                 self.logger.info(f"Early stopping triggered after {epoch+1} epochs")
                 self.logger.info(f"\n[STOP] Early stopping: no improvement for {self.early_stopping_patience} epochs")
+                
+                # Restore best weights before breaking
+                if hasattr(self, 'best_val_loss') and Path(self.checkpoint_dir, 'best_model.pth').exists():
+                    self.logger.info("Restoring best model weights in memory...")
+                    self.load_checkpoint(str(Path(self.checkpoint_dir) / 'best_model.pth'))
+                
                 break
         
         self.logger.info(f"\n{'='*70}")

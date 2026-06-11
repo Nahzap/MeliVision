@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use('Agg')
@@ -45,7 +45,8 @@ class InferenceReportGenerator:
         folder_path: str,
         model_info: Dict,
         class_names: List[str],
-        report_name: Optional[str] = None
+        report_name: Optional[str] = None,
+        visual_samples: Optional[List[Dict[str, Any]]] = None
     ) -> Path:
         """
         Genera reporte completo de inferencia.
@@ -78,7 +79,7 @@ class InferenceReportGenerator:
         
         # Generar reporte HTML
         html_path = self._generate_html_report(
-            df, stats, figure_paths, folder_path, model_info, report_name
+            df, stats, figure_paths, folder_path, model_info, report_name, visual_samples
         )
         
         # Guardar CSV con resultados detallados
@@ -100,7 +101,15 @@ class InferenceReportGenerator:
                 'confidence': pred.get('confidence', 0.0),
                 'mean_distance': pred.get('mean_distance', pred.get('distance', 0.0)),
                 'n_grains': pred.get('n_grains', 1),
-                'true_class': pred.get('true_class', None)
+                'true_class': pred.get('true_class', None),
+                'image_width': pred.get('image_width', 0),
+                'image_height': pred.get('image_height', 0),
+                'image_area_px': pred.get('image_area_px', 0.0),
+                'grain_area_sum_px': pred.get('grain_area_sum_px', 0.0),
+                'grain_coverage_pct': pred.get('grain_coverage_pct', 0.0),
+                'detect_ms': pred.get('detect_ms', 0.0),
+                'classify_ms': pred.get('classify_ms', 0.0),
+                'elapsed_ms': pred.get('elapsed_ms', 0.0),
             })
         
         return pd.DataFrame(data)
@@ -124,6 +133,27 @@ class InferenceReportGenerator:
                 'min': df['mean_distance'].min(),
                 'max': df['mean_distance'].max(),
                 'median': df['mean_distance'].median()
+            },
+            'total_grains': int(df['n_grains'].sum()),
+            'images_without_grains': int((df['n_grains'] == 0).sum()),
+            'grains_per_image_stats': {
+                'mean': df['n_grains'].mean(),
+                'std': df['n_grains'].std(),
+                'min': df['n_grains'].min(),
+                'max': df['n_grains'].max(),
+                'median': df['n_grains'].median()
+            },
+            'coverage_stats': {
+                'mean': df['grain_coverage_pct'].mean(),
+                'std': df['grain_coverage_pct'].std(),
+                'min': df['grain_coverage_pct'].min(),
+                'max': df['grain_coverage_pct'].max(),
+                'median': df['grain_coverage_pct'].median()
+            },
+            'timing_stats_ms': {
+                'detect_mean': df['detect_ms'].mean(),
+                'classify_mean': df['classify_ms'].mean(),
+                'elapsed_mean': df['elapsed_ms'].mean()
             }
         }
         
@@ -185,6 +215,20 @@ class InferenceReportGenerator:
             fig5.savefig(path5, dpi=150, bbox_inches='tight')
             plt.close(fig5)
             figure_paths['confusion_matrix'] = path5
+
+        # 6. Distribución de granos por imagen
+        fig6 = self._plot_grains_per_image(df)
+        path6 = output_dir / "grains_per_image.png"
+        fig6.savefig(path6, dpi=150, bbox_inches='tight')
+        plt.close(fig6)
+        figure_paths['grains_per_image'] = path6
+
+        # 7. Cobertura de granos en imagen (%)
+        fig7 = self._plot_grain_coverage_distribution(df)
+        path7 = output_dir / "grain_coverage_distribution.png"
+        fig7.savefig(path7, dpi=150, bbox_inches='tight')
+        plt.close(fig7)
+        figure_paths['grain_coverage_distribution'] = path7
         
         return figure_paths
     
@@ -304,6 +348,58 @@ class InferenceReportGenerator:
         plt.tight_layout()
         
         return fig
+
+    def _plot_grains_per_image(self, df: pd.DataFrame) -> Figure:
+        """Histograma de detecciones (granos) por imagen."""
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.hist(df['n_grains'], bins=30, color='#569cd6', alpha=0.8, edgecolor='black')
+        ax.axvline(
+            df['n_grains'].mean(),
+            color='red',
+            linestyle='--',
+            linewidth=2,
+            label=f"Media: {df['n_grains'].mean():.2f}"
+        )
+        ax.axvline(
+            df['n_grains'].median(),
+            color='orange',
+            linestyle='--',
+            linewidth=2,
+            label=f"Mediana: {df['n_grains'].median():.2f}"
+        )
+        ax.set_xlabel('Número de Granos por Imagen', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Frecuencia', fontsize=12, fontweight='bold')
+        ax.set_title('Distribución de Detecciones por Imagen', fontsize=14, fontweight='bold')
+        ax.legend()
+        ax.grid(alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    def _plot_grain_coverage_distribution(self, df: pd.DataFrame) -> Figure:
+        """Histograma de cobertura de granos (% del área de imagen)."""
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.hist(df['grain_coverage_pct'], bins=30, color='#c586c0', alpha=0.8, edgecolor='black')
+        ax.axvline(
+            df['grain_coverage_pct'].mean(),
+            color='red',
+            linestyle='--',
+            linewidth=2,
+            label=f"Media: {df['grain_coverage_pct'].mean():.2f}%"
+        )
+        ax.axvline(
+            df['grain_coverage_pct'].median(),
+            color='orange',
+            linestyle='--',
+            linewidth=2,
+            label=f"Mediana: {df['grain_coverage_pct'].median():.2f}%"
+        )
+        ax.set_xlabel('Cobertura de Granos (%)', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Frecuencia', fontsize=12, fontweight='bold')
+        ax.set_title('Cobertura de Detecciones por Imagen', fontsize=14, fontweight='bold')
+        ax.legend()
+        ax.grid(alpha=0.3)
+        plt.tight_layout()
+        return fig
     
     def _generate_html_report(
         self,
@@ -312,7 +408,8 @@ class InferenceReportGenerator:
         figure_paths: Dict[str, Path],
         folder_path: str,
         model_info: Dict,
-        report_name: str
+        report_name: str,
+        visual_samples: Optional[List[Dict[str, Any]]] = None
     ) -> Path:
         """Genera reporte HTML profesional"""
         
@@ -447,6 +544,14 @@ class InferenceReportGenerator:
                 <div class="value">{stats['num_classes_predicted']}</div>
             </div>
             <div class="stat-card">
+                <h3>Total de Granos Detectados</h3>
+                <div class="value">{stats['total_grains']}</div>
+            </div>
+            <div class="stat-card">
+                <h3>Imágenes sin Granos</h3>
+                <div class="value">{stats['images_without_grains']}</div>
+            </div>
+            <div class="stat-card">
                 <h3>Confianza Media</h3>
                 <div class="value">{stats['confidence_stats']['mean']:.3f}</div>
                 <div class="unit">± {stats['confidence_stats']['std']:.3f}</div>
@@ -470,6 +575,13 @@ class InferenceReportGenerator:
         </div>
         
         <h2>📊 Análisis Estadístico</h2>
+"""
+        html_content += f"""
+        <div class="metadata">
+            <p><strong>Granos por imagen (media ± std):</strong> {stats['grains_per_image_stats']['mean']:.2f} ± {0.0 if pd.isna(stats['grains_per_image_stats']['std']) else stats['grains_per_image_stats']['std']:.2f}</p>
+            <p><strong>Cobertura de granos (media ± std):</strong> {stats['coverage_stats']['mean']:.2f}% ± {0.0 if pd.isna(stats['coverage_stats']['std']) else stats['coverage_stats']['std']:.2f}%</p>
+            <p><strong>Tiempos medios:</strong> detección={stats['timing_stats_ms']['detect_mean']:.1f}ms, clasificación={stats['timing_stats_ms']['classify_mean']:.1f}ms, total={stats['timing_stats_ms']['elapsed_mean']:.1f}ms</p>
+        </div>
 """
         
         # Añadir gráficos
@@ -507,6 +619,47 @@ class InferenceReportGenerator:
                     <td>{count}</td>
                     <td>{percentage:.2f}%</td>
                     <td>{conf_mean:.3f}</td>
+                </tr>
+"""
+
+        if visual_samples:
+            html_content += """
+            </tbody>
+        </table>
+        
+        <h2>🖼️ Inspección Visual de Detecciones</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Imagen</th>
+                    <th>Motivo Muestra</th>
+                    <th>Granos</th>
+                    <th>Clase Dominante</th>
+                    <th>Confianza</th>
+                    <th>Cobertura (%)</th>
+                    <th>Vista</th>
+                </tr>
+            </thead>
+            <tbody>
+"""
+            for sample in visual_samples[:24]:
+                ann_path = Path(sample.get('annotated_path', ''))
+                img_ref = ""
+                if ann_path.exists():
+                    try:
+                        img_ref = str(ann_path.relative_to(self.output_dir)).replace("\\", "/")
+                    except ValueError:
+                        img_ref = str(ann_path).replace("\\", "/")
+                link_html = f'<a href="{img_ref}" target="_blank">Abrir</a>' if img_ref else 'N/A'
+                html_content += f"""
+                <tr>
+                    <td>{sample.get('image_name', '')}</td>
+                    <td>{sample.get('reason', '')}</td>
+                    <td>{sample.get('n_grains', 0)}</td>
+                    <td>{sample.get('dominant_class', '')}</td>
+                    <td>{sample.get('confidence', 0.0):.3f}</td>
+                    <td>{sample.get('grain_coverage_pct', 0.0):.2f}</td>
+                    <td>{link_html}</td>
                 </tr>
 """
         

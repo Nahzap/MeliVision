@@ -18,27 +18,39 @@ import time
 import statistics
 from pathlib import Path
 from torch.utils.data import DataLoader
-from pytorch_metric_learning.samplers import MPerClassSampler
 
 from src.models.analogy_net import AnalogyNet
-from src.data.dataset import MielDataset
-from src.data.transforms_enhanced import get_train_transforms, get_val_transforms
+from src.data.data_engine import GrainDataEngine, resolve_dataloader_workers
 from src.training.trainer_enhanced import MetricLearningTrainer
 from src.utils.config_utils import get_backbone_name
+from src.utils.training_alarms import TrainingAlarmManager
 
 
 def setup_logging(log_dir: str = 'logs', log_level: str = 'INFO'):
-    """Setup logging configuration"""
+    """Setup logging configuration (ASCII-safe on Windows cp1252 consoles)."""
+    from src.utils.unicode_utils import make_logger_ascii_safe
+
     Path(log_dir).mkdir(parents=True, exist_ok=True)
-    
-    logging.basicConfig(
-        level=getattr(logging, log_level),
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(f'{log_dir}/training.log'),
-            logging.StreamHandler()
-        ]
-    )
+
+    fmt = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.setLevel(getattr(logging, log_level))
+
+    file_handler = logging.FileHandler(f'{log_dir}/training.log', encoding='utf-8')
+    stream_handler = logging.StreamHandler()
+    if hasattr(stream_handler.stream, 'reconfigure'):
+        try:
+            stream_handler.stream.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
+    formatter = logging.Formatter(fmt)
+    file_handler.setFormatter(formatter)
+    stream_handler.setFormatter(formatter)
+    root.addHandler(file_handler)
+    root.addHandler(stream_handler)
+    make_logger_ascii_safe(root)
+
     return logging.getLogger(__name__)
 
 
@@ -57,150 +69,16 @@ def create_dataloaders(config: dict):
         config: Configuration dictionary
         
     Returns:
-        Tuple of (train_loader, val_loader)
+        Tuple of (train_loader, val_loader, GrainDataEngine)
     """
+    engine = GrainDataEngine.from_config(config)
+    data_config = config["data"]
     logger = logging.getLogger(__name__)
-    
-    # Get data configuration
-    data_config = config['data']
-    aug_config = config['augmentation']
-    
-    # Merge data and augmentation config for transforms
-    transform_config = {**aug_config, **data_config}
-    
-    # Create transforms (support DeiT III 3-Augment mode + dynamic resolution per backbone)
-    aug_mode = config.get('sota', {}).get('augmentation_mode', 'full')
-    backbone_name = get_backbone_name(config)
-    train_transforms = get_train_transforms(transform_config, mode=aug_mode, backbone_name=backbone_name)
-    val_transforms = get_val_transforms(transform_config, backbone_name=backbone_name)
-    
-    # num_workers > 0 enables parallel data loading in background processes,
-    # keeping the GPU fed while the next batch is prepared.
-    # Default to 4 workers on Windows (spawn-based multiprocessing).
-    num_workers = min(data_config.get('num_workers', 4), 4)
-    if num_workers == 0:
-        logger.warning("⚠️  num_workers=0: data loading is BLOCKING. "
-                       "Consider setting num_workers: 2-4 in config.yaml for faster training.")
-    
-    # Create datasets — choose between full images or segmented grain crops
-    dataset_mode = config.get('grain_detection', {}).get('dataset_mode', 'image')
-    
-    if dataset_mode == 'grain':
-        # Modo grain: cada sample es un crop de grano individual (de .seg files)
-        # Los .seg DEBEN existir previamente (generados en el tab de Contornos, paso 2)
-        from src.data.grain_dataset import SegmentedGrainDataset
-        grain_cfg = config.get('grain_detection', {})
-        
-        use_mask = grain_cfg.get('use_mask', True)
-        use_masked_pooling = grain_cfg.get('masked_pooling', False)
-        # Gray background: after ImageNet normalization ≈ zero → minimal contribution to mean pool
-        # This naturally suppresses background without masked pooling (avoids mask-augmentation desync)
-        mask_bg = 'gray'
-        
-        logger.info(f"[GRAIN MODE] Loading segmented grain crops from: {data_config['train_dir']}")
-        logger.info(f"[GRAIN MODE] use_mask={use_mask}, mask_bg={mask_bg}, masked_pooling={use_masked_pooling}")
-        train_dataset = SegmentedGrainDataset(
-            root=data_config['train_dir'],
-            transform=train_transforms,
-            crop_padding=grain_cfg.get('crop_padding', 0.2),
-            crop_size=grain_cfg.get('crop_size', 252),
-            use_mask=use_mask,
-            mask_bg_mode=mask_bg,
-            min_saliency=0.0,
-            return_mask=use_masked_pooling,
-            annotation_root='data/annotations',
-        )
-        
-        if len(train_dataset) == 0:
-            raise RuntimeError(
-                f"No se encontraron granos en {data_config['train_dir']}. "
-                f"Ejecuta primero 'Análisis de Contornos' para generar los archivos .seg."
-            )
-        
-        logger.info(f"[GRAIN MODE] Loading segmented grain crops from: {data_config['val_dir']}")
-        val_dataset = SegmentedGrainDataset(
-            root=data_config['val_dir'],
-            transform=val_transforms,
-            crop_padding=grain_cfg.get('crop_padding', 0.2),
-            crop_size=grain_cfg.get('crop_size', 252),
-            use_mask=use_mask,
-            mask_bg_mode=mask_bg,
-            min_saliency=0.0,
-            return_mask=use_masked_pooling,
-            annotation_root='data/annotations',
-        )
-        
-        if len(val_dataset) == 0:
-            logger.warning(
-                f"[GRAIN MODE] Val set vacío ({data_config['val_dir']}). "
-                f"¿Faltan archivos .seg? Ejecuta 'Análisis de Contornos' sobre todos los splits."
-            )
-        
-        logger.info(f"[GRAIN MODE] Train grains: {len(train_dataset)} | Val grains: {len(val_dataset)}")
-    else:
-        # Modo image: cada sample es una imagen completa (ImageFolder estándar)
-        logger.info(f"Loading training data from: {data_config['train_dir']}")
-        train_dataset = MielDataset(
-            root=data_config['train_dir'],
-            transform=train_transforms
-        )
-        
-        logger.info(f"Loading validation data from: {data_config['val_dir']}")
-        val_dataset = MielDataset(
-            root=data_config['val_dir'],
-            transform=val_transforms
-        )
-    
-    logger.info(f"Train samples: {len(train_dataset)}")
-    logger.info(f"Val samples: {len(val_dataset)}")
-    logger.info(f"Number of classes: {len(train_dataset.classes)}")
-    
-    # Update config with number of classes (needed for ArcFace)
-    config['num_classes'] = len(train_dataset.classes)
-    
-    # Create M-Per-Class sampler for training (CRITICAL for metric learning)
-    # .targets works for both MielDataset and SegmentedGrainDataset
-    train_labels = train_dataset.targets
-    sampler = MPerClassSampler(
-        labels=train_labels,
-        m=data_config['samples_per_class'],
-        length_before_new_iter=len(train_dataset)
+    logger.info(
+        f"Batch configuration: {data_config['classes_per_batch']} classes x "
+        f"{data_config['samples_per_class']} samples = {data_config['batch_size']} batch size"
     )
-    
-    # DataLoader configuration for Windows:
-    #   - persistent_workers=True: workers stay alive between epochs (avoids
-    #     costly respawn of 4 Python processes every epoch)
-    #   - prefetch_factor=4: each worker buffers 4 batches → 16 total in queue,
-    #     enough to absorb I/O variance and keep the GPU fed
-    #   - num_workers=4: good balance for Windows (spawn-based multiprocessing)
-    pin_memory = data_config.get('pin_memory', True)
-    use_persistent = num_workers > 0
-    
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=data_config['batch_size'],
-        sampler=sampler,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        drop_last=data_config.get('drop_last', True),
-        persistent_workers=use_persistent,
-        prefetch_factor=4 if num_workers > 0 else None,
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=data_config['batch_size'],
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        drop_last=False,
-        persistent_workers=use_persistent,
-        prefetch_factor=4 if num_workers > 0 else None,
-    )
-    
-    logger.info(f"Batch configuration: {data_config['classes_per_batch']} classes × {data_config['samples_per_class']} samples = {data_config['batch_size']} batch size")
-    
-    return train_loader, val_loader
+    return engine.train_loader, engine.val_loader, engine
 
 
 def create_model(config: dict) -> AnalogyNet:
@@ -243,12 +121,24 @@ def create_model(config: dict) -> AnalogyNet:
     return model
 
 
+def _unpack_batch(batch_data, device):
+    """Support (images, labels) or (images, labels, masks) batches."""
+    if len(batch_data) == 3:
+        images, labels, masks = batch_data
+        masks = masks.to(device, non_blocking=True)
+    else:
+        images, labels = batch_data
+        masks = None
+    images = images.to(device, non_blocking=True)
+    labels = labels.to(device, non_blocking=True)
+    return images, labels, masks
+
+
 def estimate_training_time(config: dict, train_loader, val_loader, model, logger, benchmark_batches: int = 8) -> dict:
     """
     Benchmarks real training steps (forward + loss + backward + optimizer)
     and validation batches to estimate total training time accurately.
-    Uses num_workers=0 internally to avoid Windows multiprocessing deadlocks,
-    then adds measured data-loading overhead factor.
+    Uses the same configured batch size as training for a closer estimate.
     
     Args:
         config: Full configuration dictionary
@@ -297,25 +187,28 @@ def estimate_training_time(config: dict, train_loader, val_loader, model, logger
     gradient_clip_norm = config['training'].get('gradient_clip_norm', 5.0)
     
     # Create lightweight single-process loaders for benchmarking
-    # Use smaller batch size for benchmark to avoid OOM and speed up estimation
-    bench_batch_size = min(batch_size, 32)  # Cap at 32 for faster benchmark
+    # Keep real batch size to avoid optimistic estimates.
+    bench_batch_size = batch_size
     logger.info(f"Using batch_size={bench_batch_size} for benchmark (original: {batch_size})")
     
-    bench_train_loader = DataLoader(
-        train_loader.dataset,
+    collate_fn = getattr(train_loader, "collate_fn", None)
+    bench_kw = dict(
         batch_size=bench_batch_size,
-        shuffle=True,
         num_workers=0,
         pin_memory=False,
-        drop_last=True
+        collate_fn=collate_fn,
+    )
+    bench_train_loader = DataLoader(
+        train_loader.dataset,
+        shuffle=True,
+        drop_last=True,
+        **bench_kw,
     )
     bench_val_loader = DataLoader(
         val_loader.dataset,
-        batch_size=bench_batch_size,
         shuffle=False,
-        num_workers=0,
-        pin_memory=False,
-        drop_last=False
+        drop_last=False,
+        **bench_kw,
     )
     
     # --- CUDA warmup (2 batches, NOT timed) ---
@@ -332,15 +225,13 @@ def estimate_training_time(config: dict, train_loader, val_loader, model, logger
             bench_train_iter = iter(bench_train_loader)
             batch_data = next(bench_train_iter)
         logger.info(f"  Warmup batch {i+1}/{warmup_batches}: loaded, processing...")
-        images, labels = batch_data[0], batch_data[1]
-        images = images.to(device)
-        labels = labels.to(device)
+        images, labels, masks = _unpack_batch(batch_data, device)
         bench_optimizer.zero_grad(set_to_none=True)
         
         logger.info(f"    -> Forward pass...")
         if use_amp:
             with autocast('cuda'):
-                embeddings = model(images)
+                embeddings = model(images, mask=masks)
                 logger.info(f"    -> Loss computation...")
                 loss = bench_loss_func(embeddings, labels)
             logger.info(f"    -> Backward pass...")
@@ -351,7 +242,7 @@ def estimate_training_time(config: dict, train_loader, val_loader, model, logger
             bench_scaler.step(bench_optimizer)
             bench_scaler.update()
         else:
-            embeddings = model(images)
+            embeddings = model(images, mask=masks)
             logger.info(f"    -> Loss computation...")
             loss = bench_loss_func(embeddings, labels)
             logger.info(f"    -> Backward pass...")
@@ -379,9 +270,7 @@ def estimate_training_time(config: dict, train_loader, val_loader, model, logger
         except StopIteration:
             bench_train_iter = iter(bench_train_loader)
             batch_data = next(bench_train_iter)
-        images, labels = batch_data[0], batch_data[1]
-        images = images.to(device)
-        labels = labels.to(device)
+        images, labels, masks = _unpack_batch(batch_data, device)
         data_load_times.append(time.perf_counter() - t_data_start)
         
         t0 = time.perf_counter()
@@ -389,7 +278,7 @@ def estimate_training_time(config: dict, train_loader, val_loader, model, logger
         
         if use_amp:
             with autocast('cuda'):
-                embeddings = model(images)
+                embeddings = model(images, mask=masks)
                 loss = bench_loss_func(embeddings, labels)
             bench_scaler.scale(loss).backward()
             bench_scaler.unscale_(bench_optimizer)
@@ -397,7 +286,7 @@ def estimate_training_time(config: dict, train_loader, val_loader, model, logger
             bench_scaler.step(bench_optimizer)
             bench_scaler.update()
         else:
-            embeddings = model(images)
+            embeddings = model(images, mask=masks)
             loss = bench_loss_func(embeddings, labels)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip_norm)
@@ -419,18 +308,14 @@ def estimate_training_time(config: dict, train_loader, val_loader, model, logger
                 batch_data = next(bench_val_iter)
             except StopIteration:
                 break
-            images, labels = batch_data[0], batch_data[1]
-            images = images.to(device)
-            labels = labels.to(device)
+            images, labels, masks = _unpack_batch(batch_data, device)
             
             t0 = time.perf_counter()
             if use_amp:
                 with autocast('cuda'):
-                    embeddings = model(images)
-                    loss = bench_loss_func(embeddings, labels)
+                    embeddings = model(images, mask=masks)
             else:
-                embeddings = model(images)
-                loss = bench_loss_func(embeddings, labels)
+                embeddings = model(images, mask=masks)
             
             if device.type == 'cuda':
                 torch.cuda.synchronize()
@@ -444,16 +329,22 @@ def estimate_training_time(config: dict, train_loader, val_loader, model, logger
     # Data loading overhead:
     #   num_workers > 0: loading is overlapped with GPU work; add ~15% for stalls
     #   num_workers = 0: loading is BLOCKING (sequential), so total = step + data_load
-    num_workers = config['data'].get('num_workers', 4)
+    num_workers = int(getattr(train_loader, "num_workers", 0))
+    val_workers = int(getattr(val_loader, "num_workers", 0))
     if num_workers > 0:
-        data_overhead_factor = 1.15
+        data_overhead_factor = 1.0 + (avg_data_load / avg_train_step) if avg_train_step > 0 else 1.15
     else:
         data_overhead_factor = 1.0 + (avg_data_load / avg_train_step) if avg_train_step > 0 else 1.5
+    val_data_factor = 1.0 + (avg_data_load / avg_val_batch) if val_workers > 0 and avg_val_batch > 0 else (
+        1.0 + (avg_data_load / avg_val_batch) if avg_val_batch > 0 else 1.0
+    )
     
     avg_train_batch_full = avg_train_step * data_overhead_factor
     
-    # Validation also includes Recall@K computation overhead (~5s per epoch)
-    recall_overhead_sec = 5.0
+    recall_overhead_sec = float(
+        config.get("evaluation", {}).get("metrics_overhead_sec", 5.0)
+    )
+    avg_val_batch_full = avg_val_batch * val_data_factor
     
     # Reference embedding extraction: happens ONCE at the end (final_model.pth),
     # NOT during training epochs.  Centroids are also computed once post-training.
@@ -461,7 +352,7 @@ def estimate_training_time(config: dict, train_loader, val_loader, model, logger
     ref_embed_one_time_sec = num_train_batches * avg_val_batch  # one full pass over train set
     
     train_epoch_sec = avg_train_batch_full * num_train_batches
-    val_epoch_sec = (avg_val_batch * num_val_batches) + recall_overhead_sec
+    val_epoch_sec = (avg_val_batch_full * num_val_batches) + recall_overhead_sec
     epoch_total_sec = train_epoch_sec + val_epoch_sec
     total_sec = (epoch_total_sec * epochs) + ref_embed_one_time_sec
     
@@ -517,19 +408,25 @@ def estimate_training_time(config: dict, train_loader, val_loader, model, logger
     logger.info(f"Median data load: {avg_data_load:.4f}s  (range: {min(data_load_times):.4f}-{max(data_load_times):.4f}s)")
     logger.info(f"Data overhead factor: {data_overhead_factor:.2f}x  ({'blocking I/O' if num_workers == 0 else 'overlapped'})")
     if num_workers == 0:
-        logger.info(f"⚠️  num_workers=0: data loading is BLOCKING. GPU idles during disk I/O.")
+        logger.info("num_workers=0: data loading is BLOCKING. GPU idles during disk I/O.")
         logger.info(f"    Consider enabling cache_in_memory in config or setting num_workers > 0.")
-    logger.info(f"Train: {num_train_batches} batches × {avg_train_batch_full:.3f}s = {estimate['train_epoch_fmt']}/epoch")
-    logger.info(f"Val:   {num_val_batches} batches × {avg_val_batch:.3f}s + recall = {estimate['val_epoch_fmt']}/epoch")
+    logger.info(f"Train: {num_train_batches} batches x {avg_train_batch_full:.3f}s = {estimate['train_epoch_fmt']}/epoch")
+    logger.info(f"Val:   {num_val_batches} batches x {avg_val_batch:.3f}s + recall = {estimate['val_epoch_fmt']}/epoch")
     logger.info(f"Ref embed (one-time, post-training): {fmt_time(ref_embed_one_time_sec)}")
     logger.info(f"Epoch total: {estimate['epoch_total_fmt']}")
-    logger.info(f"Total estimated: {estimate['epochs']} epochs × {estimate['epoch_total_fmt']} + ref_embed = {estimate['total_fmt']}")
+    logger.info(f"Total estimated: {estimate['epochs']} epochs x {estimate['epoch_total_fmt']} + ref_embed = {estimate['total_fmt']}")
     logger.info("=" * 70)
     
-    # Clean up benchmark objects
+    # Clean up benchmark objects (same process as GUI train thread — free RAM aggressively)
+    del bench_train_loader, bench_val_loader, bench_train_iter, bench_val_iter
     del bench_optimizer, bench_loss_func
     if bench_scaler:
         del bench_scaler
+    model.cpu()
+    import gc
+    from src.data.dataloader_utils import free_training_memory
+    gc.collect()
+    free_training_memory("benchmark")
     
     return estimate
 
@@ -561,6 +458,7 @@ def run_training(args, estimate_only: bool = False, run_dir: str = None):
         log_dir=config['paths']['log_dir'],
         log_level=config['logging']['log_level']
     )
+    alarm_manager = TrainingAlarmManager(run_dir=run_dir, logger=logger)
     
     logger.info("="*70)
     logger.info("METRIC LEARNING TRAINING - SOTA 2024")
@@ -576,7 +474,10 @@ def run_training(args, estimate_only: bool = False, run_dir: str = None):
     logger.info(f"  Model: {get_backbone_name(config)}, emb_dim={model_cfg['embedding_dim']}, pretrained={model_cfg['pretrained']}")
     logger.info(f"  Projection: {model_cfg.get('projection_head', {}).get('hidden_dims', [])}, dropout={model_cfg.get('projection_head', {}).get('dropout', 0)}")
     logger.info(f"  Data: image_size={data_cfg.get('image_size')}, resize={data_cfg.get('resize_size')}, batch={data_cfg['batch_size']}, workers={data_cfg.get('num_workers', 4)}")
-    logger.info(f"  Grain: mode={grain_cfg.get('dataset_mode')}, crop_size={grain_cfg.get('crop_size')}, use_mask={grain_cfg.get('use_mask')}, masked_pooling={grain_cfg.get('masked_pooling')}")
+    logger.info(
+        f"  Grain: enabled={grain_cfg.get('enabled', True)}, crop_size={grain_cfg.get('crop_size')}, "
+        f"use_mask={grain_cfg.get('use_mask')}, masked_pooling={grain_cfg.get('masked_pooling')}"
+    )
     logger.info(f"  Training: loss={train_cfg['loss']['type']}, lr={train_cfg['learning_rate']}, epochs={train_cfg['epochs']}, warmup={train_cfg.get('warmup_epochs', 0)}")
     logger.info(f"  Scheduler: {train_cfg.get('scheduler')}, T_max={train_cfg.get('scheduler_params', {}).get('T_max')}")
     logger.info(f"  AMP: {config.get('hardware', {}).get('use_amp', True)}, grad_clip={train_cfg.get('gradient_clip_norm', 5.0)}")
@@ -599,11 +500,73 @@ def run_training(args, estimate_only: bool = False, run_dir: str = None):
         torch.backends.cudnn.benchmark = True
         logger.info("cuDNN benchmark mode enabled (faster convolutions)")
     
+    from src.data.dataloader_utils import (
+        dispose_data_engine,
+        estimate_worker_ram_mb,
+        free_training_memory,
+    )
+
     # Create dataloaders
     logger.info("\n" + "="*70)
     logger.info("CREATING DATALOADERS")
     logger.info("="*70)
-    train_loader, val_loader = create_dataloaders(config)
+    train_loader, val_loader, data_engine = create_dataloaders(config)
+    test_loader = getattr(data_engine, 'test_loader', None)
+    ram_est = estimate_worker_ram_mb(config)
+    logger.info(
+        "Worker RAM budget (estimate): ~%.0f MB for %d train + %d val workers",
+        ram_est["total_workers_mb"],
+        ram_est["train_workers"],
+        ram_est["val_workers"],
+    )
+    effective_train_workers = int(getattr(train_loader, 'num_workers', -1))
+    effective_val_workers = int(getattr(val_loader, 'num_workers', -1))
+    requested_train_workers, requested_val_workers = resolve_dataloader_workers(config)
+    logger.info(
+        f"DataLoader effective workers: train={effective_train_workers}, "
+        f"val={effective_val_workers} "
+        f"(config: train={requested_train_workers}, val={requested_val_workers})"
+    )
+    alarm_manager.info(
+        "WORKER_REGIME_APPLIED",
+        "DataLoader regime initialized.",
+        requested_train_workers=requested_train_workers,
+        requested_val_workers=requested_val_workers,
+        effective_train_workers=effective_train_workers,
+        effective_val_workers=effective_val_workers,
+    )
+
+    if effective_train_workers != requested_train_workers:
+        alarm_manager.error(
+            "WORKER_REGIME_MISMATCH",
+            "Train DataLoader workers do not match config.",
+            requested=requested_train_workers,
+            effective=effective_train_workers,
+        )
+        raise RuntimeError(
+            "Worker regime mismatch: train DataLoader workers differ from config."
+        )
+    if effective_val_workers != requested_val_workers:
+        alarm_manager.error(
+            "WORKER_REGIME_MISMATCH",
+            "Val DataLoader workers do not match config.",
+            requested=requested_val_workers,
+            effective=effective_val_workers,
+        )
+        raise RuntimeError(
+            "Worker regime mismatch: val DataLoader workers differ from config."
+        )
+
+    if effective_train_workers > 0:
+        if not bool(getattr(train_loader, "persistent_workers", False)):
+            raise RuntimeError(
+                "Persistent workers disabled on train loader while num_workers > 0."
+            )
+    if effective_val_workers > 0:
+        if not bool(getattr(val_loader, "persistent_workers", False)):
+            raise RuntimeError(
+                "Persistent workers disabled on val loader while val_num_workers > 0."
+            )
     
     # Create model
     logger.info("\n" + "="*70)
@@ -621,6 +584,8 @@ def run_training(args, estimate_only: bool = False, run_dir: str = None):
         logger.info("BENCHMARKING (estimating training time...)")
         logger.info("="*70)
         time_estimate = estimate_training_time(config, train_loader, val_loader, model, logger)
+        dispose_data_engine(data_engine)
+        free_training_memory("post-benchmark")
     
     if estimate_only:
         # Run pre-training analysis and create run directory
@@ -634,23 +599,27 @@ def run_training(args, estimate_only: bool = False, run_dir: str = None):
         time_estimate['analysis'] = analysis
         time_estimate['run_dir'] = analysis['run_paths']['run_dir']
         
-        # Clean up GPU memory before returning
-        del model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        dispose_data_engine(data_engine)
+        del train_loader, val_loader, data_engine, model
+        free_training_memory("estimate_only")
         return time_estimate
     
     # Merge training and hardware configs for trainer
     sota_config = config.get('sota', {})
+    eval_cfg = config.get("evaluation", {})
     trainer_config = {
         **config['training'],
         **config['hardware'],
         'num_classes': config.get('num_classes'),
         'embedding_dim': config['model']['embedding_dim'],
+        'run_dir': run_dir,
+        'expected_train_workers': effective_train_workers,
+        'expected_val_workers': effective_val_workers,
         'use_gpu': config['hardware']['use_gpu'],
         'use_amp': config['hardware']['use_amp'],
         'epochs': config['training']['epochs'],
         'save_every_n_epochs': config['training']['save_every_n_epochs'],
+        'progressive_plot_every_epochs': int(eval_cfg.get('progressive_plot_every_epochs', 2)),
         # SOTA regularizers (2022-2024)
         'nir': sota_config.get('nir', {}),
         'hier': sota_config.get('hier', {}),
@@ -668,7 +637,8 @@ def run_training(args, estimate_only: bool = False, run_dir: str = None):
         val_loader=val_loader,
         config=trainer_config,
         logger=logger,
-        checkpoint_dir=run_dir
+        checkpoint_dir=run_dir,
+        data_engine=data_engine,
     )
     
     # Print training configuration
@@ -689,6 +659,7 @@ def run_training(args, estimate_only: bool = False, run_dir: str = None):
     logger.info("\n" + "="*70)
     logger.info("STARTING TRAINING")
     logger.info("="*70)
+    free_training_memory("pre_fit")
     
     try:
         train_losses, val_losses = trainer.fit(
@@ -716,46 +687,77 @@ def run_training(args, estimate_only: bool = False, run_dir: str = None):
         
         # --- Post-training analysis (curves, t-SNE, confusion matrix, inference, report) ---
         if run_dir:
-            from scripts.post_training import run_post_training_analysis, compute_and_save_centroids
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            # Load BEST model for analysis (not the final epoch model)
-            best_ckpt = Path(run_dir) / 'checkpoints' / 'best_model.pth'
-            if best_ckpt.exists():
-                logger.info("Loading BEST model checkpoint for post-training analysis...")
-                ckpt = torch.load(str(best_ckpt), map_location=device, weights_only=True)
-                model.load_state_dict(ckpt['model_state_dict'])
-                logger.info(f"Best model loaded (epoch {ckpt.get('epoch', '?')+1}, val_loss={ckpt.get('val_loss', '?')})")
-            model.to(device)
-
-            # Compute and save centroids + reference embeddings (ONE-TIME, training artifact)
-            class_names = train_loader.dataset.classes
-            centroids = compute_and_save_centroids(
-                model, train_loader, device, run_dir, class_names
+            from scripts.post_training import (
+                run_post_training_analysis,
+                compute_and_save_centroids,
+                finalize_self_contained_checkpoint,
             )
 
-            # Run analysis using pre-computed centroids (no train_loader needed)
-            run_post_training_analysis(model, val_loader, config, run_dir, device, centroids=centroids)
+            del trainer
+            free_training_memory("post_training_start")
 
-            # Re-save best_model.pth as SELF-CONTAINED inference checkpoint
-            # (includes reference embeddings + centroids + class_names)
-            logger.info("Re-saving best_model.pth as self-contained inference checkpoint...")
-            ref_path = Path(run_dir) / 'reference_embeddings.pt'
-            cent_path = Path(run_dir) / 'class_centroids.pt'
-            if best_ckpt.exists() and ref_path.exists() and cent_path.exists():
-                best_data = torch.load(str(best_ckpt), map_location='cpu', weights_only=False)
-                ref_data = torch.load(str(ref_path), map_location='cpu', weights_only=False)
-                cent_data = torch.load(str(cent_path), map_location='cpu', weights_only=False)
-                best_data['reference_embeddings'] = ref_data['embeddings'].numpy() if torch.is_tensor(ref_data['embeddings']) else ref_data['embeddings']
-                best_data['reference_labels'] = ref_data['labels'].numpy() if torch.is_tensor(ref_data['labels']) else ref_data['labels']
-                best_data['class_names'] = cent_data['class_names']
-                best_data['centroids'] = cent_data['centroids']
-                best_data['config'] = config
-                torch.save(best_data, str(best_ckpt))
-                logger.info(f"Self-contained checkpoint saved: {best_ckpt} "
-                            f"({len(best_data['class_names'])} classes, "
-                            f"{len(best_data['reference_embeddings'])} ref embeddings)")
-        
+            try:
+                device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                best_ckpt = Path(run_dir) / 'checkpoints' / 'best_model.pth'
+                if best_ckpt.exists():
+                    logger.info("Loading BEST model checkpoint for post-training analysis...")
+                    ckpt = torch.load(str(best_ckpt), map_location=device, weights_only=True)
+                    model.load_state_dict(ckpt['model_state_dict'])
+                    logger.info(
+                        f"Best model loaded (epoch {ckpt.get('epoch', '?')+1}, "
+                        f"val_loss={ckpt.get('val_loss', '?')})"
+                    )
+                model.to(device)
+
+                class_names = train_loader.dataset.classes
+                loss_params = config.get('training', {}).get('loss', {}).get('params', {})
+                num_slices = int(loss_params.get('num_slices', 4))
+                ckpt_full = torch.load(str(best_ckpt), map_location='cpu', weights_only=False) if best_ckpt.exists() else {}
+                centroids, slice_classifier = compute_and_save_centroids(
+                    model,
+                    train_loader,
+                    device,
+                    run_dir,
+                    class_names,
+                    num_slices=num_slices,
+                    loss_state_dict=ckpt_full.get('loss_state_dict'),
+                    loss_type=ckpt_full.get('loss_type'),
+                )
+                free_training_memory("centroids_saved")
+
+                logger.info("Running post-training analysis on Validation set...")
+                run_post_training_analysis(
+                    model, val_loader, config, run_dir, device,
+                    slice_classifier=slice_classifier, centroids=centroids, prefix="val"
+                )
+
+                if test_loader is not None:
+                    logger.info("Running post-training analysis on Test set...")
+                    run_post_training_analysis(
+                        model, test_loader, config, run_dir, device,
+                        slice_classifier=slice_classifier, centroids=centroids, prefix="test"
+                    )
+
+                logger.info("Re-saving best_model.pth as self-contained inference checkpoint...")
+                finalize_self_contained_checkpoint(Path(run_dir))
+
+            except Exception as post_err:
+                alarm_manager.error(
+                    "POST_TRAINING_FAILED",
+                    "Post-training analysis failed (training completed successfully).",
+                    error=str(post_err),
+                )
+                logger.error(
+                    f"\nPost-training analysis failed: {post_err}\n"
+                    f"Use the Evaluación tab or run_evaluation_from_checkpoint to regenerate results.",
+                    exc_info=True,
+                )
+
     except KeyboardInterrupt:
+        alarm_manager.warning(
+            "TRAINING_INTERRUPTED",
+            "Training interrupted by user.",
+        )
         logger.info("\n\nTraining interrupted by user")
         logger.info("Saving checkpoint...")
         trainer.save_checkpoint(
@@ -767,6 +769,11 @@ def run_training(args, estimate_only: bool = False, run_dir: str = None):
         logger.info("Checkpoint saved to run directory")
     
     except Exception as e:
+        alarm_manager.error(
+            "TRAINING_FAILED",
+            "Unhandled training exception.",
+            error=str(e),
+        )
         logger.error(f"\n\nTraining failed with error: {str(e)}", exc_info=True)
         raise
 

@@ -7,12 +7,16 @@ from pathlib import Path
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QLabel,
     QPushButton, QLineEdit, QTextEdit, QFileDialog, QMessageBox,
-    QComboBox, QSpinBox, QFormLayout, QProgressBar
+    QComboBox, QSpinBox, QFormLayout, QProgressBar, QCheckBox, QDoubleSpinBox,
+    QScrollArea
 )
 from PyQt5.QtCore import QThread, pyqtSignal
 import logging
+from typing import Dict, Any, List
 
 from lib.styles import Styles, Colors
+from src.utils.logging_utils import setup_logger
+from src.utils.run_artifact_utils import check_slice_inference_artifacts
 
 logger = logging.getLogger(__name__)
 
@@ -24,12 +28,113 @@ class InferenceWorker(QThread):
     progress = pyqtSignal(int, int)
     detailed_progress = pyqtSignal(object)
     
-    def __init__(self, checkpoint, folder, database, k):
+    def __init__(self, checkpoint, folder, database, k, noise_config: Dict[str, Any]):
         super().__init__()
         self.checkpoint = checkpoint
         self.folder = folder
         self.database = database
         self.k = k
+        self.noise_config = noise_config or {}
+
+    def _background_correct_image(self, image_bgr, blur_kernel: int):
+        """
+        Flat-field-like correction using heavy blur background estimate.
+        Kept local to inference tab to avoid changing core detector.
+        """
+        import cv2
+        import numpy as np
+
+        kernel = max(3, int(blur_kernel))
+        if kernel % 2 == 0:
+            kernel += 1
+
+        img = image_bgr.astype(np.float32)
+        background = cv2.GaussianBlur(img, (kernel, kernel), 0)
+        # Fix B&N / Domain Shift: Promedio por canales para no desaturar las texturas
+        corrected = (img / (background + 1.0)) * np.mean(background, axis=(0, 1))
+        corrected = np.clip(corrected, 0, 255).astype(np.uint8)
+        return corrected
+
+    def _postfilter_grains(
+        self,
+        grains: List[Dict[str, Any]],
+        image_shape,
+        confidence_min: float
+    ):
+        """
+        Adaptive post-filtering: Removes static-like noise but dynamically relaxes 
+        thresholds based on image statistics to prevent NO_GRAINS_DETECTED on valid external samples.
+        """
+        import cv2
+
+        if not grains:
+            return [], []
+
+        h, w = image_shape
+        image_area = max(1.0, float(h * w))
+        
+        # Base (strict) thresholds from UI
+        base_min_w = int(self.noise_config.get("min_bbox_w", 20))
+        base_min_h = int(self.noise_config.get("min_bbox_h", 20))
+        base_min_area = float(self.noise_config.get("min_contour_area", 1500.0))
+        base_min_ratio = float(self.noise_config.get("min_area_ratio", 0.0002))
+        base_min_sal = float(self.noise_config.get("min_saliency", 0.35))
+        exclude_unknown = bool(self.noise_config.get("exclude_unknown", True))
+
+        # Adaptive logic: calculate max stats from current raw grains
+        max_sal = max((float(g.get('saliency', 0.0)) for g in grains), default=0.0)
+        
+        # Relax thresholds to a dynamic minimum (e.g. 50% of the max saliency found)
+        # with an absolute floor to avoid complete noise.
+        min_saliency = max(0.15, min(base_min_sal, max_sal * 0.50))
+        min_confidence = max(0.20, confidence_min * 0.50)
+        min_contour_area = max(200.0, base_min_area * 0.30)
+        min_bbox_w = max(10, int(base_min_w * 0.50))
+        min_bbox_h = max(10, int(base_min_h * 0.50))
+        min_area_ratio = max(0.00005, base_min_ratio * 0.25)
+
+        kept = []
+        dropped = []
+        for grain in grains:
+            bx, by, bw, bh = grain.get('bbox', (0, 0, 0, 0))
+            contour = grain.get('contour')
+            contour_area = float(max(0, bw) * max(0, bh))
+            if contour is not None and len(contour) >= 3:
+                contour_area = float(cv2.contourArea(contour.astype('int32')))
+            area_ratio = contour_area / image_area
+            sal = float(grain.get('saliency', 0.0))
+            conf = float(grain.get('confidence', 0.0))
+            pred_class = str(grain.get('predicted_class', ''))
+
+            reason = None
+            if bw < min_bbox_w or bh < min_bbox_h:
+                reason = f"small_bbox (w={bw},h={bh} < {min_bbox_w})"
+            elif contour_area < min_contour_area:
+                reason = f"small_area ({contour_area:.1f} < {min_contour_area:.1f})"
+            elif area_ratio < min_area_ratio:
+                reason = f"low_area_ratio ({area_ratio:.5f} < {min_area_ratio:.5f})"
+            elif sal < min_saliency:
+                reason = f"low_saliency ({sal:.3f} < {min_saliency:.3f})"
+            elif conf < min_confidence:
+                reason = f"low_confidence ({conf:.3f} < {min_confidence:.3f})"
+            elif exclude_unknown and ("unknown" in pred_class.lower()):
+                reason = "unknown_class"
+
+            if reason is not None:
+                dropped.append({
+                    "grain_index": grain.get("index", -1),
+                    "reason": reason,
+                    "bbox": (bx, by, bw, bh),
+                    "contour_area_px": contour_area,
+                    "area_ratio": area_ratio,
+                    "saliency": sal,
+                    "confidence": conf,
+                    "predicted_class": pred_class,
+                })
+            else:
+                kept.append(grain)
+
+        return kept, dropped
     
     def run(self):
         """Ejecuta inferencia con detección de granos por imagen"""
@@ -38,12 +143,15 @@ class InferenceWorker(QThread):
             from src.utils.report_generator import InferenceReportGenerator
             import numpy as np
             import cv2
+            import csv
 
-            # Inicializar pipeline completo: U²-Net detector + modelo + kNN
-            logger.info("Inicializando FullImageClassifier...")
+            from src.utils.config_utils import resolve_run_config_path
+
+            config_path = resolve_run_config_path(self.checkpoint, "config.yaml")
+            logger.info("Inicializando FullImageClassifier (slice-aware si hay artefactos)...")
             classifier = FullImageClassifier.from_checkpoint(
                 checkpoint_path=self.checkpoint,
-                config_path="config.yaml",
+                config_path=config_path,
                 k=self.k,
             )
             
@@ -67,26 +175,94 @@ class InferenceWorker(QThread):
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_dir = folder_path / f"inference_{timestamp}"
             output_dir.mkdir(exist_ok=True)
+            report_output_dir = output_dir / "report"
+            report_output_dir.mkdir(exist_ok=True)
+            samples_dir = output_dir / "samples"
+            samples_dir.mkdir(exist_ok=True)
+            annotated_dir = output_dir / "annotated"
+            annotated_dir.mkdir(exist_ok=True)
+
+            runtime_logger = setup_logger(
+                name="inference_runtime",
+                log_level=logging.INFO,
+                console_output=True,
+                file_output=True
+            )
+            runtime_logger.info(
+                f"[RUN] Inicio inferencia carpeta={folder_path} total_imagenes={len(image_files)} "
+                f"checkpoint={self.checkpoint} k={self.k}"
+            )
             
             # Procesar cada imagen con detección de granos
             predictions = []
             all_grain_details = []
+            dropped_grain_details = []
+            visual_samples = []
             total = len(image_files)
             running_class_counts = {}  # conteo acumulado por clase
             running_total_grains = 0
+            running_no_grains = 0
             
             # Milestones cada 5% para guardar imágenes de muestra
             sample_pcts = set(range(0, 101, 5))  # {0, 5, 10, ..., 100}
             saved_samples = set()
+            max_visual_samples = 80
+            save_all_annotated = total <= 300
             
             for idx, img_path in enumerate(image_files, 1):
                 try:
+                    img = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
+                    if img is None:
+                        continue
+                    
+                    if len(img.shape) == 2:
+                        image_bgr = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+                    elif img.shape[2] == 4:
+                        image_bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+                    else:
+                        image_bgr = img
+
+                    # Preprocesamiento local SOLO para inferencia en tab:
+                    # corrige fondo/viñeteo y reduce ruido óptico de baja escala.
+                    if self.noise_config.get("enable_background_correction", True):
+                        blur_kernel = int(self.noise_config.get("background_blur_kernel", 61))
+                        image_for_detection = self._background_correct_image(image_bgr, blur_kernel)
+                    else:
+                        image_for_detection = image_bgr
+
                     # Pipeline: detectar granos → recortar → clasificar cada grano
-                    results = classifier.classify_full_image(str(img_path))
-                    grains = results.get("grains", [])
+                    results = classifier.classify_full_image(image_for_detection)
+                    grains_raw = results.get("grains", [])
+                    summary = results.get("summary", {})
+
+                    confidence_min = float(self.noise_config.get("min_confidence", 0.45))
+                    if self.noise_config.get("enable_postfilter", True):
+                        grains, dropped = self._postfilter_grains(
+                            grains_raw,
+                            image_for_detection.shape[:2],
+                            confidence_min=confidence_min
+                        )
+                    else:
+                        grains = grains_raw
+                        dropped = []
+
+                    filtered_results = dict(results)
+                    filtered_results["grains"] = grains
+                    per_class_counts = {}
+                    for g in grains:
+                        cls_name = g.get("predicted_class", "UNKNOWN")
+                        per_class_counts[cls_name] = per_class_counts.get(cls_name, 0) + 1
+                    filtered_results["summary"] = dict(summary)
+                    filtered_results["summary"]["total_grains"] = len(grains)
+                    filtered_results["summary"]["per_class_counts"] = per_class_counts
+
+                    image_h, image_w = image_bgr.shape[:2]
+                    image_area = float(image_w * image_h)
                     
                     if not grains:
                         logger.warning(f"No se detectaron granos en {img_path.name}")
+                        running_no_grains += 1
+                        coverage_pct = 0.0
                         predictions.append({
                             'image_path': str(img_path),
                             'predicted_class': 'NO_GRAINS_DETECTED',
@@ -94,7 +270,50 @@ class InferenceWorker(QThread):
                             'mean_distance': 0.0,
                             'n_grains': 0,
                             'class_distribution': {},
+                            'image_width': image_w,
+                            'image_height': image_h,
+                            'image_area_px': image_area,
+                            'grain_area_sum_px': 0.0,
+                            'grain_coverage_pct': coverage_pct,
+                            'detect_ms': float(summary.get('detect_ms', 0.0)),
+                            'classify_ms': float(summary.get('classify_ms', 0.0)),
+                            'elapsed_ms': float(summary.get('elapsed_ms', 0.0)),
+                            'n_grains_raw': len(grains_raw),
+                            'n_grains_dropped': len(dropped),
                         })
+                        runtime_logger.info(
+                            f"[{idx}/{total}] image={img_path.name} grains_kept=0 grains_raw={len(grains_raw)} "
+                            f"dropped={len(dropped)} dominant=NO_GRAINS_DETECTED "
+                            f"coverage_pct=0.00 detect_ms={summary.get('detect_ms', 0.0):.1f} "
+                            f"classify_ms={summary.get('classify_ms', 0.0):.1f}"
+                        )
+
+                        if len(visual_samples) < max_visual_samples:
+                            try:
+                                annotated = classifier.draw_results(image_bgr, filtered_results)
+                                sample_name = f"sample_{idx:04d}_NO_GRAINS_{img_path.stem}.png"
+                                sample_path = samples_dir / sample_name
+                                cv2.imwrite(str(sample_path), annotated)
+                                visual_samples.append({
+                                    'image_name': img_path.name,
+                                    'image_path': str(img_path),
+                                    'annotated_path': str(sample_path),
+                                    'reason': 'NO_GRAINS',
+                                    'n_grains': 0,
+                                    'dominant_class': 'NO_GRAINS_DETECTED',
+                                    'confidence': 0.0,
+                                    'grain_coverage_pct': 0.0
+                                })
+                            except Exception as e_draw:
+                                logger.warning(f"Error guardando muestra NO_GRAINS {img_path.name}: {e_draw}")
+
+                        for d in dropped:
+                            dropped_grain_details.append({
+                                'image_name': img_path.name,
+                                'image_path': str(img_path),
+                                **d
+                            })
+
                         self.progress.emit(idx, total)
                         self.detailed_progress.emit({
                             'idx': idx, 'total': total,
@@ -106,15 +325,36 @@ class InferenceWorker(QThread):
                         continue
                     
                     # Agregar detalles por grano
+                    grain_area_sum = 0.0
                     for grain in grains:
+                        bx, by, bw, bh = grain['bbox']
+                        bbox_area = float(max(0, bw) * max(0, bh))
+                        contour = grain.get('contour')
+                        contour_area = bbox_area
+                        if contour is not None and len(contour) >= 3:
+                            contour_area = float(cv2.contourArea(contour.astype(np.int32)))
+                        area_ratio = float(contour_area / image_area) if image_area > 0 else 0.0
+                        grain_area_sum += contour_area
+
                         all_grain_details.append({
                             'image_path': str(img_path),
                             'image_name': img_path.name,
+                            'image_width': image_w,
+                            'image_height': image_h,
+                            'image_area_px': image_area,
                             'grain_index': grain['index'],
                             'predicted_class': grain['predicted_class'],
                             'confidence': grain['confidence'],
                             'mean_distance': grain['mean_distance'],
                             'bbox': grain['bbox'],
+                            'bbox_x': bx,
+                            'bbox_y': by,
+                            'bbox_w': bw,
+                            'bbox_h': bh,
+                            'bbox_area_px': bbox_area,
+                            'contour_area_px': contour_area,
+                            'area_ratio_vs_image': area_ratio,
+                            'saliency': float(grain.get('saliency', 0.0)),
                         })
                     
                     # Predicción por imagen: voto mayoritario de granos detectados
@@ -125,6 +365,7 @@ class InferenceWorker(QThread):
                     
                     # Distancia media de todos los granos
                     mean_dist = np.mean([g['mean_distance'] for g in grains])
+                    coverage_pct = float((grain_area_sum / image_area) * 100.0) if image_area > 0 else 0.0
                     
                     # Distribución de clases en la imagen
                     class_dist = {}
@@ -138,28 +379,70 @@ class InferenceWorker(QThread):
                         'mean_distance': float(mean_dist),
                         'n_grains': len(grains),
                         'class_distribution': class_dist,
+                        'image_width': image_w,
+                        'image_height': image_h,
+                        'image_area_px': image_area,
+                        'grain_area_sum_px': float(grain_area_sum),
+                        'grain_coverage_pct': coverage_pct,
+                        'detect_ms': float(summary.get('detect_ms', 0.0)),
+                        'classify_ms': float(summary.get('classify_ms', 0.0)),
+                        'elapsed_ms': float(summary.get('elapsed_ms', 0.0)),
                     })
                     
                     # Actualizar conteos acumulados
                     running_total_grains += len(grains)
                     for cls in grain_classes:
                         running_class_counts[cls] = running_class_counts.get(cls, 0) + 1
+
+                    runtime_logger.info(
+                        f"[{idx}/{total}] image={img_path.name} grains_kept={len(grains)} "
+                        f"grains_raw={len(grains_raw)} dropped={len(dropped)} "
+                        f"dominant={dominant_class} conf={dominant_conf:.3f} "
+                        f"coverage_pct={coverage_pct:.2f} detect_ms={summary.get('detect_ms', 0.0):.1f} "
+                        f"classify_ms={summary.get('classify_ms', 0.0):.1f}"
+                    )
                     
-                    # Guardar imagen anotada solo en milestones cada 5%
+                    # Guardar imagen anotada para trazabilidad completa (datasets pequeños/medianos)
+                    if save_all_annotated:
+                        try:
+                            annotated_full = classifier.draw_results(image_bgr, filtered_results)
+                            full_out_path = annotated_dir / f"annotated_{idx:04d}_{img_path.stem}.png"
+                            cv2.imwrite(str(full_out_path), annotated_full)
+                        except Exception as e_draw:
+                            logger.warning(f"Error guardando anotada completa en {img_path.name}: {e_draw}")
+
+                    # Guardar muestra anotada por hitos y casos críticos
                     pct = int((idx / total) * 100)
                     save_this = False
+                    reason = ""
                     for p in sample_pcts:
                         if p not in saved_samples and pct >= p:
                             saved_samples.add(p)
                             save_this = True
+                            reason = f"MILESTONE_{p}PCT"
+
+                    if dominant_conf < 0.45:
+                        save_this = True
+                        reason = "LOW_CONFIDENCE"
+                    if len(grains) >= 12:
+                        save_this = True
+                        reason = "HIGH_DENSITY"
                     
-                    if save_this:
+                    if save_this and len(visual_samples) < max_visual_samples:
                         try:
-                            image_bgr = cv2.imread(str(img_path))
-                            if image_bgr is not None:
-                                annotated = classifier.draw_results(image_bgr, results)
-                                out_path = output_dir / f"sample_{pct:03d}pct_{img_path.stem}.png"
-                                cv2.imwrite(str(out_path), annotated)
+                            annotated = classifier.draw_results(image_bgr, filtered_results)
+                            out_path = samples_dir / f"sample_{idx:04d}_{reason}_{img_path.stem}.png"
+                            cv2.imwrite(str(out_path), annotated)
+                            visual_samples.append({
+                                'image_name': img_path.name,
+                                'image_path': str(img_path),
+                                'annotated_path': str(out_path),
+                                'reason': reason,
+                                'n_grains': int(len(grains)),
+                                'dominant_class': dominant_class,
+                                'confidence': float(dominant_conf),
+                                'grain_coverage_pct': float(coverage_pct),
+                            })
                         except Exception as e_draw:
                             logger.warning(f"Error dibujando resultados en {img_path.name}: {e_draw}")
                     
@@ -192,7 +475,7 @@ class InferenceWorker(QThread):
                     })
             
             # Generar reporte
-            report_gen = InferenceReportGenerator(output_dir="reports")
+            report_gen = InferenceReportGenerator(output_dir=str(report_output_dir))
             
             model_info = {
                 'name': 'AnalogyNet + FullImageClassifier',
@@ -203,28 +486,116 @@ class InferenceWorker(QThread):
                 predictions=predictions,
                 folder_path=str(folder_path),
                 model_info=model_info,
-                class_names=classifier.class_names
+                class_names=classifier.class_names,
+                visual_samples=visual_samples
             )
             
-            # Guardar detalle por grano como CSV
+            # Guardar detalle por grano como CSV extendido
             if all_grain_details:
-                import csv
                 grain_csv = output_dir / "grain_details.csv"
                 with open(grain_csv, 'w', newline='', encoding='utf-8') as f:
                     writer = csv.DictWriter(f, fieldnames=[
-                        'image_name', 'grain_index', 'predicted_class',
-                        'confidence', 'mean_distance'
+                        'image_name', 'image_path', 'image_width', 'image_height', 'image_area_px',
+                        'grain_index', 'predicted_class', 'confidence', 'mean_distance',
+                        'saliency', 'bbox_x', 'bbox_y', 'bbox_w', 'bbox_h',
+                        'bbox_area_px', 'contour_area_px', 'area_ratio_vs_image'
                     ])
                     writer.writeheader()
                     for g in all_grain_details:
                         writer.writerow({
                             'image_name': g['image_name'],
+                            'image_path': g['image_path'],
+                            'image_width': g['image_width'],
+                            'image_height': g['image_height'],
+                            'image_area_px': f"{g['image_area_px']:.0f}",
                             'grain_index': g['grain_index'],
                             'predicted_class': g['predicted_class'],
                             'confidence': g['confidence'],
                             'mean_distance': f"{g['mean_distance']:.4f}",
+                            'saliency': f"{g['saliency']:.4f}",
+                            'bbox_x': g['bbox_x'],
+                            'bbox_y': g['bbox_y'],
+                            'bbox_w': g['bbox_w'],
+                            'bbox_h': g['bbox_h'],
+                            'bbox_area_px': f"{g['bbox_area_px']:.1f}",
+                            'contour_area_px': f"{g['contour_area_px']:.1f}",
+                            'area_ratio_vs_image': f"{g['area_ratio_vs_image']:.6f}",
                         })
                 logger.info(f"Detalle por grano guardado en {grain_csv}")
+
+            if dropped_grain_details:
+                dropped_csv = output_dir / "dropped_grains.csv"
+                with open(dropped_csv, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.DictWriter(f, fieldnames=[
+                        'image_name', 'image_path', 'grain_index', 'reason', 'bbox',
+                        'contour_area_px', 'area_ratio', 'saliency', 'confidence',
+                        'predicted_class'
+                    ])
+                    writer.writeheader()
+                    for row in dropped_grain_details:
+                        writer.writerow(row)
+                logger.info(f"Detalle de granos descartados guardado en {dropped_csv}")
+
+            # Guardar resumen por imagen con relación tamaño/detecciones
+            image_summary_csv = output_dir / "image_summary.csv"
+            with open(image_summary_csv, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=[
+                    'image_path', 'predicted_class', 'confidence', 'mean_distance',
+                    'n_grains', 'image_width', 'image_height', 'image_area_px',
+                    'grain_area_sum_px', 'grain_coverage_pct', 'detect_ms',
+                    'classify_ms', 'elapsed_ms'
+                ])
+                writer.writeheader()
+                for p in predictions:
+                    writer.writerow({
+                        'image_path': p.get('image_path', ''),
+                        'predicted_class': p.get('predicted_class', ''),
+                        'confidence': f"{float(p.get('confidence', 0.0)):.4f}",
+                        'mean_distance': f"{float(p.get('mean_distance', 0.0)):.4f}",
+                        'n_grains': int(p.get('n_grains', 0)),
+                        'image_width': int(p.get('image_width', 0)),
+                        'image_height': int(p.get('image_height', 0)),
+                        'image_area_px': f"{float(p.get('image_area_px', 0.0)):.0f}",
+                        'grain_area_sum_px': f"{float(p.get('grain_area_sum_px', 0.0)):.1f}",
+                        'grain_coverage_pct': f"{float(p.get('grain_coverage_pct', 0.0)):.4f}",
+                        'detect_ms': f"{float(p.get('detect_ms', 0.0)):.2f}",
+                        'classify_ms': f"{float(p.get('classify_ms', 0.0)):.2f}",
+                        'elapsed_ms': f"{float(p.get('elapsed_ms', 0.0)):.2f}",
+                    })
+            logger.info(f"Resumen por imagen guardado en {image_summary_csv}")
+
+            # Generar inspección rápida de casos dudosos
+            suspicious = sorted(
+                predictions,
+                key=lambda x: (
+                    0 if x.get('n_grains', 0) == 0 else 1,
+                    float(x.get('confidence', 0.0)),
+                    -float(x.get('mean_distance', 0.0))
+                )
+            )[:20]
+            quick_md = output_dir / "quick_inspection.md"
+            with open(quick_md, 'w', encoding='utf-8') as f:
+                f.write("# Quick Inspection\n\n")
+                f.write(f"- Total imagenes: {len(predictions)}\n")
+                f.write(f"- Total granos: {len(all_grain_details)}\n")
+                f.write(f"- Imagenes sin granos: {running_no_grains}\n\n")
+                f.write("## Top casos a revisar\n\n")
+                for i, item in enumerate(suspicious, 1):
+                    f.write(
+                        f"{i}. `{Path(item.get('image_path', '')).name}` | "
+                        f"clase={item.get('predicted_class', '')} | "
+                        f"conf={float(item.get('confidence', 0.0)):.3f} | "
+                        f"dist={float(item.get('mean_distance', 0.0)):.4f} | "
+                        f"granos={int(item.get('n_grains', 0))} | "
+                        f"coverage={float(item.get('grain_coverage_pct', 0.0)):.2f}%\n"
+                    )
+
+            runtime_logger.info(
+                f"[RUN] Fin inferencia total_imagenes={len(predictions)} "
+                f"total_granos={len(all_grain_details)} imagenes_sin_granos={running_no_grains} "
+                f"granos_descartados={len(dropped_grain_details)} "
+                f"report={report_path} quick_inspection={quick_md}"
+            )
             
             self.finished.emit({
                 'report_path': report_path,
@@ -232,11 +603,53 @@ class InferenceWorker(QThread):
                 'total_grains': len(all_grain_details),
                 'predictions': predictions,
                 'output_dir': str(output_dir),
+                'quick_inspection_path': str(quick_md),
             })
             
         except Exception as e:
             import traceback
             logger.error(f"Error en inferencia: {traceback.format_exc()}")
+            self.error.emit(str(e))
+
+
+class SingleImageInferenceWorker(QThread):
+    """Worker thread para inferencia slice-aware en una imagen (FullImageClassifier)."""
+
+    finished = pyqtSignal(object)
+    error = pyqtSignal(str)
+
+    def __init__(self, checkpoint: str, image_path: str, k: int):
+        super().__init__()
+        self.checkpoint = checkpoint
+        self.image_path = image_path
+        self.k = k
+
+    def run(self):
+        try:
+            from src.grain_detection.full_image_classifier import FullImageClassifier
+            from src.utils.config_utils import resolve_run_config_path
+
+            config_path = resolve_run_config_path(self.checkpoint, "config.yaml")
+            logger.info("Single-image: FullImageClassifier (slice-aware si hay artefactos)...")
+            classifier = FullImageClassifier.from_checkpoint(
+                checkpoint_path=self.checkpoint,
+                config_path=config_path,
+                k=self.k,
+            )
+            mode = (
+                "slice-aware"
+                if classifier.slice_classifier is not None
+                else f"kNN (k={self.k})"
+            )
+            results = classifier.classify_full_image(self.image_path)
+            self.finished.emit({
+                "classifier_mode": mode,
+                "results": results,
+                "image_path": self.image_path,
+            })
+        except Exception as e:
+            import traceback
+            logger.error("Error en inferencia single-image: %s", traceback.format_exc())
             self.error.emit(str(e))
 
 
@@ -250,6 +663,12 @@ class InferenceTab(QWidget):
         self.init_ui()
     
     def init_ui(self):
+        # Wrap tab content in a scroll area so all controls stay editable
+        # on smaller windows / high DPI setups.
+        root_layout = QVBoxLayout()
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content_widget = QWidget()
         layout = QVBoxLayout()
         
         # Modelo
@@ -264,6 +683,12 @@ class InferenceTab(QWidget):
         checkpoint_layout.addWidget(self.checkpoint_input)
         checkpoint_layout.addWidget(checkpoint_btn)
         model_layout.addRow("Checkpoint:", checkpoint_layout)
+        
+        self.artifact_status_label = QLabel("")
+        self.artifact_status_label.setWordWrap(True)
+        self.artifact_status_label.setStyleSheet("color: #666; font-size: 9pt; padding: 2px 0;")
+        model_layout.addRow("", self.artifact_status_label)
+        self.checkpoint_input.textChanged.connect(self._update_checkpoint_artifact_status)
         
         model_group.setLayout(model_layout)
         layout.addWidget(model_group)
@@ -340,6 +765,67 @@ class InferenceTab(QWidget):
         
         options_group.setLayout(options_layout)
         layout.addWidget(options_group)
+
+        # Filtro de ruido óptico (SOLO inferencia tab)
+        noise_group = QGroupBox("Filtro de Ruido Óptico Adaptativo")
+        noise_layout = QFormLayout()
+
+        self.enable_bg_correction = QCheckBox("Activar corrección de background")
+        self.enable_bg_correction.setChecked(False)
+        noise_layout.addRow("", self.enable_bg_correction)
+
+        self.bg_blur_kernel = QSpinBox()
+        self.bg_blur_kernel.setRange(15, 301)
+        self.bg_blur_kernel.setSingleStep(2)
+        self.bg_blur_kernel.setValue(61)
+        noise_layout.addRow("Kernel blur background:", self.bg_blur_kernel)
+
+        self.enable_postfilter = QCheckBox("Activar post-filtro adaptativo (dinámico por imagen)")
+        self.enable_postfilter.setChecked(True)
+        noise_layout.addRow("", self.enable_postfilter)
+
+        self.min_bbox_w = QSpinBox()
+        self.min_bbox_w.setRange(1, 500)
+        self.min_bbox_w.setValue(8)
+        noise_layout.addRow("Base Min bbox width (px):", self.min_bbox_w)
+
+        self.min_bbox_h = QSpinBox()
+        self.min_bbox_h.setRange(1, 500)
+        self.min_bbox_h.setValue(8)
+        noise_layout.addRow("Base Min bbox height (px):", self.min_bbox_h)
+
+        self.min_contour_area = QSpinBox()
+        self.min_contour_area.setRange(10, 200000)
+        self.min_contour_area.setValue(100)
+        noise_layout.addRow("Base Min contour area (px²):", self.min_contour_area)
+
+        self.min_area_ratio = QDoubleSpinBox()
+        self.min_area_ratio.setDecimals(5)
+        self.min_area_ratio.setRange(0.0, 0.1)
+        self.min_area_ratio.setSingleStep(0.0001)
+        self.min_area_ratio.setValue(0.00020)
+        noise_layout.addRow("Base Min area ratio:", self.min_area_ratio)
+
+        self.min_saliency = QDoubleSpinBox()
+        self.min_saliency.setDecimals(3)
+        self.min_saliency.setRange(0.0, 1.0)
+        self.min_saliency.setSingleStep(0.01)
+        self.min_saliency.setValue(0.20)
+        noise_layout.addRow("Base Min saliency:", self.min_saliency)
+
+        self.min_confidence = QDoubleSpinBox()
+        self.min_confidence.setDecimals(3)
+        self.min_confidence.setRange(0.0, 1.0)
+        self.min_confidence.setSingleStep(0.01)
+        self.min_confidence.setValue(0.30)
+        noise_layout.addRow("Base Min confidence:", self.min_confidence)
+
+        self.exclude_unknown = QCheckBox("Excluir UNKNOWN del conteo final")
+        self.exclude_unknown.setChecked(True)
+        noise_layout.addRow("", self.exclude_unknown)
+
+        noise_group.setLayout(noise_layout)
+        layout.addWidget(noise_group)
         
         # Botón Ejecutar
         self.infer_btn = QPushButton("🔍 Ejecutar Inferencia")
@@ -362,10 +848,13 @@ class InferenceTab(QWidget):
         results_layout.addWidget(self.results_text)
         
         results_group.setLayout(results_layout)
-        layout.addWidget(results_group)
+        # Darle el factor de stretch (1) al grupo de resultados para que ocupe todo el espacio libre
+        layout.addWidget(results_group, 1)
         
-        layout.addStretch()
-        self.setLayout(layout)
+        content_widget.setLayout(layout)
+        scroll.setWidget(content_widget)
+        root_layout.addWidget(scroll)
+        self.setLayout(root_layout)
     
     def toggle_inference_mode(self):
         """Alterna entre modo carpeta e imagen individual"""
@@ -379,6 +868,60 @@ class InferenceTab(QWidget):
         )
         if file_path:
             self.checkpoint_input.setText(file_path)
+    
+    def _update_checkpoint_artifact_status(self):
+        """Actualiza indicador de modo de inferencia según artefactos del run."""
+        checkpoint = self.checkpoint_input.text().strip()
+        if not checkpoint or not Path(checkpoint).exists():
+            self.artifact_status_label.setText("")
+            return
+
+        info = check_slice_inference_artifacts(checkpoint)
+        if info["has_slice_representatives"]:
+            self.artifact_status_label.setText(
+                "Modo inferencia: slice-aware (slice_representatives.pt)"
+            )
+            self.artifact_status_label.setStyleSheet(
+                "color: #4ec9b0; font-size: 9pt; padding: 2px 0; font-weight: bold;"
+            )
+        elif info["has_class_proxies"]:
+            self.artifact_status_label.setText(
+                "Modo inferencia: slice-aware (class_proxies.pt — run legacy)"
+            )
+            self.artifact_status_label.setStyleSheet(
+                "color: #4ec9b0; font-size: 9pt; padding: 2px 0; font-weight: bold;"
+            )
+        else:
+            self.artifact_status_label.setText(
+                "Modo inferencia: k-NN fallback — no se encontró slice_representatives.pt"
+            )
+            self.artifact_status_label.setStyleSheet(
+                "color: #ffa94d; font-size: 9pt; padding: 2px 0; font-weight: bold;"
+            )
+
+    def _confirm_inference_artifacts(self, checkpoint: str) -> bool:
+        """
+        Confirma inferencia cuando faltan artefactos slice-aware.
+        Returns True si el usuario acepta continuar (o si los artefactos existen).
+        """
+        info = check_slice_inference_artifacts(checkpoint)
+        if info["has_slice_representatives"] or info["has_class_proxies"]:
+            return True
+
+        run_dir = info["run_dir"]
+        reply = QMessageBox.warning(
+            self,
+            "Artefactos slice-aware no encontrados",
+            f"No se encontró slice_representatives.pt en:\n{run_dir}\n\n"
+            "La inferencia usará k-NN sobre embeddings 128D (geometría distinta al "
+            "entrenamiento con sliced_ms).\n\n"
+            "Recomendación: ejecute post-training o scripts/migrate_slice_artifacts.py "
+            "antes de inferir.\n\n"
+            "¿Desea continuar con fallback k-NN?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return reply == QMessageBox.Yes
     
     def browse_folder(self):
         dir_path = QFileDialog.getExistingDirectory(
@@ -411,12 +954,10 @@ class InferenceTab(QWidget):
             self.run_single_image_inference()
     
     def run_single_image_inference(self):
-        """Ejecuta inferencia en imagen individual"""
+        """Ejecuta inferencia slice-aware en imagen individual (FullImageClassifier)."""
         checkpoint = self.checkpoint_input.text()
         query = self.query_path.text()
-        database = self.database_path.text()
         
-        # Validación
         if not checkpoint or not Path(checkpoint).exists():
             QMessageBox.warning(self, "Error", "Checkpoint no válido")
             return
@@ -425,56 +966,74 @@ class InferenceTab(QWidget):
             QMessageBox.warning(self, "Error", "Imagen query no válida")
             return
         
-        # Base de datos es opcional (usa embeddings del checkpoint si no se proporciona)
-        if database and not Path(database).exists():
-            QMessageBox.warning(self, "Error", "Directorio de base de datos no válido")
+        if not self._confirm_inference_artifacts(checkpoint):
             return
         
         self.infer_btn.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)
         self.results_text.clear()
-        self.results_text.append("🔄 Procesando...")
+        self.results_text.append("Procesando imagen (detección + clasificación slice-aware)...")
         
         if self.parent_window:
-            self.parent_window.log_widget.append_log("Iniciando inferencia...", "INFO")
-        
-        # Ejecutar inferencia
-        try:
-            from scripts.inference import MicroscopyImageRetrieval
-            
-            # Base de datos opcional
-            database = database if database and Path(database).exists() else None
-            retrieval = MicroscopyImageRetrieval(
-                config_path="config.yaml",
-                checkpoint_path=checkpoint,
-                database_path=database
+            self.parent_window.log_widget.append_log(
+                "Iniciando inferencia single-image (FullImageClassifier)...", "INFO"
             )
-            
-            k = self.k_spin.value()
-            result = retrieval.classify_image(query, k=k)
-            
-            self.results_text.clear()
-            self.results_text.append("=" * 50)
-            self.results_text.append("📊 RESULTADO DE CLASIFICACIÓN")
-            self.results_text.append("=" * 50)
-            self.results_text.append(f"\n✅ Clase Predicha: {result['predicted_class']}")
-            self.results_text.append(f"📈 Confianza: {result['confidence']:.2%}")
-            self.results_text.append(f"📏 Distancia: {result['distance']:.4f}")
-            
-            if self.parent_window:
-                self.parent_window.log_widget.append_log(
-                    f"Clasificación: {result['predicted_class']} ({result['confidence']:.2%})",
-                    "SUCCESS"
-                )
         
-        except Exception as e:
-            self.results_text.clear()
-            self.results_text.append(f"❌ Error: {str(e)}")
-            if self.parent_window:
-                self.parent_window.log_widget.append_log(f"Error en inferencia: {e}", "ERROR")
-            QMessageBox.critical(self, "Error", f"Error durante inferencia:\n{str(e)}")
+        k = self.k_spin.value()
+        self.worker = SingleImageInferenceWorker(checkpoint, query, k)
+        self.worker.finished.connect(self._single_image_inference_finished)
+        self.worker.error.connect(self._single_image_inference_error)
+        self.worker.start()
+    
+    def _single_image_inference_finished(self, payload: Dict[str, Any]):
+        """Callback cuando termina inferencia de imagen individual."""
+        self.infer_btn.setEnabled(True)
+        self.progress_bar.setVisible(False)
         
-        finally:
-            self.infer_btn.setEnabled(True)
+        mode = payload["classifier_mode"]
+        results = payload["results"]
+        grains = results.get("grains", [])
+        summary = results.get("summary", {})
+        per_class = summary.get("per_class_counts", {})
+        
+        self.results_text.clear()
+        self.results_text.append("=" * 50)
+        self.results_text.append("RESULTADO DE CLASIFICACIÓN (IMAGEN INDIVIDUAL)")
+        self.results_text.append("=" * 50)
+        self.results_text.append(f"\nModo clasificación: {mode}")
+        self.results_text.append(f"Granos detectados: {summary.get('total_grains', len(grains))}")
+        self.results_text.append(f"Tiempo: {summary.get('elapsed_ms', 0):.0f} ms")
+        
+        if not grains:
+            self.results_text.append("\nNo se detectaron granos en la imagen.")
+        else:
+            self.results_text.append("\n--- Resumen por clase ---")
+            for cls_name, count in sorted(per_class.items(), key=lambda x: -x[1]):
+                self.results_text.append(f"  {cls_name}: {count}")
+            
+            self.results_text.append("\n--- Detalle por grano ---")
+            for i, grain in enumerate(grains, 1):
+                cls = grain.get("predicted_class", "?")
+                conf = grain.get("confidence", 0.0)
+                self.results_text.append(f"  Grano {i}: {cls} ({conf:.1%})")
+        
+        if self.parent_window:
+            top_class = max(per_class, key=per_class.get) if per_class else "N/A"
+            self.parent_window.log_widget.append_log(
+                f"Inferencia [{mode}]: {len(grains)} granos, principal={top_class}",
+                "SUCCESS",
+            )
+    
+    def _single_image_inference_error(self, error_msg: str):
+        """Callback de error en inferencia de imagen individual."""
+        self.infer_btn.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.results_text.clear()
+        self.results_text.append(f"Error: {error_msg}")
+        if self.parent_window:
+            self.parent_window.log_widget.append_log(f"Error en inferencia: {error_msg}", "ERROR")
+        QMessageBox.critical(self, "Error", f"Error durante inferencia:\n{error_msg}")
     
     def run_folder_inference(self):
         """Ejecuta inferencia en carpeta completa y genera reporte"""
@@ -496,6 +1055,9 @@ class InferenceTab(QWidget):
             QMessageBox.warning(self, "Error", "Directorio de base de datos no válido")
             return
         
+        if not self._confirm_inference_artifacts(checkpoint):
+            return
+        
         self.infer_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 100)
@@ -508,7 +1070,19 @@ class InferenceTab(QWidget):
         
         # Ejecutar en thread
         k = self.k_spin.value()
-        self.worker = InferenceWorker(checkpoint, folder, database, k)
+        noise_config = {
+            "enable_background_correction": self.enable_bg_correction.isChecked(),
+            "background_blur_kernel": self.bg_blur_kernel.value(),
+            "enable_postfilter": self.enable_postfilter.isChecked(),
+            "min_bbox_w": self.min_bbox_w.value(),
+            "min_bbox_h": self.min_bbox_h.value(),
+            "min_contour_area": self.min_contour_area.value(),
+            "min_area_ratio": self.min_area_ratio.value(),
+            "min_saliency": self.min_saliency.value(),
+            "min_confidence": self.min_confidence.value(),
+            "exclude_unknown": self.exclude_unknown.isChecked(),
+        }
+        self.worker = InferenceWorker(checkpoint, folder, database, k, noise_config)
         self.worker.finished.connect(self.folder_inference_finished)
         self.worker.error.connect(self.folder_inference_error)
         self.worker.progress.connect(self.update_progress)
@@ -554,6 +1128,7 @@ class InferenceTab(QWidget):
         total = result['total_images']
         total_grains = result.get('total_grains', 0)
         output_dir = result.get('output_dir', '')
+        quick_inspection = result.get('quick_inspection_path', '')
         
         self.results_text.clear()
         self.results_text.append("=" * 50)
@@ -583,6 +1158,8 @@ class InferenceTab(QWidget):
         self.results_text.append(f"\nReporte: {report_path}")
         if output_dir:
             self.results_text.append(f"Imagenes anotadas: {output_dir}")
+        if quick_inspection:
+            self.results_text.append(f"Inspeccion rapida: {quick_inspection}")
         
         if self.parent_window:
             self.parent_window.log_widget.append_log(

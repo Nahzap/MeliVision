@@ -87,6 +87,11 @@ class MicroscopyAugmentation:
         """
         if config is None:
             config = self._get_default_config()
+
+        if config.get("performance_mode"):
+            micro = config.setdefault("microscopy_specific", {})
+            micro.setdefault("optical_distortion", {})["enabled"] = False
+            config.setdefault("domain_augmentation", {})["enabled"] = False
         
         self.config = config
         self.transform = self._build_transform()
@@ -107,67 +112,83 @@ class MicroscopyAugmentation:
                 'gaussian_noise': {'enabled': True, 'var_limit': [10.0, 50.0], 'p': 0.5},
                 'blur': {'enabled': True, 'blur_limit': 3, 'p': 0.3},
                 'optical_distortion': {'enabled': True, 'distort_limit': 0.1, 'p': 0.3},
-                'clahe': {'enabled': True, 'clip_limit': 2.0, 'tile_grid_size': [8, 8], 'p': 0.5}
+                'clahe': {'enabled': True, 'clip_limit': 2.0, 'tile_grid_size': [8, 8], 'p': 0.1}
             },
+            'grayscale': {'enabled': True, 'p': 0.5},
             'normalize': {
                 'mean': [0.485, 0.456, 0.406],
                 'std': [0.229, 0.224, 0.225]
             }
         }
-    
+
+    def _scale_transforms(self, image_size: int, resize_size: int, random_crop: bool):
+        """Resize / crop block shared by train pipeline and preview."""
+        if resize_size > image_size:
+            return [
+                A.Resize(resize_size, resize_size),
+                A.RandomCrop(image_size, image_size),
+            ]
+        if random_crop:
+            return [
+                A.RandomResizedCrop(
+                    size=(image_size, image_size),
+                    scale=(0.3, 1.0),
+                    ratio=(0.8, 1.2),
+                    p=1.0,
+                )
+            ]
+        return [A.Resize(image_size, image_size)]
+
     def _build_transform(self):
         """Build Albumentations transform pipeline — optimized for DINOv2 fine-tuning."""
         transform_list = []
         image_size = self.config['image_size']
         resize_size = self.config.get('resize_size', image_size)
-        
-        # Scale augmentation: RandomResizedCrop gives multi-scale views of the grain
-        # (SOTA for fine-grained recognition — Touvron et al., DeiT III, ECCV 2022)
-        if resize_size > image_size:
-            transform_list.append(A.Resize(resize_size, resize_size))
-            transform_list.append(A.RandomCrop(image_size, image_size))
-        else:
-            transform_list.append(
-                A.RandomResizedCrop(
-                    size=(image_size, image_size),
-                    scale=(0.8, 1.0),
-                    ratio=(0.9, 1.1),
-                    p=0.5,
-                )
-            )
-            # Fallback resize when RandomResizedCrop doesn't fire (p=0.5)
-            transform_list.append(A.Resize(image_size, image_size))
-        
-        # Geometric transforms (appropriate for microscopy — grains have no canonical orientation)
+        random_crop = bool(self.config.get('random_crop', True))
+
+        transform_list.extend(
+            self._scale_transforms(image_size, resize_size, random_crop)
+        )
+
+        # Geometric transforms — read probabilities from config.yaml / GUI
+        h_flip_p = float(self.config.get('random_horizontal_flip', 0.5))
+        v_flip_p = float(self.config.get('random_vertical_flip', 0.5))
+        rot_limit = int(self.config.get('random_rotation', 180))
+        import cv2
         transform_list.extend([
-            A.HorizontalFlip(p=0.5),
-            A.VerticalFlip(p=0.5),
-            A.Rotate(limit=180, p=0.8, border_mode=0, fill=128),
-            A.Affine(
-                translate_percent={'x': (-0.08, 0.08), 'y': (-0.08, 0.08)},
-                scale=(0.9, 1.1),
-                rotate=0,
-                border_mode=0, fill=128,
-                p=0.4
-            )
-        ])
-        
-        # Color augmentations — ONE unified block (no redundancy)
-        cj = self.config['color_jitter']
-        transform_list.append(
-            A.ColorJitter(
-                brightness=cj['brightness'],
-                contrast=cj['contrast'],
-                saturation=cj['saturation'],
-                hue=cj['hue'],
+            A.HorizontalFlip(p=h_flip_p),
+            A.VerticalFlip(p=v_flip_p),
+            A.ShiftScaleRotate(
+                shift_limit=0.08,
+                scale_limit=0.1,
+                rotate_limit=rot_limit,
+                border_mode=cv2.BORDER_CONSTANT,
+                value=[128, 128, 128],
                 p=0.8
             )
-        )
+        ])
+
+        # Color augmentations — ONE unified block (no redundancy)
+        grayscale_cfg = self.config.get('grayscale', {})
+        is_grayscale = grayscale_cfg.get('enabled', False)
         
+        if not is_grayscale:
+            cj = self.config.get('color_jitter', {})
+            transform_list.append(
+                A.ColorJitter(
+                    brightness=cj.get('brightness', 0.3),
+                    contrast=cj.get('contrast', 0.3),
+                    saturation=cj.get('saturation', 0.2),
+                    hue=cj.get('hue', 0.1),
+                    p=0.8
+                )
+            )
+
+
         # Microscopy-specific augmentations (SOTA 2024)
-        micro = self.config['microscopy_specific']
-        
-        if micro['random_gamma']['enabled']:
+        micro = self.config.get('microscopy_specific', {})
+
+        if micro.get('random_gamma', {}).get('enabled', False):
             transform_list.append(
                 A.RandomGamma(
                     gamma_limit=tuple(micro['random_gamma']['gamma_limit']),
@@ -175,7 +196,7 @@ class MicroscopyAugmentation:
                 )
             )
         
-        if micro['gaussian_noise']['enabled']:
+        if micro.get('gaussian_noise', {}).get('enabled', False):
             transform_list.append(
                 A.GaussNoise(
                     std_range=tuple(v / 255.0 for v in micro['gaussian_noise']['var_limit']),
@@ -183,7 +204,7 @@ class MicroscopyAugmentation:
                 )
             )
         
-        if micro['blur']['enabled']:
+        if micro.get('blur', {}).get('enabled', False):
             transform_list.append(
                 A.Blur(
                     blur_limit=micro['blur']['blur_limit'],
@@ -191,7 +212,7 @@ class MicroscopyAugmentation:
                 )
             )
         
-        if micro['optical_distortion']['enabled']:
+        if micro.get('optical_distortion', {}).get('enabled', False):
             transform_list.append(
                 A.OpticalDistortion(
                     distort_limit=micro['optical_distortion']['distort_limit'],
@@ -199,7 +220,7 @@ class MicroscopyAugmentation:
                 )
             )
         
-        if micro['clahe']['enabled']:
+        if micro.get('clahe', {}).get('enabled', False):
             transform_list.append(
                 A.CLAHE(
                     clip_limit=micro['clahe']['clip_limit'],
@@ -216,47 +237,196 @@ class MicroscopyAugmentation:
             tone_scale = domain_aug.get('tone_curve_scale', 0.15)
             ds_min = domain_aug.get('downscale_min', 0.6)
             cd_holes = domain_aug.get('coarse_dropout_holes', 3)
-            transform_list.extend([
-                A.RGBShift(
-                    r_shift_limit=rgb_shift, g_shift_limit=rgb_shift,
-                    b_shift_limit=rgb_shift, p=0.3
-                ),
-                A.RandomToneCurve(scale=tone_scale, p=0.2),
-                A.Downscale(
-                    scale_range=(ds_min, 0.8), p=0.15
-                ),
-                A.CoarseDropout(
-                    num_holes_range=(1, cd_holes), hole_height_range=(8, 20),
-                    hole_width_range=(8, 20), fill=128, p=0.15
-                ),
-            ])
+            
+            # Avoid destructive resolution/color drops on grayscale/low-res
+            if not is_grayscale:
+                transform_list.extend([
+                    A.RGBShift(
+                        r_shift_limit=rgb_shift, g_shift_limit=rgb_shift,
+                        b_shift_limit=rgb_shift, p=0.3
+                    ),
+                    A.RandomToneCurve(scale=tone_scale, p=0.05),
+                ])
+                
+            # Only apply Downscale/Dropout if explicitly configured (default skip for B/W to preserve morphology)
+            if not is_grayscale or domain_aug.get('force_geometric_in_bw', False):
+                transform_list.extend([
+                    A.Downscale(
+                        scale_range=(ds_min, 0.8), p=0.5
+                    ),
+                    A.CoarseDropout(
+                        num_holes_range=(1, 5), 
+                        hole_height_range=(20, 80), 
+                        hole_width_range=(20, 80), 
+                        fill_value=128, p=0.7
+                    )
+                ])
+            
+        # RGB → grayscale: aplicado DESPUÉS de alteraciones de color para no re-colorear
+        gs = self.config.get('grayscale', {})
+        if gs.get('enabled', False):
+            transform_list.append(A.ToGray(p=float(gs.get('p', 0.5))))
         
         # Normalization and tensor conversion
+        norm_mean = self.config['normalize']['mean']
+        norm_std = self.config['normalize']['std']
+        
+        # Symmetrical normalization for Grayscale to prevent artificial purple/green colorization
+        if is_grayscale:
+            norm_mean = [0.5, 0.5, 0.5]
+            norm_std = [0.5, 0.5, 0.5]
+            
         transform_list.extend([
             A.Normalize(
-                mean=self.config['normalize']['mean'],
-                std=self.config['normalize']['std']
+                mean=norm_mean,
+                std=norm_std
             ),
             ToTensorV2()
         ])
         
-        return A.Compose(transform_list)
-    
-    def __call__(self, image):
+        return A.Compose(transform_list, additional_targets={"mask": "mask"})
+
+    def apply_with_mask(self, image, mask):
+        """Apply pipeline to image + mask (same geometry)."""
+        from src.data.grain_transform import to_mask_float_tensor, to_mask_uint8_numpy
+
+        if not isinstance(image, np.ndarray):
+            image = np.array(image)
+        out = self.transform(image=image, mask=to_mask_uint8_numpy(mask))
+        return out["image"], to_mask_float_tensor(out["mask"])
+
+    def __call__(self, image, mask=None):
         """
-        Apply augmentation to image.
-        
-        Args:
-            image: PIL Image or numpy array
-            
-        Returns:
-            torch.Tensor: Augmented image tensor
+        Apply augmentation to image (and optional mask for masked pooling).
         """
         if not isinstance(image, np.ndarray):
             image = np.array(image)
-        
+
+        if mask is not None:
+            return self.apply_with_mask(image, mask)
+
         augmented = self.transform(image=image)
-        return augmented['image']
+        return augmented["image"]
+
+
+def _preview_compose(transform_list, image):
+    """Apply Albumentations list to a numpy RGB image (no normalize)."""
+    if not isinstance(image, np.ndarray):
+        image = np.array(image)
+    pipeline = A.Compose(transform_list)
+    return pipeline(image=image)['image']
+
+
+def get_augmentation_preview_columns(config: dict):
+    """
+    Build (title, transform_list) for augmentation preview grid.
+    One column per enabled augmentation (p=1.0) plus full training pipeline.
+    """
+    if config is None:
+        config = {}
+    image_size = int(config.get('image_size', 224))
+    resize_size = int(config.get('resize_size', image_size))
+    random_crop = bool(config.get('random_crop', True))
+    columns = []
+
+    base = MicroscopyAugmentation(config)
+    columns.append(('Original', base._scale_transforms(image_size, resize_size, False)))
+
+    h_flip_p = float(config.get('random_horizontal_flip', 0.5))
+    if h_flip_p > 0:
+        columns.append((
+            f'H-Flip (p={h_flip_p:.2f})',
+            base._scale_transforms(image_size, resize_size, False)
+            + [A.HorizontalFlip(p=1.0)],
+        ))
+
+    v_flip_p = float(config.get('random_vertical_flip', 0.5))
+    if v_flip_p > 0:
+        columns.append((
+            f'V-Flip (p={v_flip_p:.2f})',
+            base._scale_transforms(image_size, resize_size, False)
+            + [A.VerticalFlip(p=1.0)],
+        ))
+
+    rot_limit = int(config.get('random_rotation', 180))
+    if rot_limit > 0:
+        import cv2
+        columns.append((
+            f'Rotate ±{rot_limit}°',
+            base._scale_transforms(image_size, resize_size, False)
+            + [A.ShiftScaleRotate(shift_limit=0, scale_limit=0, rotate_limit=rot_limit, p=1.0, border_mode=cv2.BORDER_CONSTANT, value=[128, 128, 128])],
+        ))
+
+    cj = config.get('color_jitter', {})
+    if any(cj.get(k, 0) > 0 for k in ('brightness', 'contrast', 'saturation', 'hue')):
+        columns.append((
+            'ColorJitter',
+            base._scale_transforms(image_size, resize_size, False)
+            + [
+                A.ColorJitter(
+                    brightness=cj.get('brightness', 0.3),
+                    contrast=cj.get('contrast', 0.3),
+                    saturation=cj.get('saturation', 0.2),
+                    hue=cj.get('hue', 0.1),
+                    p=1.0,
+                )
+            ],
+        ))
+
+    gs = config.get('grayscale', {})
+    if gs.get('enabled', False):
+        columns.append((
+            f'Gris B&N (p={float(gs.get("p", 0.5)):.2f})',
+            base._scale_transforms(image_size, resize_size, False)
+            + [A.ToGray(p=1.0)],
+        ))
+
+    micro = config.get('microscopy_specific', {})
+    micro_map = [
+        ('random_gamma', 'Gamma', lambda m: A.RandomGamma(
+            gamma_limit=tuple(m['gamma_limit']), p=1.0)),
+        ('gaussian_noise', 'GaussNoise', lambda m: A.GaussNoise(
+            std_range=tuple(v / 255.0 for v in m['var_limit']), p=1.0)),
+        ('blur', 'Blur', lambda m: A.Blur(blur_limit=m['blur_limit'], p=1.0)),
+        ('optical_distortion', 'Opt.Distort', lambda m: A.OpticalDistortion(
+            distort_limit=m['distort_limit'], p=1.0)),
+        ('clahe', 'CLAHE', lambda m: A.CLAHE(
+            clip_limit=m['clip_limit'],
+            tile_grid_size=tuple(m['tile_grid_size']),
+            p=1.0)),
+    ]
+    for key, label, builder in micro_map:
+        block = micro.get(key, {})
+        if block.get('enabled', False):
+            columns.append((
+                label,
+                base._scale_transforms(image_size, resize_size, False) + [builder(block)],
+            ))
+
+    domain = config.get('domain_augmentation', {})
+    if domain.get('enabled', True):
+        rgb_shift = domain.get('rgb_shift_limit', 20)
+        tone_scale = domain.get('tone_curve_scale', 0.15)
+        ds_min = domain.get('downscale_min', 0.6)
+        cd_holes = domain.get('coarse_dropout_holes', 3)
+        domain_steps = [
+            ('RGBShift', [A.RGBShift(
+                r_shift_limit=rgb_shift, g_shift_limit=rgb_shift,
+                b_shift_limit=rgb_shift, p=1.0)]),
+            ('ToneCurve', [A.RandomToneCurve(scale=tone_scale, p=1.0)]),
+            ('Downscale', [A.Downscale(scale_range=(ds_min, 0.8), p=1.0)]),
+            ('CoarseDropout', [A.CoarseDropout(
+                num_holes_range=(1, 5), hole_height_range=(20, 80),
+                hole_width_range=(20, 80), fill_value=128, p=1.0)]),
+        ]
+        for label, steps in domain_steps:
+            columns.append((
+                label,
+                base._scale_transforms(image_size, resize_size, False) + steps,
+            ))
+
+    columns.append(('Pipeline completo', None))
+    return columns
 
 
 def get_train_transforms(config=None, mode='full', backbone_name=None):
@@ -271,29 +441,32 @@ def get_train_transforms(config=None, mode='full', backbone_name=None):
     Returns:
         MicroscopyAugmentation or DeiT3Augmentation or transforms.Compose
     """
-    # Si se proporciona backbone_name, ajustar image_size dinámicamente
     if backbone_name is not None:
         if config is None:
             config = {}
-        resolved_size = get_input_size_for_backbone(backbone_name)
-        config['image_size'] = resolved_size
-        # Para resize_size, usar un poco más grande para crop (excepto DINOv2 que usa exacto)
-        if 'dinov2' in backbone_name:
-            config['resize_size'] = resolved_size
+        
+        # Respetar el image_size si viene explícito en el config (para no limitar el rendimiento)
+        if 'image_size' not in config or config.get('image_size') is None:
+            resolved_size = get_input_size_for_backbone(backbone_name)
+            config['image_size'] = resolved_size
+            logger.info(f"Train transforms using dynamic size for '{backbone_name}': {resolved_size}x{resolved_size}")
         else:
-            config['resize_size'] = int(resolved_size * 1.14)  # ~256 para 224
-        logger.info(f"Train transforms using dynamic size for '{backbone_name}': {resolved_size}×{resolved_size}")
+            resolved_size = config['image_size']
+            logger.info(f"Train transforms using user config size: {resolved_size}x{resolved_size}")
+
+        # Configurar resize_size si no viene dado
+        if 'resize_size' not in config:
+            # Para resize_size, usar un poco más grande para crop (excepto DINOv2 que usa exacto)
+            if 'dinov2' in backbone_name:
+                config['resize_size'] = resolved_size
+            else:
+                config['resize_size'] = int(resolved_size * 1.14)  # ~256 para 224
     
     if mode == 'deit3':
         return DeiT3Augmentation(config)
     
-    try:
-        # Try to use enhanced microscopy augmentation
-        return MicroscopyAugmentation(config)
-    except ImportError:
-        # Fallback to torchvision transforms if albumentations not available
-        print("Warning: albumentations not available, using basic torchvision transforms")
-        return _get_basic_train_transforms(config)
+    # Usar directamente MicroscopyAugmentation sin ramas ocultas ni fallbacks
+    return MicroscopyAugmentation(config)
 
 
 class ValidationTransform:
@@ -309,22 +482,57 @@ class ValidationTransform:
                 }
             }
         
-        self.transform = A.Compose([
-            A.Resize(config['image_size'], config['image_size']),
+        # Aplicar grayscale en val/inference determinista
+        grayscale_cfg = config.get("grayscale", {})
+        is_grayscale = grayscale_cfg.get("enabled", False)
+        grayscale_p = 1.0 if is_grayscale else 0.0
+        
+        transforms_list = [
+            A.Resize(config["image_size"], config["image_size"]),
+        ]
+        
+        if grayscale_p > 0:
+            transforms_list.append(A.ToGray(p=grayscale_p))
+            
+        norm_mean = config["normalize"]["mean"]
+        norm_std = config["normalize"]["std"]
+        
+        # Symmetrical normalization for Grayscale to prevent artificial purple/green colorization
+        if is_grayscale:
+            norm_mean = [0.5, 0.5, 0.5]
+            norm_std = [0.5, 0.5, 0.5]
+        
+        transforms_list.extend([
             A.Normalize(
-                mean=config['normalize']['mean'],
-                std=config['normalize']['std']
+                mean=norm_mean,
+                std=norm_std,
             ),
-            ToTensorV2()
+            ToTensorV2(),
         ])
-    
-    def __call__(self, image):
-        """Apply validation transform to image"""
+        
+        self.transform = A.Compose(
+            transforms_list,
+            additional_targets={"mask": "mask"},
+        )
+
+    def apply_with_mask(self, image, mask):
+        from src.data.grain_transform import to_mask_float_tensor, to_mask_uint8_numpy
+
         if not isinstance(image, np.ndarray):
             image = np.array(image)
-        
+        out = self.transform(image=image, mask=to_mask_uint8_numpy(mask))
+        return out["image"], to_mask_float_tensor(out["mask"])
+
+    def __call__(self, image, mask=None):
+        """Apply validation transform to image (optional mask)."""
+        if not isinstance(image, np.ndarray):
+            image = np.array(image)
+
+        if mask is not None:
+            return self.apply_with_mask(image, mask)
+
         augmented = self.transform(image=image)
-        return augmented['image']
+        return augmented["image"]
 
 
 def get_val_transforms(config=None, backbone_name=None):
@@ -347,153 +555,18 @@ def get_val_transforms(config=None, backbone_name=None):
             }
         }
     
-    # Si se proporciona backbone_name, ajustar image_size dinámicamente
+    # Si se proporciona backbone_name, ajustar image_size dinámicamente si no está definido
     if backbone_name is not None:
-        resolved_size = get_input_size_for_backbone(backbone_name)
-        config['image_size'] = resolved_size
-        logger.info(f"Val transforms using dynamic size for '{backbone_name}': {resolved_size}×{resolved_size}")
+        if 'image_size' not in config or config.get('image_size') is None:
+            resolved_size = get_input_size_for_backbone(backbone_name)
+            config['image_size'] = resolved_size
+            logger.info(f"Val transforms using dynamic size for '{backbone_name}': {resolved_size}x{resolved_size}")
+        else:
+            resolved_size = config['image_size']
+            logger.info(f"Val transforms using user config size: {resolved_size}x{resolved_size}")
     
-    try:
-        # Try Albumentations for consistency
-        return ValidationTransform(config)
-    except ImportError:
-        # Fallback to torchvision
-        return transforms.Compose([
-            transforms.Resize((config['image_size'], config['image_size'])),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=config['normalize']['mean'],
-                std=config['normalize']['std']
-            )
-        ])
+    return ValidationTransform(config)
 
-
-def get_test_time_augmentation(config=None, n_augmentations=5):
-    """
-    Get Test-Time Augmentation (TTA) transforms for ensemble predictions.
-    
-    Args:
-        config (dict, optional): Configuration dictionary
-        n_augmentations (int): Number of augmented versions per image
-        
-    Returns:
-        list: List of transform pipelines
-    """
-    if config is None:
-        config = {
-            'image_size': 224,
-            'normalize': {
-                'mean': [0.485, 0.456, 0.406],
-                'std': [0.229, 0.224, 0.225]
-            }
-        }
-    
-    tta_transforms = []
-    
-    # Original (no augmentation)
-    tta_transforms.append(get_val_transforms(config))
-    
-    # Horizontal flip
-    tta_transforms.append(
-        transforms.Compose([
-            transforms.Resize((config['image_size'], config['image_size'])),
-            transforms.RandomHorizontalFlip(p=1.0),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=config['normalize']['mean'],
-                std=config['normalize']['std']
-            )
-        ])
-    )
-    
-    # Vertical flip
-    tta_transforms.append(
-        transforms.Compose([
-            transforms.Resize((config['image_size'], config['image_size'])),
-            transforms.RandomVerticalFlip(p=1.0),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=config['normalize']['mean'],
-                std=config['normalize']['std']
-            )
-        ])
-    )
-    
-    # Rotation 90
-    tta_transforms.append(
-        transforms.Compose([
-            transforms.Resize((config['image_size'], config['image_size'])),
-            transforms.RandomRotation(degrees=(90, 90)),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=config['normalize']['mean'],
-                std=config['normalize']['std']
-            )
-        ])
-    )
-    
-    # Rotation 180
-    tta_transforms.append(
-        transforms.Compose([
-            transforms.Resize((config['image_size'], config['image_size'])),
-            transforms.RandomRotation(degrees=(180, 180)),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=config['normalize']['mean'],
-                std=config['normalize']['std']
-            )
-        ])
-    )
-    
-    return tta_transforms[:n_augmentations]
-
-
-class MultiScaleTransform:
-    """
-    Multi-scale transform for extracting features at different resolutions.
-    Useful for microscopy images with details at multiple scales.
-    """
-    
-    def __init__(self, scales=[224, 256, 288], normalize_config=None):
-        """
-        Initialize multi-scale transform.
-        
-        Args:
-            scales (list): List of image sizes
-            normalize_config (dict): Normalization parameters
-        """
-        self.scales = scales
-        if normalize_config is None:
-            normalize_config = {
-                'mean': [0.485, 0.456, 0.406],
-                'std': [0.229, 0.224, 0.225]
-            }
-        self.normalize_config = normalize_config
-        
-        self.transforms = []
-        for scale in scales:
-            self.transforms.append(
-                transforms.Compose([
-                    transforms.Resize((scale, scale)),
-                    transforms.ToTensor(),
-                    transforms.Normalize(
-                        mean=normalize_config['mean'],
-                        std=normalize_config['std']
-                    )
-                ])
-            )
-    
-    def __call__(self, image):
-        """
-        Apply multi-scale transforms.
-        
-        Args:
-            image: PIL Image
-            
-        Returns:
-            list: List of transformed images at different scales
-        """
-        return [transform(image) for transform in self.transforms]
 
 
 class DeiT3Augmentation:
@@ -523,28 +596,44 @@ class DeiT3Augmentation:
         mean = norm.get('mean', [0.485, 0.456, 0.406])
         std = norm.get('std', [0.229, 0.224, 0.225])
         
-        self.transform = A.Compose([
-            A.RandomResizedCrop(
-                size=(image_size, image_size),
-                scale=(0.3, 1.0),
-                ratio=(0.75, 1.333),
-            ),
-            A.HorizontalFlip(p=0.5),
-            A.VerticalFlip(p=0.5),
-            A.OneOf([
-                A.ToGray(p=1.0),
-                A.Solarize(threshold_range=(0.5, 0.5), p=1.0),
-                A.GaussianBlur(blur_limit=(3, 7), p=1.0),
-            ], p=0.3),
-            A.Normalize(mean=mean, std=std),
-            ToTensorV2(),
-        ])
-    
-    def __call__(self, image):
+        self.transform = A.Compose(
+            [
+                A.RandomResizedCrop(
+                    size=(image_size, image_size),
+                    scale=(0.3, 1.0),
+                    ratio=(0.75, 1.333),
+                ),
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.5),
+                A.OneOf(
+                    [
+                        A.ToGray(p=1.0),
+                        A.Solarize(threshold_range=(128, 128), p=1.0),
+                        A.GaussianBlur(blur_limit=(3, 7), p=1.0),
+                    ],
+                    p=0.3,
+                ),
+                A.Normalize(mean=mean, std=std),
+                ToTensorV2(),
+            ],
+            additional_targets={"mask": "mask"},
+        )
+
+    def apply_with_mask(self, image, mask):
+        from src.data.grain_transform import to_mask_float_tensor, to_mask_uint8_numpy
+
         if not isinstance(image, np.ndarray):
             image = np.array(image)
+        out = self.transform(image=image, mask=to_mask_uint8_numpy(mask))
+        return out["image"], to_mask_float_tensor(out["mask"])
+
+    def __call__(self, image, mask=None):
+        if not isinstance(image, np.ndarray):
+            image = np.array(image)
+        if mask is not None:
+            return self.apply_with_mask(image, mask)
         augmented = self.transform(image=image)
-        return augmented['image']
+        return augmented["image"]
 
 
 class ReinhardStainNormalization:

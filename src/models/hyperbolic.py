@@ -32,21 +32,35 @@ class PoincareBallProjection(nn.Module):
         self.max_norm = 1.0 / (curvature ** 0.5) - eps
     
     def expmap0(self, u):
+        """Exponential map from origin to Poincare ball.
+        u: (B, D) point in tangent space at origin.
         """
-        Exponential map from the tangent space at the origin to the Poincaré ball.
+        dtype = u.dtype
+        u = u.float()
+        # Zero-center to prevent angular collapse from ReLU layers
+        u = u - u.mean(dim=0, keepdim=True)
         
-        exp_0(u) = tanh(sqrt(c) * ||u||) * u / (sqrt(c) * ||u||)
-        """
         sqrt_c = self.curvature ** 0.5
-        u_norm = u.norm(dim=-1, keepdim=True).clamp(min=self.eps)
-        return torch.tanh(sqrt_c * u_norm) * u / (sqrt_c * u_norm)
+        u_norm_sq = (u ** 2).sum(dim=-1, keepdim=True)
+        u_norm = (u_norm_sq + self.eps).sqrt()
+        
+        # Clip norm to prevent tanh saturation (tanh(x) -> 1.0 for x > 10)
+        # and vanishing gradients for the magnitude
+        max_u_norm = 15.0 / sqrt_c
+        u_norm_clipped = u_norm.clamp(max=max_u_norm)
+        
+        res = torch.tanh(sqrt_c * u_norm_clipped) * u / u_norm
+        return res.to(dtype)
     
     def project(self, x):
         """Project point back into the Poincaré ball if it escaped."""
+        dtype = x.dtype
+        x = x.float()
         norm = x.norm(dim=-1, keepdim=True)
         cond = norm > self.max_norm
-        projected = x / norm * self.max_norm
-        return torch.where(cond, projected, x)
+        projected = x / norm.clamp(min=self.eps) * self.max_norm
+        res = torch.where(cond, projected, x)
+        return res.to(dtype)
     
     def forward(self, x):
         """
@@ -78,17 +92,26 @@ def poincare_distance(x, y, curvature=1.0, eps=1e-5):
     c = curvature
     sqrt_c = c ** 0.5
     
+    # Compute in float32 to prevent AMP overflow (float16 max is 65504)
+    orig_dtype = x.dtype
+    x = x.float()
+    y = y.float()
+    
+    # Direct computation of squared distance avoids catastrophic cancellation
+    # (x.unsqueeze(1) - y.unsqueeze(0)) is (B, N, D)
+    diff_sq = (x.unsqueeze(1) - y.unsqueeze(0)).pow(2).sum(dim=-1) # (B, N)
+    
     x_norm_sq = (x * x).sum(dim=-1, keepdim=True).clamp(max=1.0/c - eps)  # (B, 1)
     y_norm_sq = (y * y).sum(dim=-1, keepdim=True).clamp(max=1.0/c - eps)  # (N, 1)
-    
-    # ||x - y||^2 via expansion
-    diff_sq = torch.cdist(x, y, p=2).pow(2)  # (B, N)
     
     denom = (1 - c * x_norm_sq) * (1 - c * y_norm_sq.t())  # (B, N)
     denom = denom.clamp(min=eps)
     
+    # Prevent exploding noise near boundary
     arg = 1 + 2 * c * diff_sq / denom
-    arg = arg.clamp(min=1.0 + eps)
+    
+    # Relax clamp slightly to allow gradients for very close points
+    arg = arg.clamp(min=1.0 + 1e-6)
     
     dist = (1.0 / sqrt_c) * torch.acosh(arg)
-    return dist
+    return dist.to(orig_dtype)

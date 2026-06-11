@@ -16,13 +16,13 @@ def print_banner():
     """Muestra banner de la aplicación"""
     print("\n" + "="*70)
     print("  MetricLearning - Sistema de Clasificación de Imágenes")
-    print("  Metric Learning con ResNet y k-NN")
+    print("  Metric Learning — Sliced MS + clasificacion slice-aware")
     print("="*70 + "\n")
 
 
 def train_model(args):
     """Ejecuta entrenamiento del modelo"""
-    from scripts.train import main as train_main
+    from scripts.train import run_training
     
     logger = setup_logger("training")
     logger.info("Iniciando entrenamiento del modelo...")
@@ -30,10 +30,11 @@ def train_model(args):
     train_args = argparse.Namespace(
         config=args.config,
         resume=args.resume,
-        checkpoint=args.checkpoint
+        checkpoint=args.checkpoint,
+        gpu=None
     )
     
-    return train_main(train_args)
+    return run_training(train_args)
 
 
 def run_inference(args):
@@ -71,19 +72,21 @@ def run_inference(args):
 
 
 def evaluate_model(args):
-    """Evalúa el modelo"""
-    from scripts.evaluate_model import main as eval_main
-    
+    """Evalúa el modelo — ejecuta el mismo pipeline post-entrenamiento que train.py"""
+    from scripts.post_training import run_evaluation_from_checkpoint
+
     logger = setup_logger("evaluation")
-    logger.info("Iniciando evaluación del modelo...")
-    
-    eval_args = argparse.Namespace(
-        checkpoint=args.checkpoint,
-        config=args.config,
-        output_dir=args.output_dir
+    if getattr(args, "skip_test", False):
+        logger.info("Iniciando evaluacion post-entrenamiento (val only, test omitido)...")
+    else:
+        logger.info("Iniciando evaluacion post-entrenamiento (regeneracion completa val + test)...")
+
+    return run_evaluation_from_checkpoint(
+        checkpoint_path=args.checkpoint,
+        config_path=args.config,
+        output_dir=args.output_dir,
+        skip_test=getattr(args, "skip_test", False),
     )
-    
-    return eval_main(eval_args)
 
 
 def batch_evaluation(args):
@@ -226,6 +229,8 @@ Ejemplos de uso:
                             help='Ruta al checkpoint del modelo')
     eval_parser.add_argument('--output-dir', type=str, default='results',
                             help='Directorio de salida para resultados')
+    eval_parser.add_argument('--skip-test', action='store_true',
+                            help='Omitir test (solo val); por defecto se ejecuta val + test')
     
     # === BATCH ===
     batch_parser = subparsers.add_parser('batch', help='Evaluación en batch')

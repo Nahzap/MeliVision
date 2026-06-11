@@ -22,6 +22,7 @@ from .visualization_utils import (
     add_text_with_background,
     create_color_palette
 )
+from .save_utils import save_plot_with_data
 
 
 def visualize_input_batch(dataloader: torch.utils.data.DataLoader,
@@ -101,7 +102,10 @@ def visualize_input_batch(dataloader: torch.utils.data.DataLoader,
     # Save
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path, dpi=200, bbox_inches='tight')
+    
+    # Not tabular data, just creating a simple manifest
+    df_batch = pd.DataFrame({'image_index': range(num_images)})
+    save_plot_with_data(output_path, df_batch, dpi=200, bbox_inches='tight')
     plt.close()
     
     print(f"✅ Input batch visualization saved to: {output_path}")
@@ -113,14 +117,12 @@ def compute_class_centroids(model: torch.nn.Module,
                            device: torch.device,
                            num_classes: int) -> torch.Tensor:
     """
-    Compute class centroids (mean embeddings per class).
-    
-    Args:
-        model: Trained model
-        dataloader: DataLoader with labeled data
-        device: Device to run on
-        num_classes: Number of classes
-    
+    Compute class centroids (mean 128D embeddings per class).
+
+    Para centroides **por slice** (inferencia slice-aware), usar
+    ``src.inference.slice_classifier.compute_slice_centroids_from_embeddings``.
+    El camino canónico post-entrenamiento es ``scripts/post_training.compute_and_save_centroids``.
+
     Returns:
         Tensor of shape (num_classes, embedding_dim) with centroids
     """
@@ -254,7 +256,15 @@ def plot_embeddings_tsne(model: torch.nn.Module,
     # Save
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    
+    df_tsne = pd.DataFrame({
+        'tsne_dim1': embeddings_2d[:, 0],
+        'tsne_dim2': embeddings_2d[:, 1],
+        'label_id': labels_array,
+        'label_name': [class_names[l] for l in labels_array],
+        'density': z
+    })
+    save_plot_with_data(output_path, df_tsne, dpi=150, bbox_inches='tight')
     plt.close()
     
     print(f"✅ t-SNE visualization saved to: {output_path}")
@@ -438,7 +448,14 @@ def visualize_inference_batch(model: torch.nn.Module,
     # Save
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path, dpi=200, bbox_inches='tight')
+    
+    df_inference = pd.DataFrame({
+        'image_idx': range(len(images)),
+        'pred_class': predicted_classes.cpu().numpy(),
+        'true_class': true_labels.cpu().numpy(),
+        'distance': min_distances.cpu().numpy()
+    })
+    save_plot_with_data(output_path, df_inference, dpi=200, bbox_inches='tight')
     plt.close()
     
     print(f"✅ YOLO-style visualization saved to: {output_path}")

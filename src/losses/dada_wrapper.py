@@ -41,7 +41,10 @@ class DADAWrapper(nn.Module):
     def _gaussian_kernel(self, x, y):
         """Compute Gaussian kernel matrix between x and y."""
         # (B, 1, D) - (1, M, D) -> (B, M, D) -> (B, M)
-        dist_sq = torch.cdist(x, y, p=2).pow(2)
+        x_norm = (x ** 2).sum(-1).view(-1, 1)
+        y_norm = (y ** 2).sum(-1).view(1, -1)
+        dist_sq = x_norm + y_norm - 2.0 * torch.mm(x, y.t())
+        dist_sq = dist_sq.clamp(min=0.0)
         return torch.exp(-dist_sq / (2 * self.kernel_bandwidth ** 2))
     
     def _compute_mmd(self, x, y):

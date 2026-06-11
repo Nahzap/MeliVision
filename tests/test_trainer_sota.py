@@ -247,5 +247,37 @@ def test_invalid_loss_type():
         MetricLearningTrainer(model, loader, loader, config)
 
 
+def test_arcface_hard_mining_per_sample_loss():
+    """ArcFace per-sample loss via library compute_loss (W is Parameter)."""
+    from src.training.trainer_enhanced import MetricLearningTrainer
+
+    config = _make_trainer_config(loss_type='arcface', num_classes=3)
+    config['hard_mining'] = {
+        'enabled': True,
+        'ratio': 0.3,
+        'min_samples': 2,
+        'warmup_epochs': 0,
+        'adaptive': False,
+    }
+    model = AnalogyNet(backbone='resnet18', embedding_dim=128, pretrained=False)
+    loader = _make_dummy_loader(batch_size=6)
+
+    trainer = MetricLearningTrainer(model, loader, loader, config)
+    assert trainer.hard_miner is not None, "OHEM should be enabled for ArcFace when configured"
+
+    embeddings = torch.randn(6, 128)
+    labels = torch.tensor([0, 0, 1, 1, 2, 2])
+    loss_per_sample = trainer._compute_loss_per_sample(embeddings, labels)
+
+    assert loss_per_sample.shape == (6,)
+    assert torch.isfinite(loss_per_sample).all()
+
+    arcface_groups = [g for g in trainer.optimizer.param_groups if g.get('name') == 'arcface_weights']
+    assert len(arcface_groups) == 1, "ArcFace W must be in optimizer"
+
+    loss = trainer._compute_training_loss(embeddings, labels, images=torch.randn(6, 3, 224, 224))
+    assert loss.dim() == 0 and torch.isfinite(loss)
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

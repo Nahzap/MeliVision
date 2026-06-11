@@ -39,6 +39,19 @@ def load_config(config_path: str = 'config.yaml') -> Dict:
     return config
 
 
+def resolve_run_config_path(checkpoint_path: str, fallback: str = "config.yaml") -> str:
+    """Prefer run-specific config/config.yaml next to a checkpoint."""
+    ckpt = Path(checkpoint_path).resolve()
+    run_dir = ckpt.parent.parent
+    for candidate in (run_dir / "config" / "config.yaml", run_dir / "config.yaml"):
+        if candidate.exists():
+            return str(candidate)
+    fallback_path = Path(fallback)
+    if fallback_path.exists():
+        return str(fallback_path)
+    return fallback
+
+
 def get_transforms_from_config(config: Dict, mode: str = 'val'):
     """
     Obtiene transforms desde configuración.

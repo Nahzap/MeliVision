@@ -29,6 +29,9 @@ tensorboard>=2.13.0
 wandb>=0.15.0
 tqdm>=4.65.0
 
+# System / auto-tuning
+psutil>=5.9.0
+
 # Configuration
 pyyaml>=6.0
 omegaconf>=2.3.0

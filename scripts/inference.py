@@ -31,7 +31,13 @@ logger = logging.getLogger(__name__)
 
 
 class MicroscopyImageRetrieval:
-    """Image retrieval system for microscopy images"""
+    """
+    Image retrieval system for microscopy images (legacy MielDataset path).
+
+    .. deprecated::
+        Para clasificación alineada con entrenamiento ``sliced_ms``, use
+        :class:`src.grain_detection.full_image_classifier.FullImageClassifier`.
+    """
     
     def __init__(self, config_path, checkpoint_path, database_path=None):
         """
@@ -224,14 +230,26 @@ class MicroscopyImageRetrieval:
     def classify_image(self, image_path, k=5):
         """
         Classify image using k-NN on embeddings.
-        
+
+        .. deprecated::
+            Usa geometría 128D global (k-NN euclidiano). Para pipeline
+            slice-aware coherente con ``sliced_ms``, use
+            ``FullImageClassifier.from_checkpoint()`` + ``classify_full_image()``.
+
         Args:
             image_path: Path to image to classify
             k: Number of neighbors to consider
-            
+
         Returns:
             dict: Classification results
         """
+        import warnings
+        warnings.warn(
+            "MicroscopyImageRetrieval.classify_image usa k-NN legacy (128D). "
+            "Use FullImageClassifier para clasificación slice-aware.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         logger.info(f"Classifying image: {image_path}")
         
         # Find k similar images

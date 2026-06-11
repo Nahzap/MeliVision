@@ -31,6 +31,7 @@ Fecha: 2026-03-06
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import cm
+import pandas as pd
 from sklearn.decomposition import PCA
 from itertools import combinations
 from pathlib import Path
@@ -181,8 +182,18 @@ class EmbeddingSpaceAnalyzer:
             'class_b': class_b
         }
         
-        # Visualización
+        # Visualización y exportación CSV
         output_path = Path(output_dir) / f"spectral_analysis_{class_a}_{class_b}.png"
+        csv_path = Path(output_dir) / f"spectral_analysis_{class_a}_{class_b}.csv"
+        
+        df = pd.DataFrame({
+            'component': range(1, len(eigenvalues) + 1),
+            'eigenvalue': eigenvalues,
+            'explained_variance': explained_var,
+            'cumulative_variance': cumulative_var
+        })
+        df.to_csv(csv_path, index=False)
+        
         self._plot_spectrum(results, output_path)
         
         # Log resultado
@@ -390,8 +401,18 @@ class EmbeddingSpaceAnalyzer:
             'class_b': 'CLASSES'
         }
         
-        # Plot
+        # Plot y exportación CSV
         output_path = Path(output_dir) / "spectral_analysis_GLOBAL.png"
+        csv_path = Path(output_dir) / "spectral_analysis_GLOBAL.csv"
+        
+        df = pd.DataFrame({
+            'component': range(1, len(eigenvalues) + 1),
+            'eigenvalue': eigenvalues,
+            'explained_variance': explained_var,
+            'cumulative_variance': cumulative_var
+        })
+        df.to_csv(csv_path, index=False)
+        
         self._plot_spectrum(results, output_path)
         
         status = "! COLLAPSED" if is_collapsed else "OK HEALTHY"

@@ -134,17 +134,18 @@ class SalientObjectDetector:
 
         logger.info(f"[SalientObjectDetector] Modelo {self.model_type} cargado exitosamente")
 
-    def _preprocess(self, image: np.ndarray) -> Tuple[torch.Tensor, Tuple[int, int]]:
+    def _preprocess(self, image: np.ndarray) -> Tuple[torch.Tensor, Tuple[int, int], Tuple[int, int]]:
         """
-        Preprocesa imagen para el modelo.
+        Preprocesa imagen para el modelo manteniendo aspect ratio mediante padding.
 
         Args:
             image: Imagen BGR o grayscale (numpy array)
 
         Returns:
-            (tensor, original_size) donde original_size = (H, W)
+            (tensor, original_size, pad_info)
         """
         original_size = image.shape[:2]
+        h, w = original_size
 
         if len(image.shape) == 2:
             image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
@@ -153,37 +154,54 @@ class SalientObjectDetector:
         else:
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        image = cv2.resize(image, (self.input_size, self.input_size))
+        longest = max(h, w)
+        pad_top = (longest - h) // 2
+        pad_bottom = longest - h - pad_top
+        pad_left = (longest - w) // 2
+        pad_right = longest - w - pad_left
+        pad_info = (pad_top, pad_left)
 
-        image = image.astype(np.float32) / 255.0
-        image = (image - np.array([0.485, 0.456, 0.406])) / np.array(
+        image_padded = cv2.copyMakeBorder(
+            image, pad_top, pad_bottom, pad_left, pad_right,
+            cv2.BORDER_CONSTANT, value=[0, 0, 0]
+        )
+
+        image_resized = cv2.resize(image_padded, (self.input_size, self.input_size))
+
+        image_resized = image_resized.astype(np.float32) / 255.0
+        image_resized = (image_resized - np.array([0.485, 0.456, 0.406])) / np.array(
             [0.229, 0.224, 0.225]
         )
 
-        tensor = torch.from_numpy(image.transpose(2, 0, 1)).float().unsqueeze(0)
+        tensor = torch.from_numpy(image_resized.transpose(2, 0, 1)).float().unsqueeze(0)
 
-        return tensor.to(self.device), original_size
+        return tensor.to(self.device), original_size, pad_info
 
     def _postprocess(
-        self, output: torch.Tensor, original_size: Tuple[int, int]
+        self, output: torch.Tensor, original_size: Tuple[int, int], pad_info: Tuple[int, int]
     ) -> np.ndarray:
         """
-        Postprocesa la salida del modelo.
+        Postprocesa la salida del modelo, recortando el padding para restaurar tamaño.
 
         Args:
             output: Tensor de salida del modelo
             original_size: (H, W) tamaño original
+            pad_info: (pad_top, pad_left) usado en preprocess
 
         Returns:
             Máscara de probabilidad [0-1] en tamaño original
         """
         mask = output[0].squeeze().cpu().numpy()
-
         mask = (mask - mask.min()) / (mask.max() - mask.min() + 1e-8)
 
-        mask = cv2.resize(mask, (original_size[1], original_size[0]))
+        h, w = original_size
+        longest = max(h, w)
+        pad_top, pad_left = pad_info
 
-        return mask
+        mask_padded = cv2.resize(mask, (longest, longest))
+        mask_cropped = mask_padded[pad_top : pad_top + h, pad_left : pad_left + w]
+
+        return mask_cropped
 
     @torch.no_grad()
     def get_saliency_map(self, image: np.ndarray) -> np.ndarray:
@@ -199,9 +217,9 @@ class SalientObjectDetector:
         if self.model is None:
             raise RuntimeError("Modelo no cargado")
 
-        tensor, original_size = self._preprocess(image)
+        tensor, original_size, pad_info = self._preprocess(image)
         outputs = self.model(tensor)
-        mask = self._postprocess(outputs, original_size)
+        mask = self._postprocess(outputs, original_size, pad_info)
 
         return mask.astype(np.float32)
 

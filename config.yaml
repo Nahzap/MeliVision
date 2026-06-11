@@ -1,6 +1,6 @@
 experiment:
   name: dinov2_vits14_baseline
-  description: DINOv2 ViT-S/14 baseline with ArcFace
+  description: DINOv2 ViT-S/14
 model:
   backbone_name: dinov2_vits14
   embedding_dim: 128
@@ -12,30 +12,46 @@ model:
     - 256
     - 256
     use_batch_norm: true
-    dropout: 0.1
+    dropout: 0.15
+    normalize_embeddings_ln: true
+    use_hardtanh: false
+    hardtanh_min: -2.0
+    hardtanh_max: 2.0
 data:
   train_dir: data/processed/train
   val_dir: data/processed/val
   test_dir: data/processed/test
   annotation_root: data/annotations
-  classes_per_batch: 7
-  samples_per_class: 14
-  batch_size: 98
-  num_workers: 8
+  classes_per_batch: 8
+  samples_per_class: 2
+  batch_size: 16
+  val_batch_size: 2
+  auto_tune_resources: true
+  num_workers: 10
+  prefetch_factor: 4
+  val_num_workers: 2
+  worker_ram_budget_mb: 20570
   pin_memory: true
+  loader_policy:
+    exclusive_train_workers_during_val: false
+    persistent_workers: true
   drop_last: true
-  image_size: 252
-  resize_size: 252
+  image_size: 504
+  resize_size: 504
 augmentation:
+  performance_mode: true
   random_horizontal_flip: 0.5
   random_vertical_flip: 0.5
   random_rotation: 180
-  random_crop: true
+  random_crop: false
   color_jitter:
-    brightness: 0.3
-    contrast: 0.42
-    saturation: 0.2
-    hue: 0.2
+    brightness: 0.8
+    contrast: 0.8
+    saturation: 0.1
+    hue: 0.15
+  grayscale:
+    enabled: false
+    p: 1.0
   microscopy_specific:
     random_gamma:
       enabled: true
@@ -54,7 +70,7 @@ augmentation:
       blur_limit: 3
       p: 0.3
     optical_distortion:
-      enabled: true
+      enabled: false
       distort_limit: 0.1
       p: 0.3
     clahe:
@@ -69,7 +85,7 @@ augmentation:
     brightness_contrast_limit: 0.4
     rgb_shift_limit: 25
     tone_curve_scale: 0.2
-    downscale_min: 0.5
+    downscale_min: 0.2
     coarse_dropout_holes: 4
   normalize:
     mean:
@@ -81,42 +97,67 @@ augmentation:
     - 0.224
     - 0.225
 training:
-  epochs: 20
+  epochs: 10
   warmup_epochs: 3
+  gradient_accumulation_steps: 4
   loss:
-    type: arcface
+    type: sliced_ms
     params:
-      alpha: 2.0
+      num_slices: 4
+      alpha: 1.0
       beta: 50.0
-      base: 0.5
+      base_margin: 0.5
+      margin: 28.6
+      scale: 64.0
+      proxy_scale: 30.0
+      proxy_margin: 0.2
   validation_metric: recall_at_1
   mining:
-    enabled: true
+    enabled: false
     type: semihard
     margin: 0.2
   hard_mining:
-    enabled: true
-    ratio: 0.3
+    enabled: false
+    ratio: 0.5
     min_samples: 32
-    warmup_epochs: 0
+    warmup_epochs: 3
     adaptive: false
   optimizer: adamw
-  learning_rate: 5.0e-05
-  weight_decay: 0.00025
-  backbone_lr_factor: 0.5
+  learning_rate: 0.0001
+  weight_decay: 0.01
+  backbone_lr_factor: 0.1
   scheduler: cosine
   scheduler_params:
-    T_max: 50
+    T_max: 10
     eta_min: 1.0e-06
   gradient_clip_norm: 5.0
   early_stopping:
     enabled: true
-    patience: 10
+    patience: 20
     min_delta: 0.001
     restore_best_weights: true
-  save_every_n_epochs: 11
+  save_every_n_epochs: 9
   save_best_only: true
 sota:
+  uniformity:
+    enabled: false
+    lambda: 1.0
+    t: 2.0
+  decorrelation:
+    enabled: false
+    lambda: 10.0
+    target_variance: 1.0
+    var_weight: 0.0
+    cov_weight: 1.0
+  disentanglement:
+    enabled: false
+    lambda: 5.0
+    weight: 1.0
+  amplitude_penalty:
+    enabled: false
+    lambda_weight: 0.1
+    penalty_type: clamping
+    margin: 0.5
   nir:
     enabled: false
     lambda: 0.5
@@ -149,28 +190,16 @@ grain_detection:
   morph_kernel_size: 3
   min_circularity: 0.3
   crop_padding: 0.2
-  crop_size: 224
+  crop_size: 504
   use_mask: true
   masked_pooling: true
+  image_cache_size: 32
+  image_cache_max_mb: 512
+  max_cached_image_mb: 32
+  max_load_side: 512
   distance_threshold: 0.7
-  dataset_mode: grain
-inference:
-  index_type: flat
-  metric_type: inner_product
-  k_neighbors: 5
-  use_gpu: true
-  batch_queries: true
-  ivf_nlist: 1024
-  ivf_nprobe: 32
-  pq_m: 16
-  pq_nbits: 8
-  use_tta: false
-  tta_augmentations: 5
-  use_gradcam: false
-  similarity_threshold: 0.6
-  confidence_threshold: 0.7
-  inference_batch_size: 64
-  device: cuda
+  train_mask_bg_mode: gray
+  val_mask_bg_mode: gray
 logging:
   tensorboard:
     enabled: true
@@ -195,16 +224,22 @@ hardware:
   world_size: 1
   faiss_gpu: true
 evaluation:
+  progressive_plot_every_epochs: 2
   compute_precision_at_k:
   - 1
   - 5
   - 10
-  compute_map: true
-  compute_nmi: true
   visualize_embeddings: true
   embedding_visualization_method: tsne
-  eval_every_n_epochs: 1
 reproducibility:
   seed: 42
   deterministic: false
   benchmark: true
+inference:
+  index_type: flat
+  metric_type: inner_product
+  k_neighbors: 5
+  use_gpu: false
+  similarity_threshold: 0.6
+  confidence_threshold: 0.8
+  device: cuda

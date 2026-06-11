@@ -39,6 +39,28 @@ def load_model(config, checkpoint_path, device):
     return load_model_from_checkpoint(checkpoint_path, config, device, eval_mode=True)
 
 
+def get_distances(X, Y, config=None):
+    """Dynamically get distances based on config metric space."""
+    from src.inference.knn_classifier import euclidean_distances, cosine_distances, poincare_distances_np
+    if config is None:
+        return euclidean_distances(X, Y)
+    
+    metric_type = 'euclidean'
+    space = config.get('sota', {}).get('embedding_space', 'euclidean')
+    if space == 'hyperbolic':
+        metric_type = 'hyperbolic'
+    else:
+        loss_type = config.get('training', {}).get('loss', {}).get('type', 'arcface')
+        if loss_type in ['arcface', 'sg_softmax', 'proxy_anchor']:
+            metric_type = 'cosine'
+            
+    if metric_type == 'hyperbolic':
+        return poincare_distances_np(X, Y)
+    elif metric_type == 'cosine':
+        return cosine_distances(X, Y)
+    return euclidean_distances(X, Y)
+
+
 def compute_metrics(embeddings, labels, class_names=None, k_values=[1, 5, 10]):
     """Compute ALL SOTA metrics for Deep Metric Learning"""
     logger.info("Computing SOTA metrics...")
@@ -87,13 +109,12 @@ def plot_tsne(embeddings, labels, class_names, save_path):
     plt.close()
 
 
-def plot_confusion_matrix(embeddings, labels, class_names, save_path):
+def plot_confusion_matrix(embeddings, labels, class_names, save_path, config=None):
     """Plot confusion matrix based on nearest neighbor classification"""
     logger.info("Generating confusion matrix...")
     
-    # Compute pairwise distances
-    from sklearn.metrics.pairwise import euclidean_distances
-    distances = euclidean_distances(embeddings, embeddings)
+    # Compute pairwise distances dynamically
+    distances = get_distances(embeddings, embeddings, config)
     
     # For each sample, find nearest neighbor (excluding itself)
     np.fill_diagonal(distances, np.inf)
@@ -133,12 +154,11 @@ def plot_confusion_matrix(embeddings, labels, class_names, save_path):
         logger.info(f"  {class_name}: {acc:.4f}")
 
 
-def plot_distance_distribution(embeddings, labels, class_names, save_path):
+def plot_distance_distribution(embeddings, labels, class_names, save_path, config=None):
     """Plot distribution of intra-class vs inter-class distances"""
     logger.info("Analyzing distance distributions...")
     
-    from sklearn.metrics.pairwise import euclidean_distances
-    distances = euclidean_distances(embeddings, embeddings)
+    distances = get_distances(embeddings, embeddings, config)
     
     intra_class_distances = []
     inter_class_distances = []
@@ -174,7 +194,7 @@ def plot_distance_distribution(embeddings, labels, class_names, save_path):
     logger.info(f"Distance ratio (inter/intra): {np.mean(inter_class_distances) / np.mean(intra_class_distances):.4f}")
 
 
-def test_retrieval(model, dataset, device, n_queries=5, k=5):
+def test_retrieval(model, dataset, device, n_queries=5, k=5, config=None):
     """Test image retrieval with sample queries"""
     logger.info(f"Testing retrieval with {n_queries} query images...")
     
@@ -191,9 +211,8 @@ def test_retrieval(model, dataset, device, n_queries=5, k=5):
         query_embedding = embeddings[query_idx:query_idx+1]
         query_label = labels[query_idx]
         
-        # Compute distances to all images
-        from sklearn.metrics.pairwise import euclidean_distances
-        distances = euclidean_distances(query_embedding, embeddings)[0]
+        # Compute distances dynamically
+        distances = get_distances(query_embedding, embeddings, config)[0]
         
         # Get top-k nearest neighbors (excluding query itself)
         nearest_indices = np.argsort(distances)[1:k+1]
@@ -296,11 +315,11 @@ def main():
     # Generate visualizations
     logger.info("Generating visualizations...")
     plot_tsne(embeddings, labels, class_names, output_dir / 'tsne_visualization.png')
-    plot_confusion_matrix(embeddings, labels, class_names, output_dir / 'confusion_matrix.png')
-    plot_distance_distribution(embeddings, labels, class_names, output_dir / 'distance_distribution.png')
+    plot_confusion_matrix(embeddings, labels, class_names, output_dir / 'confusion_matrix.png', config=config)
+    plot_distance_distribution(embeddings, labels, class_names, output_dir / 'distance_distribution.png', config=config)
     
     # Test retrieval
-    retrieval_results = test_retrieval(model, test_dataset, device, n_queries=10, k=5)
+    retrieval_results = test_retrieval(model, test_dataset, device, n_queries=10, k=5, config=config)
     
     # Prepare metadata for academic report
     dataset_info = {
@@ -315,7 +334,7 @@ def main():
     model_info = {
         'backbone': get_backbone_name(config),
         'embedding_dim': config['model']['embedding_dim'],
-        'loss': config['training']['loss_function'],
+        'loss': config['training'].get('loss', {}).get('type', 'arcface'),
         'projection': config['model'].get('projection_head', 'MLP')
     }
     

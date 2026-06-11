@@ -1,1 +1,1 @@
-epoch,train_loss,val_loss,recall_at_1,recall_at_5,recall_at_10,mAP@R,NMI,F1_macro,learning_rate,is_best,best_recall_at_1,epoch_time_sec
+epoch,train_loss,val_loss,recall_at_1,recall_at_5,recall_at_10,mAP@R,NMI,F1_macro,accuracy,balanced_accuracy,precision_macro,precision_weighted,F1_weighted,learning_rate,is_best,best_recall_at_1,epoch_time_sec

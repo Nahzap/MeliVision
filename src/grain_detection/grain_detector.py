@@ -222,68 +222,6 @@ class PollenGrainDetector:
 
         return grains
 
-    def extract_crop(
-        self,
-        image: np.ndarray,
-        grain: DetectedGrain,
-        padding: Optional[float] = None,
-        size: Optional[int] = None,
-    ) -> np.ndarray:
-        """
-        Extrae un crop cuadrado centrado en el grano con padding proporcional.
-
-        Args:
-            image: Imagen original BGR
-            grain: DetectedGrain con bbox
-            padding: Override de padding (default: self.crop_padding)
-            size: Override de tamaño final (default: self.crop_size)
-
-        Returns:
-            Crop RGB redimensionado a (size, size, 3)
-        """
-        pad = padding if padding is not None else self.crop_padding
-        sz = size if size is not None else self.crop_size
-        h_img, w_img = image.shape[:2]
-        x, y, w, h = grain.bbox
-
-        # Padding proporcional
-        pad_x = int(w * pad)
-        pad_y = int(h * pad)
-
-        # Hacer cuadrado: tomar el lado mayor
-        side = max(w + 2 * pad_x, h + 2 * pad_y)
-
-        # Centrar en el centroide
-        cx, cy = grain.centroid
-        x1 = cx - side // 2
-        y1 = cy - side // 2
-        x2 = x1 + side
-        y2 = y1 + side
-
-        # Clamp a bordes de imagen
-        x1 = max(0, x1)
-        y1 = max(0, y1)
-        x2 = min(w_img, x2)
-        y2 = min(h_img, y2)
-
-        crop = image[y1:y2, x1:x2]
-
-        if crop.size == 0:
-            crop = np.zeros((sz, sz, 3), dtype=np.uint8)
-        else:
-            crop = cv2.resize(crop, (sz, sz), interpolation=cv2.INTER_LINEAR)
-
-        # BGR → RGB
-        if len(crop.shape) == 3 and crop.shape[2] == 3:
-            crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-
-        return crop
-
-    def extract_all_crops(
-        self, image: np.ndarray, grains: List[DetectedGrain]
-    ) -> List[np.ndarray]:
-        """Extrae crops de todos los granos detectados."""
-        return [self.extract_crop(image, g) for g in grains]
 
     def set_parameters(self, **kwargs):
         """Actualiza parámetros de detección."""

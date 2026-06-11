@@ -25,6 +25,25 @@ def euclidean_distances(X, Y):
     distances = np.sqrt(np.maximum(XX - 2 * np.dot(X, Y.T) + YY, 0))
     return distances
 
+def cosine_distances(X, Y):
+    X_norm = X / np.maximum(np.linalg.norm(X, axis=1, keepdims=True), 1e-8)
+    Y_norm = Y / np.maximum(np.linalg.norm(Y, axis=1, keepdims=True), 1e-8)
+    return 1 - np.dot(X_norm, Y_norm.T)
+
+def poincare_distances_np(X, Y, curvature=1.0):
+    c = curvature
+    eps = 1e-5
+    X_norm_sq = np.clip(np.sum(X**2, axis=1, keepdims=True), 0, 1/c - eps)
+    Y_norm_sq = np.clip(np.sum(Y**2, axis=1, keepdims=True), 0, 1/c - eps)
+    
+    X_n = np.sum(X**2, axis=1, keepdims=True)
+    Y_n = np.sum(Y**2, axis=1, keepdims=True)
+    diff_sq = np.maximum(X_n + Y_n.T - 2 * np.dot(X, Y.T), 0)
+    
+    denom = np.maximum((1 - c * X_norm_sq) * (1 - c * Y_norm_sq.T), eps)
+    arg = np.maximum(1 + 2 * c * diff_sq / denom, 1 + eps)
+    return (1 / np.sqrt(c)) * np.arccosh(arg)
+
 logger = logging.getLogger(__name__)
 
 
@@ -37,6 +56,7 @@ class KNNClassifier:
         reference_labels: Labels de referencia (N,)
         class_names: Lista de nombres de clases
         k: Número de vecinos
+        metric_type: 'euclidean', 'cosine', or 'hyperbolic'
     
     Example:
         >>> classifier = KNNClassifier(ref_embeddings, ref_labels, class_names, k=5)
@@ -52,6 +72,7 @@ class KNNClassifier:
         class_names: List[str],
         k: int = 5,
         distance_threshold: float = 0.0,
+        metric_type: str = 'euclidean',
     ):
         """
         Inicializa clasificador k-NN.
@@ -63,19 +84,29 @@ class KNNClassifier:
             k: Número de vecinos
             distance_threshold: Si > 0, rechaza predicciones con mean_distance > threshold
                                (marca como UNKNOWN). 0 = sin rechazo.
+            metric_type: Metric to use for nearest neighbors.
         """
         self.reference_embeddings = reference_embeddings
         self.reference_labels = reference_labels
         self.class_names = class_names
         self.k = k
         self.distance_threshold = distance_threshold
+        self.metric_type = metric_type
         
         self.idx_to_class = {i: name for i, name in enumerate(class_names)}
         self.class_to_idx = {name: i for i, name in enumerate(class_names)}
         
         logger.info(f"KNN Classifier initialized with k={k}, {len(reference_embeddings)} references, "
-                    f"dist_threshold={distance_threshold}")
+                    f"dist_threshold={distance_threshold}, metric_type={metric_type}")
     
+    def _compute_distances(self, X, Y):
+        if self.metric_type == 'cosine':
+            return cosine_distances(X, Y)
+        elif self.metric_type == 'hyperbolic':
+            return poincare_distances_np(X, Y)
+        else:
+            return euclidean_distances(X, Y)
+
     def predict(
         self,
         query_embedding: np.ndarray,
@@ -96,7 +127,7 @@ class KNNClassifier:
         if query_embedding.ndim == 1:
             query_embedding = query_embedding.reshape(1, -1)
         
-        distances = euclidean_distances(query_embedding, self.reference_embeddings)[0]
+        distances = self._compute_distances(query_embedding, self.reference_embeddings)[0]
         
         k_nearest_indices = np.argsort(distances)[:self.k]
         k_nearest_labels = self.reference_labels[k_nearest_indices]
@@ -172,7 +203,7 @@ class KNNClassifier:
         if query_embedding.ndim == 1:
             query_embedding = query_embedding.reshape(1, -1)
         
-        distances = euclidean_distances(query_embedding, self.reference_embeddings)[0]
+        distances = self._compute_distances(query_embedding, self.reference_embeddings)[0]
         k_nearest_indices = np.argsort(distances)[:self.k]
         k_nearest_labels = self.reference_labels[k_nearest_indices]
         
@@ -208,7 +239,7 @@ class KNNClassifier:
         if query_embedding.ndim == 1:
             query_embedding = query_embedding.reshape(1, -1)
         
-        distances = euclidean_distances(query_embedding, self.reference_embeddings)[0]
+        distances = self._compute_distances(query_embedding, self.reference_embeddings)[0]
         
         top_k_indices = np.argsort(distances)[:k]
         top_k_labels = self.reference_labels[top_k_indices]

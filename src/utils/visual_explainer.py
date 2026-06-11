@@ -131,11 +131,11 @@ class CNNExplainer(BaseVisualExplainer):
 
     # ── heatmap ───────────────────────────────────────────────────────
     def generate_heatmap(self, image_tensor, centroid=None):
-        from pytorch_grad_cam import GradCAM
+        from pytorch_grad_cam import HiResCAM  # HiResCAM prevents negative*negative=positive inversion with LayerNorm
         from src.utils.inference_utils import EmbeddingSimilarityTarget
 
         targets = [EmbeddingSimilarityTarget(centroid)] if centroid is not None else None
-        cam = GradCAM(
+        cam = HiResCAM(
             model=self._model,
             target_layers=[self.target_layer],
             reshape_transform=self._reshape_transform,
@@ -184,11 +184,11 @@ class ConvNeXtExplainer(BaseVisualExplainer):
         return tensor
 
     def generate_heatmap(self, image_tensor, centroid=None):
-        from pytorch_grad_cam import GradCAM
+        from pytorch_grad_cam import HiResCAM
         from src.utils.inference_utils import EmbeddingSimilarityTarget
 
         targets = [EmbeddingSimilarityTarget(centroid)] if centroid is not None else None
-        cam = GradCAM(
+        cam = HiResCAM(
             model=self._model,
             target_layers=[self.target_layer],
             reshape_transform=self._reshape_transform,
@@ -201,7 +201,7 @@ class ConvNeXtExplainer(BaseVisualExplainer):
             # If reshape_transform wasn't needed, retry without it
             if "Invalid grads shape" in str(e):
                 logger.warning("[XAI-ConvNeXt] Retrying without reshape_transform")
-                cam2 = GradCAM(model=self._model, target_layers=[self.target_layer])
+                cam2 = HiResCAM(model=self._model, target_layers=[self.target_layer])
                 grayscale = cam2(input_tensor=image_tensor.to(self.device), targets=targets)
                 return grayscale[0]
             raise
@@ -323,25 +323,23 @@ class TransformerExplainer(BaseVisualExplainer):
         image_tensor = image_tensor.to(self.device)
         self._model.eval()
         self._detach_all()
-        self._cache.clear()
-
-        last_block = self._raw_vit.blocks[-1]
-        num_heads = last_block.attn.num_heads
-        self._attach_hook(last_block.attn.qkv, self._qkv_hook)
-
-        # ── forward + optional backward ──────────────────────────────
+        
         image_tensor = image_tensor.detach().requires_grad_(False)
+        
         try:
             with torch.enable_grad():
                 features = self._forward_bypass(image_tensor)
-
+                
                 # Rebuild the embedding to compute metric-learning gradient
                 if features.dim() == 3:
                     patch_features = features[:, self.patch_start:]
+                    patch_features.retain_grad()
                     pooled = patch_features.mean(dim=1)
                 else:
                     pooled = features
-
+                    pooled.retain_grad()
+                    patch_features = pooled
+                
                 if hasattr(self._model, "attention") and self._model.attention is not None:
                     pooled = self._model.attention(pooled)
 
@@ -355,52 +353,29 @@ class TransformerExplainer(BaseVisualExplainer):
                     c = centroid.to(self.device).detach()
                     sim = F.cosine_similarity(emb, c.unsqueeze(0), dim=1).sum()
                     sim.backward()
+                    
         finally:
             self._detach_all()
 
-        # ── compute attention map ────────────────────────────────────
-        qkv = self._cache["qkv"].detach()
-        qkv_grad = (
-            self._cache["qkv_ref"].grad
-            if self._cache.get("qkv_ref") is not None
-            else None
-        )
-
-        B, N, C = qkv.shape
-        head_dim = C // (3 * num_heads)
-
-        qkv_r = qkv.reshape(B, N, 3, num_heads, head_dim).permute(2, 0, 3, 1, 4)
-        q, k, _ = qkv_r.unbind(0)
-
-        scale = head_dim ** -0.5
-        attn = (q @ k.transpose(-2, -1)) * scale
-        attn = attn.softmax(dim=-1)          # (B, heads, N, N)
-
-        # CLS (idx 0) → patch tokens only
-        cls_attn = attn[0, :, 0, self.patch_start:]  # (heads, P)
-
-        logger.info(
-            f"[XAI-ViT] N_tokens={N}, patch_start={self.patch_start}, "
-            f"n_patches={cls_attn.shape[-1]}, grad_available={qkv_grad is not None}, "
-            f"backbone={type(self._raw_vit).__name__}"
-        )
-
-        # ── gradient weighting ───────────────────────────────────────
-        if qkv_grad is not None:
-            g = qkv_grad.abs().mean(dim=(0, 1))                       # (3*dim,)
-            hi = g.reshape(3, num_heads, head_dim).mean(dim=(0, 2))    # (heads,)
-            hi = hi / (hi.sum() + 1e-8)
-            weighted = (cls_attn * hi.unsqueeze(-1)).sum(dim=0)        # (P,)
+        # ── compute heatmap from feature gradients ───────────────────
+        # Bypasses the Attention Sink completely by using the actual gradients 
+        # evaluated at the patch features output
+        if features.dim() == 3:
+            grads = patch_features.grad  # [B, P, C]
+            
+            # Fix inversion: Element-wise multiplication (HiResCAM math) instead of spatial pooling.
+            # This prevents negative background features from multiplying with negative global gradients.
+            cam = (patch_features * grads).sum(dim=2)  # [B, P]
+            cam = F.relu(cam).squeeze(0)  # [P]
+            
+            P = cam.shape[0]
+            h_p = w_p = int(P ** 0.5)
+            spatial = cam.reshape(1, 1, h_p, w_p).float()
         else:
-            weighted = cls_attn.mean(dim=0)
+            # Fallback for non-ViT (should not happen in TransformerExplainer)
+            spatial = torch.zeros((1, 1, 1, 1))
 
-        # ── spatial reshape + bilinear upsample ──────────────────────
-        P = weighted.shape[0]
-        h_p = w_p = int(P ** 0.5)
-
-        spatial = weighted.reshape(1, 1, h_p, w_p).float()
         H_img, W_img = image_tensor.shape[2], image_tensor.shape[3]
-
         upsampled = F.interpolate(
             spatial, size=(H_img, W_img), mode="bilinear", align_corners=False
         ).squeeze()
@@ -492,12 +467,8 @@ def create_explainer(model: nn.Module, device: torch.device) -> BaseVisualExplai
 
     # ── ViT family ────────────────────────────────────────────────────
     if _is_vit_backbone(model):
-        # DINOv2 uses register tokens → pure Self-Attention is clean
-        if _is_dinov2(model):
-            logger.info("[XAI-Factory] DINOv2 detected -> TransformerExplainer (QKV attention)")
-            return TransformerExplainer(model, device)
-
-        # DeiT / plain ViT -> Activation GradCAM to suppress attention sinks
+        # Todos los ViTs (incluyendo DINOv2 modificado con máscaras espaciales diferenciables)
+        # se rutean hacia Activation Grad-CAM para asegurar que los gradientes fluyan por todo el grafo
         raw_vit = getattr(model, "backbone", model)
         if hasattr(raw_vit, "model"):
             raw_vit = raw_vit.model
@@ -506,8 +477,8 @@ def create_explainer(model: nn.Module, device: torch.device) -> BaseVisualExplai
         reshape_fn = _make_vit_reshape_transform(raw_vit)
 
         logger.info(
-            "[XAI-Factory] ViT/DeiT detected -> CNNExplainer + reshape_transform "
-            "(target=blocks[-1].norm1, suppressing attention sinks)"
+            "[XAI-Factory] ViT/DINOv2/DeiT detected -> CNNExplainer + reshape_transform "
+            "(target=blocks[-1].norm1, propagates gradients through FFT and spatial pooling)"
         )
         return CNNExplainer(model, device, target_layer=target_layer,
                             reshape_transform=reshape_fn)

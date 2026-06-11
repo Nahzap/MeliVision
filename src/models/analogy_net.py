@@ -7,6 +7,34 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def batched_1d_kmeans(x, k=3, max_iter=10):
+    """
+    1D K-means for a batch of tensors to approximate Multi-level Otsu thresholds.
+    x shape: (B, N)
+    """
+    B, N = x.shape
+    # Initialize centroids using quantiles
+    quantiles = torch.linspace(0.1, 0.9, k, device=x.device)
+    centroids = torch.quantile(x, quantiles, dim=1).t()  # (B, k)
+    
+    for _ in range(max_iter):
+        dists = torch.abs(x.unsqueeze(-1) - centroids.unsqueeze(1))  # (B, N, k)
+        assignments = torch.argmin(dists, dim=-1)
+        
+        new_centroids = torch.zeros_like(centroids)
+        for c in range(k):
+            mask = (assignments == c).float()
+            sums = (x * mask).sum(dim=1)
+            counts = mask.sum(dim=1).clamp(min=1e-8)
+            new_centroids[:, c] = sums / counts
+            
+        centroids = new_centroids
+        
+    centroids, _ = torch.sort(centroids, dim=-1)
+    thresholds = (centroids[:, :-1] + centroids[:, 1:]) / 2.0
+    return thresholds  # (B, k-1)
+
+
 class ChannelAttention(nn.Module):
     """Channel Attention Module (parte de CBAM). Ref: [R5] Zolfaghari & Sajedi 2024."""
     
@@ -24,10 +52,10 @@ class ChannelAttention(nn.Module):
         return x * out
 
 
-class CBAM1D(nn.Module):
+class SE1D(nn.Module):
     """
     Channel-Based Attention Module for 1D feature vectors.
-    Simplified CBAM for embeddings (no spatial dimension).
+    Simplified Squeeze-and-Excitation (SE) for embeddings (no spatial dimension).
     Ref: [R5] Zolfaghari & Sajedi 2024.
     """
     
@@ -41,17 +69,14 @@ class CBAM1D(nn.Module):
 
 class DINOv2Backbone(nn.Module):
     """
-    Wrapper for DINOv2 that uses mean pooling of patch tokens
-    instead of the default CLS token. This ensures gradients flow
-    through spatial tokens for meaningful Grad-CAM heatmaps.
+    Wrapper for DINOv2 that uses multi-spectral pooling of patch tokens
+    (mean, max, and std) instead of the default CLS token. This ensures 
+    gradients flow through spatial tokens for meaningful Grad-CAM heatmaps
+    and preserves spectral richness.
     
-    Supports masked mean pooling: when a spatial mask is provided,
+    Supports masked multi-spectral pooling: when a spatial mask is provided,
     only patch tokens inside the grain (mask > 0) contribute to the
-    embedding. Background patches are excluded, forcing the model to
-    learn grain-internal features (exine texture, apertures, colpi).
-    
-    Preserves 'blocks' and 'patch_embed' attributes for automatic
-    Grad-CAM target layer detection.
+    embedding. Background patches are excluded.
     """
     
     def __init__(self, dino_model):
@@ -63,92 +88,96 @@ class DINOv2Backbone(nn.Module):
         self.norm = dino_model.norm
         self.patch_size = dino_model.patch_embed.patch_size[0]  # typically 14
         self._logged_first_forward = False
+        
+        # Override num_features since we concatenate mean, max, and std
+        self.num_features = getattr(dino_model, 'embed_dim', 384) * 3
     
     def forward(self, x, mask=None):
         """
         Args:
             x: (B, 3, H, W) input images
             mask: (B, H_mask, W_mask) optional spatial mask [0/1 float].
-                  If provided, only patches overlapping mask>0 are pooled.
-                  If None, all patches are pooled (backward-compatible).
         """
-        # Run through patch embedding + positional encoding + blocks + norm
-        # Using get_intermediate_layers with reshape=False returns (B, N_patches, D)
-        out = self.model.get_intermediate_layers(x, n=1, reshape=False)
-        patch_tokens = out[0]  # (B, N_patches, D) — CLS already excluded
+        outputs = self.model.get_intermediate_layers(x, n=[3, 11], reshape=False, norm=False)
+        tokens_hf = outputs[0]  # Layer 3
+        tokens_lf = outputs[1]  # Layer 11
+        
+        if hasattr(self.model, 'norm'):
+            tokens_hf = self.model.norm(tokens_hf)
+            tokens_lf = self.model.norm(tokens_lf)
+            
+        B, N, D = tokens_hf.shape
         
         if not self._logged_first_forward:
             self._logged_first_forward = True
-            B, N, D = patch_tokens.shape
-            h_p = int(N ** 0.5)
+            H_p = W_p = int(N ** 0.5)
             logger.info(
                 f"[DINOv2] First forward: input={tuple(x.shape)}, "
-                f"patches={N} ({h_p}x{h_p}), dim={D}, "
-                f"pooling={'masked' if mask is not None else 'standard mean'}"
+                f"patches={N} ({H_p}x{H_p}), dim={D}, "
+                f"pooling={'masked multi-spectral (3,11)' if mask is not None else 'multi-spectral (3,11)'}"
             )
-        
+            
+        # Base patch mask
         if mask is not None:
-            # Convert spatial mask to patch-level mask
-            # patch grid size: H_patches = H // patch_size, W_patches = W // patch_size
-            B, N, D = patch_tokens.shape
-            h_patches = w_patches = int(N ** 0.5)
-            
-            # Resize mask to patch grid using avg pooling
-            # mask: (B, H, W) → (B, 1, H, W) → avg_pool → (B, 1, h_p, w_p) → (B, N)
-            m = mask.unsqueeze(1).float()  # (B, 1, H, W)
-            m = nn.functional.adaptive_avg_pool2d(m, (h_patches, w_patches))  # (B, 1, h_p, w_p)
-            patch_mask = m.reshape(B, -1)  # (B, N)
-            
-            # Threshold: patch is "inside grain" if >25% of its area is masked
-            patch_mask = (patch_mask > 0.25).float()  # (B, N)
-            
-            # Ensure at least 1 patch is active (avoid division by zero)
-            patch_mask = torch.clamp(patch_mask, min=0)
-            active_count = patch_mask.sum(dim=1, keepdim=True).clamp(min=1.0)  # (B, 1)
-            
-            # Masked mean pooling: only grain patches contribute
-            features = (patch_tokens * patch_mask.unsqueeze(-1)).sum(dim=1) / active_count  # (B, D)
+            h_patches = x.shape[2] // self.patch_size
+            w_patches = x.shape[3] // self.patch_size
+            m = mask.unsqueeze(1).float()
+            m = nn.functional.adaptive_avg_pool2d(m, (h_patches, w_patches))
+            patch_mask = m.reshape(B, -1)
+            patch_mask = torch.where(patch_mask > 0.01, patch_mask, torch.zeros_like(patch_mask))
         else:
-            # Standard mean pooling (backward-compatible)
-            features = patch_tokens.mean(dim=1)  # (B, D)
+            patch_mask = torch.ones((B, N), device=tokens_hf.device)
+            
+        # Spatial Token Dropout (DropToken) for Whole-Grain Learning
+        if self.training:
+            drop_prob = 0.3
+            random_mask = torch.empty((B, N), device=tokens_hf.device).bernoulli_(1 - drop_prob)
+            patch_mask = patch_mask * random_mask
+            
+        active_count = patch_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+        pm = patch_mask.unsqueeze(-1)
         
-        return features
+        # Mean
+        mean_lf = (tokens_lf * pm).sum(dim=1) / active_count
+        mean_hf = (tokens_hf * pm).sum(dim=1) / active_count
+        
+        # Max
+        # Ignore masked tokens by setting them to -inf
+        tokens_lf_masked = torch.where(pm > 0, tokens_lf, torch.tensor(-float('inf'), device=tokens_lf.device))
+        tokens_hf_masked = torch.where(pm > 0, tokens_hf, torch.tensor(-float('inf'), device=tokens_hf.device))
+        max_lf, _ = tokens_lf_masked.max(dim=1)
+        max_hf, _ = tokens_hf_masked.max(dim=1)
+        
+        # Standard Deviation
+        var_lf = (((tokens_lf - mean_lf.unsqueeze(1))**2) * pm).sum(dim=1) / active_count
+        var_hf = (((tokens_hf - mean_hf.unsqueeze(1))**2) * pm).sum(dim=1) / active_count
+        std_lf = torch.sqrt(var_lf + 1e-6)
+        std_hf = torch.sqrt(var_hf + 1e-6)
+        
+        feat_lf = torch.cat([mean_lf, max_lf, std_lf], dim=1)
+        feat_hf = torch.cat([mean_hf, max_hf, std_hf], dim=1)
+        
+        # Returns a tuple of (LF, HF) embeddings
+        return feat_lf, feat_hf
     
     def forward_for_attention(self, x):
         """
-        Standard forward pass preserving ALL tokens (CLS + register + patches).
-        Used exclusively for attention map extraction — NOT for training.
-        
-        Unlike self.forward() which uses get_intermediate_layers() + mean pooling
-        (optimized for metric learning embeddings), this method preserves the
-        CLS token needed for CLS-to-patch attention maps (Caron et al., ICCV 2021).
-        
-        NOTE: Facebook's DINOv2 forward_features() returns a dict, not a tensor.
-        We use prepare_tokens_with_masks() + blocks + norm to get a clean tensor.
-        
-        Args:
-            x: (B, 3, H, W) input images
-            
-        Returns:
-            (B, 1 + num_register_tokens + N_patches, D) tensor with CLS at position 0
+        Standard forward pass for attention map extraction.
         """
         raw = self.model
-        # Facebook's DINOv2: forward_features returns dict — bypass it
-        if hasattr(raw, 'prepare_tokens_with_masks'):
-            tokens = raw.prepare_tokens_with_masks(x)
-            for blk in raw.blocks:
-                tokens = blk(tokens)
-            tokens = raw.norm(tokens)
-            return tokens  # (B, 1 + num_reg + N_patches, D)
-        # timm ViT (fallback): forward_features returns tensor
-        elif hasattr(raw, 'forward_features'):
+        if hasattr(raw, 'forward_features'):
             out = raw.forward_features(x)
             if isinstance(out, dict):
-                # Shouldn't happen, but handle gracefully
-                raise TypeError(f"forward_features returned dict with keys: {list(out.keys())}")
+                cls_token = out.get('x_norm_clstoken', out.get('cls_token', None))
+                patch_tokens = out.get('x_norm_patchtokens', out.get('x', None))
+                if cls_token is not None and patch_tokens is not None:
+                    if cls_token.dim() == 2:
+                        cls_token = cls_token.unsqueeze(1)
+                    return torch.cat([cls_token, patch_tokens], dim=1)
+                else:
+                    raise TypeError(f"Unexpected dict keys from forward_features: {list(out.keys())}")
             return out
-        else:
-            return raw(x)
+        return raw(x)
     
     @property
     def num_register_tokens(self):
@@ -171,7 +200,7 @@ class AnalogyNet(nn.Module):
         projection_head_config (dict, optional): Configuración del projection head.
             Keys: 'hidden_dims' (list[int]), 'use_batch_norm' (bool), 'dropout' (float).
             Si es None, usa default [256] sin BatchNorm (backward compatible).
-        use_attention (bool): Si True, inserta CBAM entre backbone y projection head.
+        use_attention (bool): Si True, inserta SE entre backbone y projection head.
         freeze_backbone (bool): Si True, congela el backbone (útil para DINOv2).
     
     Example:
@@ -208,14 +237,22 @@ class AnalogyNet(nn.Module):
         self.backbone, num_features = self._build_backbone(backbone, pretrained)
         
         if freeze_backbone:
-            for param in self.backbone.parameters():
-                param.requires_grad = False
-            logger.info(f"Backbone '{backbone}' frozen (only projection head trainable)")
+            # SOTA S-tier: Freeze everything except the last 2 blocks, norm, and projection head
+            for name, param in self.backbone.named_parameters():
+                if not any(unfreeze_key in name for unfreeze_key in ['blocks.10', 'blocks.11']):
+                    if name not in ['norm.weight', 'norm.bias']:
+                        param.requires_grad = False
+            logger.info(f"Backbone '{self.backbone_name}' partially frozen (last 2 blocks, norm, and projection head trainable)")
         
-        self.attention = CBAM1D(num_features) if use_attention else None
+        self.attention = SE1D(num_features) if use_attention else None
         
-        self.projection = self._build_projection_head(
-            num_features, embedding_dim, projection_head_config
+        # Creamos dos cabezales paralelos, cada uno proyectando a la mitad de embedding_dim
+        emb_dim_half = embedding_dim // 2
+        self.projection_lf = self._build_projection_head(
+            num_features, emb_dim_half, projection_head_config, embedding_space
+        )
+        self.projection_hf = self._build_projection_head(
+            num_features, emb_dim_half, projection_head_config, embedding_space
         )
         
         self._init_projection_weights()
@@ -223,13 +260,9 @@ class AnalogyNet(nn.Module):
         # Hyperbolic projection (Ermolov et al., CVPR 2022)
         self.hyp_projection = None
         if embedding_space == 'hyperbolic':
-            try:
-                from src.models.hyperbolic import PoincareBallProjection
-                self.hyp_projection = PoincareBallProjection(curvature=hyperbolic_curvature)
-                logger.info(f"Hyperbolic embedding space enabled (curvature={hyperbolic_curvature})")
-            except ImportError:
-                logger.warning("geoopt not installed, falling back to euclidean. pip install geoopt")
-                self.embedding_space = 'euclidean'
+            from src.models.hyperbolic import PoincareBallProjection
+            self.hyp_projection = PoincareBallProjection(curvature=hyperbolic_curvature)
+            logger.info(f"Hyperbolic embedding space enabled (curvature={hyperbolic_curvature})")
     
     def _build_backbone(self, backbone, pretrained):
         """
@@ -353,9 +386,9 @@ class AnalogyNet(nn.Module):
         )
         return self.BACKBONE_FEATURES.get(backbone_name, 512)
     
-    def _build_projection_head(self, num_features, embedding_dim, config):
+    def _build_projection_head(self, num_features, embedding_dim, config, embedding_space='euclidean'):
         """
-        Construye el Projection Head desde configuración.
+        Construye el cabezal de proyección lineal.
         
         Args:
             num_features: Dimensión de salida del backbone
@@ -366,11 +399,13 @@ class AnalogyNet(nn.Module):
         Returns:
             nn.Sequential: Projection head
         """
+        use_bias = (embedding_space != 'hyperbolic')
+        
         if config is None:
             return nn.Sequential(
-                nn.Linear(num_features, 256),
+                nn.Linear(num_features, 256, bias=use_bias),
                 nn.ReLU(inplace=True),
-                nn.Linear(256, embedding_dim)
+                nn.Linear(256, embedding_dim, bias=use_bias)
             )
         
         hidden_dims = config.get('hidden_dims', [256])
@@ -381,7 +416,7 @@ class AnalogyNet(nn.Module):
         in_dim = num_features
         
         for h_dim in hidden_dims:
-            layers.append(nn.Linear(in_dim, h_dim))
+            layers.append(nn.Linear(in_dim, h_dim, bias=use_bias))
             if use_bn:
                 layers.append(nn.BatchNorm1d(h_dim))
             layers.append(nn.ReLU(inplace=True))
@@ -389,22 +424,50 @@ class AnalogyNet(nn.Module):
                 layers.append(nn.Dropout(p=dropout))
             in_dim = h_dim
         
-        layers.append(nn.Linear(in_dim, embedding_dim))
+        layers.append(nn.Linear(in_dim, embedding_dim, bias=use_bias))
+        
+        if config is not None:
+            if config.get('normalize_embeddings_ln', False):
+                layers.append(nn.LayerNorm(embedding_dim))
+            if config.get('use_hardtanh', False):
+                min_val = config.get('hardtanh_min', -2.0)
+                max_val = config.get('hardtanh_max', 2.0)
+                layers.append(nn.Hardtanh(min_val=min_val, max_val=max_val))
         
         return nn.Sequential(*layers)
     
     def _init_projection_weights(self):
         """Inicializa los pesos del Projection Head con Kaiming Normal."""
-        for m in self.projection.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
+        emb_dim_half = self.embedding_dim // 2
+        for proj in [self.projection_lf, self.projection_hf]:
+            for m in proj.modules():
+                if isinstance(m, nn.Linear):
+                    if m.out_features == emb_dim_half:
+                        nn.init.orthogonal_(m.weight)
+                    else:
+                        nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0)
+                elif isinstance(m, nn.BatchNorm1d) or isinstance(m, nn.LayerNorm):
+                    nn.init.constant_(m.weight, 1)
                     nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm1d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
+        
+        # Inicia pesos de atencion si existen
+        if self.attention is not None:
+            for m in self.attention.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0)
     
-    def forward(self, x, mask=None):
+    def train(self, mode=True):
+        """Override train to maintain frozen backbone in eval mode."""
+        super().train(mode)
+        if self.freeze_backbone:
+            self.backbone.eval()
+        return self
+    
+    def forward(self, x, mask=None, return_prenorm=False):
         """
         Forward pass.
         
@@ -412,28 +475,60 @@ class AnalogyNet(nn.Module):
             x (torch.Tensor): Batch de imágenes (B, 3, 224, 224)
             mask (torch.Tensor, optional): Spatial mask (B, H, W) for masked pooling.
                 Only used with DINOv2 backbone. None = standard pooling.
+            return_prenorm (bool): Si True, devuelve (embeddings, prenorm_embeddings)
         
         Returns:
-            torch.Tensor: Embeddings normalizados (B, embedding_dim)
+            torch.Tensor o tuple: Embeddings normalizados (B, embedding_dim) o tupla si return_prenorm=True
         """
-        if mask is not None and hasattr(self.backbone, 'patch_size'):
-            features = self.backbone(x, mask=mask)
+        if mask is not None:
+            # "Zero activation" removido: dejar que DINOv2 vea la imagen original completa.
+            # Los píxeles en cero interactúan mal con los Positional Embeddings y la Auto-Atención.
+            # El filtrado ocurrirá únicamente a la salida (Masked Mean Pooling).
+            # x = x * mask.unsqueeze(1).float()
+            
+            if hasattr(self.backbone, 'patch_size'):
+                features = self.backbone(x, mask=mask)
+            else:
+                logger.warning("Mask provided but backbone does not support spatial masking. Ignoring mask.")
+                features = self.backbone(x)
         else:
             features = self.backbone(x)
         
-        if features.dim() > 2:
-            features = features.mean(dim=list(range(2, features.dim())))
+        # Manejar tupla de salida (LF, HF) desde DINOv2
+        if isinstance(features, tuple) and len(features) == 2:
+            feat_lf, feat_hf = features
+        else:
+            if features.dim() > 2:
+                features = features.mean(dim=list(range(2, features.dim())))
+            feat_lf, feat_hf = features, features
         
         if self.attention is not None:
-            features = self.attention(features)
+            feat_lf = self.attention(feat_lf)
+            feat_hf = self.attention(feat_hf)
         
-        embeddings = self.projection(features)
+        prenorm_lf = self.projection_lf(feat_lf)
+        prenorm_hf = self.projection_hf(feat_hf)
+        
+        # L2-Cat-L2 Topology:
+        # 1. Normalizar las representaciones a la hiperesfera unitaria de forma independiente
+        norm_lf = F.normalize(prenorm_lf, p=2, dim=1)
+        norm_hf = F.normalize(prenorm_hf, p=2, dim=1)
+        
+        # 2. Concatenar. El vector resultante tendrá una norma euclidiana de sqrt(1^2 + 1^2) = sqrt(2)
+        prenorm_embeddings = torch.cat([norm_lf, norm_hf], dim=1)
         
         if self.hyp_projection is not None:
-            embeddings = self.hyp_projection(embeddings)
+            if self.embedding_space == 'hyperbolic':
+                embeddings = self.hyp_projection(prenorm_embeddings)
+            else:
+                import math
+                embeddings = prenorm_embeddings / math.sqrt(2.0)
         else:
-            embeddings = F.normalize(embeddings, p=2, dim=1)
+            import math
+            embeddings = prenorm_embeddings / math.sqrt(2.0)
         
+        if return_prenorm:
+            return embeddings, prenorm_embeddings
         return embeddings
     
     def get_embedding_dim(self):

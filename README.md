@@ -15,7 +15,7 @@ Aprende una función de embedding $f_\theta: \mathbb{R}^{H \times W \times 3} \r
 - [Etapa 3 — Formato .seg y Dataset On-The-Fly](#etapa-3--formato-seg-y-dataset-on-the-fly)
 - [Etapa 4 — Preprocesamiento y Augmentaciones](#etapa-4--preprocesamiento-y-augmentaciones)
 - [Etapa 5 — Modelo de Embedding (AnalogyNet + DINOv2)](#etapa-5--modelo-de-embedding-analogynet--dinov2)
-- [Etapa 6 — Entrenamiento (Multi-Similarity Loss)](#etapa-6--entrenamiento-multi-similarity-loss)
+- [Etapa 6 — Entrenamiento (Sliced MS Loss)](#etapa-6--entrenamiento-sliced-ms-loss)
 - [Etapa 7 — Evaluación y Métricas](#etapa-7--evaluación-y-métricas)
 - [Etapa 8 — Análisis Post-Entrenamiento](#etapa-8--análisis-post-entrenamiento)
 - [Etapa 9 — Inferencia End-to-End](#etapa-9--inferencia-end-to-end)
@@ -351,9 +351,29 @@ Distancia euclidiana y similitud coseno son monótonamente equivalentes.
 
 ---
 
-## Etapa 6 — Entrenamiento (Multi-Similarity Loss)
+## Etapa 6 — Entrenamiento (Sliced MS Loss)
 
-### Función de Pérdida
+### Función de Pérdida (default: `sliced_ms`)
+
+El pipeline actual usa **Sliced Multi-Similarity Loss con Learnable Dynamic Margins** (LDM-MS por subespacio). Particiona el embedding 128D en **S=4 subespacios disjuntos de 32D** y aplica MS Loss (Wang et al., CVPR 2019) de forma independiente en cada slice, con márgenes aprendibles por clase.
+
+Motivación: mitigar **Neural Collapse** (Papyan et al., PNAS 2020) y elevar el rango espectral efectivo del espacio de embedding (Ko & Gu, CVPR 2020; slicing inspirado en Sanakoyeu et al., CVPR 2019).
+
+$$\mathcal{L}_{\text{sliced}} = \frac{1}{S} \sum_{s=1}^{S} \mathcal{L}_{MS}^{(s)}(\text{normalize}(\mathbf{z}^{(s)}), y)$$
+
+donde $\mathbf{z}^{(s)}$ es el slice $s$ del embedding y cada slice se L2-normaliza antes de calcular similitud coseno.
+
+| Aspecto | k-NN global 128D | Sliced MS + inferencia slice-aware |
+|---------|------------------|----------------------------------|
+| Geometría train/infer | Puede divergir | Coherente por slice |
+| Colapso dimensional | Tendencia a simplex (C−1) | S simplexes independientes |
+| Clasificación inferencia | Centroides / k-NN 128D | Media coseno por slice vs representantes |
+
+**Pérdidas alternativas:** `sliced_proxy` (SG-Softmax por slice), `hybrid_proxy_ms`, Triplet, ArcFace, Proxy Anchor.
+
+Documentación completa: `docs/2026-06-09_INFORME_MODIFICACIONES_PIPELINE_MULTI_SLICE.md`.
+
+### Multi-Similarity Loss (base por slice)
 
 **Multi-Similarity Loss** (Wang et al., CVPR 2019) explota simultáneamente relaciones positivas y negativas de cada muestra respecto a todo el batch:
 
@@ -509,11 +529,15 @@ El sistema auto-detecta el tipo de backbone y selecciona el método correcto aut
 
 ### Resultados Experimentales
 
-El sistema ha sido validado con múltiples configuraciones de backbone (ResNet, ConvNeXt, DINOv2) y funciones de pérdida (Triplet, Multi-Similarity, ArcFace). Los mejores resultados se obtienen con:
+El sistema ha sido validado con múltiples configuraciones de backbone (ResNet, ConvNeXt, DINOv2) y funciones de pérdida (Triplet, Multi-Similarity, ArcFace, **Sliced MS**). Los mejores resultados para el estudio actual se obtienen con:
+
+- **Backbone:** DINOv2 ViT-S/14
+- **Loss:** `sliced_ms` (4×32D) + LDM
+- **Inferencia:** `SliceAwareClassifier` + `FullImageClassifier`
 
 - **Backbone:** DINOv2 ViT-S/14 (21M parámetros)
 - **Embedding:** 128 dimensiones (hiperesfera S^127)
-- **Loss:** Multi-Similarity Loss
+- **Loss:** `sliced_ms` (Sliced Multi-Similarity + LDM)
 - **Augmentaciones:** Gray background (128) + máscara de contorno
 
 Las métricas de evaluación incluyen Recall@K, NMI, mAP@R y F1-Score Macro siguiendo protocolos estándar de Deep Metric Learning (CUB-200, Stanford Online Products).

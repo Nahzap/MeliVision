@@ -21,6 +21,17 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 
+# Raíz del proyecto: rutas relativas (config.yaml, logs/, models/) no dependen del CWD
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def ensure_project_root():
+    """Usar el directorio del proyecto aunque PowerShell/CMD arranquen desde otro sitio."""
+    os.chdir(PROJECT_ROOT)
+    root = str(PROJECT_ROOT)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+
 
 class TeeStream:
     """
@@ -36,7 +47,13 @@ class TeeStream:
     
     def write(self, text):
         if text:
-            self.original.write(text)
+            try:
+                self.original.write(text)
+            except UnicodeEncodeError:
+                self.original.write(
+                    text.encode(getattr(self.original, 'encoding', 'utf-8') or 'utf-8', errors='replace')
+                    .decode(getattr(self.original, 'encoding', 'utf-8') or 'utf-8', errors='replace')
+                )
             # Write to log file with timestamp for each line
             for char in text:
                 if char == '\n':
@@ -214,6 +231,8 @@ def install_exception_hooks():
 
 
 if __name__ == "__main__":
+    ensure_project_root()
+
     # Setup persistent logging BEFORE anything else
     log_path = setup_persistent_logging()
     print(f"📝 Log de sesión: {log_path.absolute()}")

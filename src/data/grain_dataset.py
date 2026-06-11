@@ -60,11 +60,14 @@ class SegmentedGrainDataset(Dataset):
         crop_padding: float = 0.2,
         crop_size: int = 256,
         use_mask: bool = False,
-        mask_bg_mode: str = 'random',
+        mask_bg_mode: str = 'gray',
         min_saliency: float = 0.0,
         return_metadata: bool = False,
         return_mask: bool = False,
         annotation_root: Optional[str] = None,
+        image_cache_size: int = 8,
+        image_cache_max_mb: int = 96,
+        max_cached_image_mb: int = 12,
     ):
         self.root = Path(root)
         self.transform = transform
@@ -96,11 +99,9 @@ class SegmentedGrainDataset(Dataset):
         self.class_to_idx: Dict[str, int] = {}
         self.targets: List[int] = []
 
-        # LRU cache for images: avoids re-reading the same image for multiple grains
-        self._image_cache: collections.OrderedDict = collections.OrderedDict()
-        self._image_cache_size = 64
-
         self._logged_first_getitem = False
+        self.h5_path: Optional[str] = None
+        self._h5_file = None
 
         self._build_index()
 
@@ -166,10 +167,14 @@ class SegmentedGrainDataset(Dataset):
 
                     # Cache grain data directly — no .seg re-reads at runtime
                     contour = grain.get("contour")  # numpy array or None
+                    
+                    # Adjust bbox if image is downscaled later
+                    bbox = list(grain["bbox"])
+                    
                     self._grain_samples.append((
                         img_str,
                         class_idx,
-                        tuple(grain["bbox"]),
+                        tuple(bbox),
                         grain["saliency"],
                         contour,
                     ))
@@ -188,44 +193,97 @@ class SegmentedGrainDataset(Dataset):
     def __len__(self) -> int:
         return len(self._grain_samples)
 
-    def _load_image(self, image_path: str) -> np.ndarray:
-        """Loads image with simple LRU cache (pickle-safe for DataLoader workers)."""
-        if image_path in self._image_cache:
-            self._image_cache.move_to_end(image_path)
-            return self._image_cache[image_path]
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['_h5_file'] = None
+        return state
+
+    def _load_image(self, image_path: str) -> Tuple[np.ndarray, float]:
+        """
+        Load BGR frame without downscaling to extract high-resolution crops.
+        """
         image = cv2.imread(image_path)
         if image is None:
             raise IOError(f"No se pudo leer: {image_path}")
-        self._image_cache[image_path] = image
-        if len(self._image_cache) > self._image_cache_size:
-            self._image_cache.popitem(last=False)
-        return image
+        
+        return image, 1.0
+
+    @staticmethod
+    def _scale_geometry(
+        bbox: Tuple[int, int, int, int],
+        contour: Optional[np.ndarray],
+        scale: float,
+    ):
+        if scale == 1.0:
+            return bbox, contour
+        x, y, w, h = bbox
+        bbox = (
+            int(x * scale),
+            int(y * scale),
+            max(1, int(w * scale)),
+            max(1, int(h * scale)),
+        )
+        if contour is not None:
+            contour = (np.asarray(contour, dtype=np.float32) * scale).astype(np.int32)
+        return bbox, contour
 
     def __getitem__(self, idx: int):
         image_path, class_idx, bbox, saliency, contour = self._grain_samples[idx]
 
-        # Cargar imagen (LRU cached — misma imagen para múltiples granos)
-        image = self._load_image(image_path)
-
-        # Construir grain dict desde datos cacheados (sin leer .seg)
-        grain = {"bbox": bbox, "saliency": saliency, "contour": contour}
-
-        # Extraer crop
-        crop = self._extract_crop(image, grain)
-
-        # Computar máscara binaria del grano (para masking y/o masked pooling)
-        mask_binary = None
-        if self.use_mask and contour is not None:
-            crop, mask_binary = self._apply_mask(crop, grain, image.shape[:2])
-
-        # Convertir BGR → RGB → PIL
-        crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-        crop_pil = Image.fromarray(crop_rgb)
-
-        if self.transform:
-            crop_tensor = self.transform(crop_pil)
+        if self.h5_path is not None:
+            if self._h5_file is None:
+                import h5py
+                # Parallel reads are safe without SWMR in 'r' mode
+                self._h5_file = h5py.File(self.h5_path, 'r')
+            
+            data = self._h5_file['crops'][idx]
+            crop = data[:, :, :3].copy()
+            mask_binary = data[:, :, 3].copy() if self.use_mask else None
+            
+            # Aplicar mask_bg_mode on-the-fly si usamos máscara
+            if mask_binary is not None:
+                bg_pixels = mask_binary == 0
+                if self.mask_bg_mode == 'random':
+                    # Use a solid random color instead of pixel-wise noise
+                    bg_color = np.random.randint(0, 256, size=(1, 1, 3), dtype=np.uint8)
+                    crop[bg_pixels] = bg_color[0, 0]
+                elif self.mask_bg_mode == 'gray':
+                    crop[bg_pixels] = 128
+                elif self.mask_bg_mode == 'black':
+                    crop[bg_pixels] = 0
+                # Si es 'none', dejamos el crop (background original) intacto.
         else:
-            crop_tensor = T.ToTensor()(crop_pil)
+            # Fallback a lectura on-the-fly
+            image, scale = self._load_image(image_path)
+            bbox, contour = self._scale_geometry(bbox, contour, scale)
+            grain = {"bbox": bbox, "saliency": saliency, "contour": contour}
+            crop = self._extract_crop(image, grain)
+
+            mask_binary = None
+            if (self.use_mask or self.return_mask) and contour is not None:
+                mask_binary = self._generate_mask(grain, image.shape[:2])
+                if self.use_mask:
+                    crop = self._apply_mask_bg(crop, mask_binary)
+
+        # BGR → RGB numpy (skip PIL — Albumentations accepts ndarray directly)
+        crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+
+        mask_tensor = None
+        if self.transform:
+            from src.data.grain_transform import apply_transform
+            if self.return_mask and mask_binary is not None:
+                out = apply_transform(self.transform, crop_rgb, mask_binary)
+                crop_tensor = out[0].contiguous()
+                mask_tensor = out[1].contiguous()
+            else:
+                crop_tensor = apply_transform(self.transform, crop_rgb).contiguous()
+                if self.return_mask:
+                    mask_tensor = torch.ones(crop_tensor.shape[1:], dtype=torch.float32).contiguous()
+        else:
+            from torchvision.transforms.functional import to_tensor
+            crop_tensor = to_tensor(crop_rgb)
+            if self.return_mask:
+                mask_tensor = torch.from_numpy(mask_binary.astype(np.float32)/255.0) if mask_binary is not None else torch.ones(crop_tensor.shape[1:], dtype=torch.float32)
 
         if self.return_metadata:
             meta = {
@@ -246,10 +304,7 @@ class SegmentedGrainDataset(Dataset):
                 f"class={self.classes[class_idx]}, mask_applied={mask_binary is not None}"
             )
 
-        if self.return_mask and mask_binary is not None:
-            mask_tensor = torch.from_numpy(
-                (mask_binary > 0).astype(np.float32)
-            )
+        if self.return_mask:
             return crop_tensor, class_idx, mask_tensor
 
         return crop_tensor, class_idx
@@ -267,41 +322,56 @@ class SegmentedGrainDataset(Dataset):
         cx = x + w // 2
         cy = y + h // 2
 
-        x1 = max(0, cx - side // 2)
-        y1 = max(0, cy - side // 2)
-        x2 = min(w_img, x1 + side)
-        y2 = min(h_img, y1 + side)
+        x1 = cx - side // 2
+        y1 = cy - side // 2
+        x2 = x1 + side
+        y2 = y1 + side
 
-        crop = image[y1:y2, x1:x2]
+        valid_x1 = max(0, x1)
+        valid_y1 = max(0, y1)
+        valid_x2 = min(w_img, x2)
+        valid_y2 = min(h_img, y2)
+
+        crop = image[valid_y1:valid_y2, valid_x1:valid_x2]
 
         if crop.size == 0:
             crop = np.zeros((self.crop_size, self.crop_size, 3), dtype=np.uint8)
         else:
-            crop = cv2.resize(
-                crop, (self.crop_size, self.crop_size), interpolation=cv2.INTER_LINEAR
-            )
+            if x1 < 0 or y1 < 0 or x2 > w_img or y2 > h_img:
+                top = max(0, -y1)
+                bottom = max(0, y2 - h_img)
+                left = max(0, -x1)
+                right = max(0, x2 - w_img)
+                crop = cv2.copyMakeBorder(crop, top, bottom, left, right, cv2.BORDER_CONSTANT, value=[128, 128, 128])
+            
+            # Remove cv2.resize, Albumentations will resize it natively.
 
         return crop
 
-    def _apply_mask(
-        self, crop: np.ndarray, grain: Dict, original_shape: Tuple[int, int]
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Aplica máscara del contorno con fondo configurable.
+    def get_raw_crop_and_mask(self, idx: int) -> np.ndarray:
+        """Extract raw crop and mask (without background coloring) for HDF5 cache."""
+        image_path, _, bbox, _, contour = self._grain_samples[idx]
+        image, scale = self._load_image(image_path)
+        bbox, contour = self._scale_geometry(bbox, contour, scale)
+        grain = {"bbox": bbox, "contour": contour}
+        
+        crop = self._extract_crop(image, grain)
+        
+        if self.use_mask and contour is not None:
+            mask_crop = self._generate_mask(grain, image.shape[:2])
+        else:
+            mask_crop = np.full((self.crop_size, self.crop_size), 255, dtype=np.uint8)
+            
+        out = np.empty((self.crop_size, self.crop_size, 4), dtype=np.uint8)
+        out[:,:,:3] = crop
+        out[:,:,3] = mask_crop
+        return out
 
-        Retorna:
-            (crop_masked, mask_binary) donde mask_binary es (crop_size, crop_size) uint8 [0/255]
-
-        mask_bg_mode:
-            'random' — fondo aleatorio (evita shortcut learning por borde constante)
-            'gray'   — gris neutro 128 (inference/val)
-            'black'  — negro puro (legacy, causa shortcut learning)
-        """
+    def _generate_mask(self, grain: Dict, original_shape: Tuple[int, int]) -> np.ndarray:
+        """Genera la máscara binaria pura desde el contorno."""
         contour = grain.get("contour")
         if contour is None or len(contour) < 3:
-            # Sin contorno válido: retornar crop sin máscara
-            full_mask = np.full((self.crop_size, self.crop_size), 255, dtype=np.uint8)
-            return crop, full_mask
+            return np.full((self.crop_size, self.crop_size), 255, dtype=np.uint8)
 
         h_img, w_img = original_shape
         x, y, w, h = grain["bbox"]
@@ -311,37 +381,48 @@ class SegmentedGrainDataset(Dataset):
 
         cx = x + w // 2
         cy = y + h // 2
-        x1 = max(0, cx - side // 2)
-        y1 = max(0, cy - side // 2)
+        x1 = cx - side // 2
+        y1 = cy - side // 2
+        x2 = x1 + side
+        y2 = y1 + side
 
         # Crear máscara en coordenadas del crop original
         mask_full = np.zeros((h_img, w_img), dtype=np.uint8)
         pts = contour.reshape(-1, 1, 2).astype(np.int32)
         cv2.drawContours(mask_full, [pts], -1, 255, -1)
 
-        x2 = min(w_img, x1 + side)
-        y2 = min(h_img, y1 + side)
-        mask_crop = mask_full[y1:y2, x1:x2]
-        mask_crop = cv2.resize(
-            mask_crop, (self.crop_size, self.crop_size), interpolation=cv2.INTER_NEAREST
-        )
+        valid_x1 = max(0, x1)
+        valid_y1 = max(0, y1)
+        valid_x2 = min(w_img, x2)
+        valid_y2 = min(h_img, y2)
+        mask_crop = mask_full[valid_y1:valid_y2, valid_x1:valid_x2]
+        
+        if x1 < 0 or y1 < 0 or x2 > w_img or y2 > h_img:
+            top = max(0, -y1)
+            bottom = max(0, y2 - h_img)
+            left = max(0, -x1)
+            right = max(0, x2 - w_img)
+            mask_crop = cv2.copyMakeBorder(mask_crop, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0)
 
-        # Aplicar fondo según modo
+        # Removido el erode agresivo para no reducir el grano y causar speckles.
+        # Conservamos el contorno completo.
+
+        return mask_crop
+
+    def _apply_mask_bg(self, crop: np.ndarray, mask_crop: np.ndarray) -> np.ndarray:
+        """Aplica el color de fondo a la imagen basándose en la máscara."""
         bg_pixels = mask_crop == 0
         if self.mask_bg_mode == 'random':
-            # 50% color sólido aleatorio, 50% ruido gaussiano
-            if np.random.random() < 0.5:
-                bg_color = np.random.randint(0, 256, size=(1, 1, 3), dtype=np.uint8)
-                crop[bg_pixels] = bg_color[0, 0]
-            else:
-                noise = np.random.randint(0, 256, crop.shape, dtype=np.uint8)
-                crop[bg_pixels] = noise[bg_pixels]
+            # Use a solid random color instead of pixel-wise noise
+            bg_color = np.random.randint(0, 256, size=(1, 1, 3), dtype=np.uint8)
+            crop[bg_pixels] = bg_color[0, 0]
         elif self.mask_bg_mode == 'gray':
             crop[bg_pixels] = 128
-        else:  # 'black' (legacy)
-            crop[bg_pixels] = 0
-
-        return crop, mask_crop
+        elif self.mask_bg_mode == 'black':
+            crop[mask_crop == 0] = 0
+        # Si es 'none', no hacemos nada (mantenemos el fondo original)
+        
+        return crop
 
     def get_stats(self) -> Dict[str, Any]:
         """Retorna estadísticas del dataset."""

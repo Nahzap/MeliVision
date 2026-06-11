@@ -209,45 +209,61 @@ def generate_sample_grid(dataset, save_path: str, samples_per_class: int = 10):
     logger.info(f"Sample grid saved: {save_path}")
 
 
-def generate_augmentation_preview(dataset, transform_config: dict, save_path: str, n_samples: int = 4):
+def generate_augmentation_preview(dataset, transform_config: dict, save_path: str, n_samples: int = None):
     """
-    Shows original vs augmented images side by side.
-    For SegmentedGrainDataset, shows grain crops instead of full images.
-    
+    Grid: one row per class, one column per augmentation (all enabled + full pipeline).
+
     Args:
         dataset: MielDataset or SegmentedGrainDataset
-        transform_config: Augmentation config dict
+        transform_config: Augmentation + data config (image_size, etc.)
         save_path: Path to save the preview PNG
-        n_samples: Number of sample images to show
+        n_samples: Deprecated; all classes are always shown.
     """
-    from src.data.transforms_enhanced import get_train_transforms
-    
+    from src.data.transforms_enhanced import (
+        get_augmentation_preview_columns,
+        get_train_transforms,
+        _preview_compose,
+    )
+
     train_tf = get_train_transforms(transform_config)
     is_grain = _is_grain_dataset(dataset)
-    
-    # Pick one random sample index per class
+    columns = get_augmentation_preview_columns(transform_config)
+    n_cols = len(columns)
+
+    # One sample index per class (all classes)
     class_sample_idx = {}
-    for idx, (path, label) in enumerate(dataset.samples):
+    for idx, (_, label) in enumerate(dataset.samples):
         if label not in class_sample_idx:
             class_sample_idx[label] = idx
-        if len(class_sample_idx) >= n_samples:
-            break
-    
-    sample_indices = list(class_sample_idx.values())[:n_samples]
-    sample_labels = list(class_sample_idx.keys())[:n_samples]
-    
-    fig, axes = plt.subplots(n_samples, 5, figsize=(14, n_samples * 3))
-    if n_samples == 1:
-        axes = axes.reshape(1, -1)
-    
-    title = 'Aumentación de Crops de Granos' if is_grain else 'Vista Previa de Aumentación de Datos'
-    fig.suptitle(title, fontsize=15, fontweight='bold', y=1.01)
-    
-    # Column headers
-    col_titles = ['Original', 'Aug #1', 'Aug #2', 'Aug #3', 'Aug #4']
-    for col, title in enumerate(col_titles):
-        axes[0, col].set_title(title, fontsize=11, fontweight='bold')
-    
+
+    sample_labels = sorted(class_sample_idx.keys(), key=lambda lbl: dataset.classes[lbl])
+    sample_indices = [class_sample_idx[lbl] for lbl in sample_labels]
+    n_classes = len(sample_indices)
+
+    if n_classes == 0:
+        logger.warning("Augmentation preview skipped: dataset has no samples.")
+        return
+
+    fig_w = max(16, n_cols * 2.0)
+    fig_h = max(8, n_classes * 2.0)
+    fig, axes = plt.subplots(n_classes, n_cols, figsize=(fig_w, fig_h))
+    if n_classes == 1:
+        axes = np.expand_dims(axes, axis=0)
+    if n_cols == 1:
+        axes = np.expand_dims(axes, axis=1)
+
+    title = (
+        f'Aumentación — {n_classes} clases × {n_cols} transformaciones'
+        + (' (crops de granos)' if is_grain else '')
+    )
+    fig.suptitle(title, fontsize=14, fontweight='bold', y=1.002)
+
+    mean = np.array(transform_config.get('normalize', {}).get('mean', [0.485, 0.456, 0.406]))
+    std = np.array(transform_config.get('normalize', {}).get('std', [0.229, 0.224, 0.225]))
+
+    for col, (col_title, transform_steps) in enumerate(columns):
+        axes[0, col].set_title(col_title, fontsize=8, fontweight='bold', rotation=35, ha='right')
+
     for row, (sample_idx, label) in enumerate(zip(sample_indices, sample_labels)):
         try:
             if is_grain:
@@ -255,45 +271,46 @@ def generate_augmentation_preview(dataset, transform_config: dict, save_path: st
             else:
                 img = Image.open(dataset.samples[sample_idx][0]).convert('RGB')
             img_np = np.array(img)
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"Preview skip sample {sample_idx}: {exc}")
             continue
-        
-        # Original
-        axes[row, 0].imshow(img)
-        axes[row, 0].set_ylabel(dataset.classes[label], fontsize=9, fontweight='bold',
-                                rotation=0, labelpad=60, ha='right', va='center')
-        
-        # Augmented versions
-        for col in range(1, 5):
+
+        class_name = dataset.classes[label]
+        axes[row, 0].set_ylabel(
+            class_name, fontsize=7, fontweight='bold',
+            rotation=0, labelpad=70, ha='right', va='center',
+        )
+
+        for col, (col_title, transform_steps) in enumerate(columns):
+            ax = axes[row, col]
             try:
-                # MicroscopyAugmentation.__call__ returns tensor directly
-                # Albumentations Compose returns dict with 'image' key
-                result = train_tf(img_np)
-                if isinstance(result, dict):
-                    augmented = result['image']
+                if col_title == 'Pipeline completo':
+                    result = train_tf(img_np)
+                    augmented = result['image'] if isinstance(result, dict) else result
+                    if hasattr(augmented, 'permute'):
+                        aug_np = augmented.permute(1, 2, 0).detach().cpu().numpy()
+                        aug_np = np.clip(aug_np * std + mean, 0, 1)
+                    else:
+                        aug_np = augmented
                 else:
-                    augmented = result
-                if hasattr(augmented, 'permute'):
-                    aug_np = augmented.permute(1, 2, 0).numpy()
-                    # Denormalize (ImageNet normalization)
-                    mean = np.array([0.485, 0.456, 0.406])
-                    std = np.array([0.229, 0.224, 0.225])
-                    aug_np = np.clip(aug_np * std + mean, 0, 1)
-                else:
-                    aug_np = augmented
-                axes[row, col].imshow(aug_np)
-            except Exception:
-                axes[row, col].text(0.5, 0.5, 'Error', ha='center', va='center',
-                                   transform=axes[row, col].transAxes)
-        
-        for col in range(5):
-            axes[row, col].set_xticks([])
-            axes[row, col].set_yticks([])
-    
+                    aug_np = _preview_compose(transform_steps, img_np)
+                ax.imshow(aug_np)
+            except Exception as exc:
+                ax.text(
+                    0.5, 0.5, 'Error', ha='center', va='center',
+                    transform=ax.transAxes, fontsize=7, color='red',
+                )
+                logger.debug(f"Preview {class_name}/{col_title}: {exc}")
+            ax.set_xticks([])
+            ax.set_yticks([])
+
     fig.tight_layout()
-    fig.savefig(save_path, dpi=120, bbox_inches='tight', facecolor='white')
+    fig.savefig(save_path, dpi=100, bbox_inches='tight', facecolor='white')
     plt.close(fig)
-    logger.info(f"Augmentation preview saved: {save_path}")
+    logger.info(
+        f"Augmentation preview saved: {save_path} "
+        f"({n_classes} classes, {n_cols} columns)"
+    )
 
 
 def _sample_image_sizes(dataset, max_samples: int = 200) -> dict:
@@ -479,30 +496,20 @@ def run_pre_training_analysis(config: dict, config_path: str, train_dataset, val
     generate_class_balance_chart(train_dataset, val_dataset, balance_path)
     charts['train_val_balance'] = balance_path
     
-    # 3. Sample grid per class (top 10)
+    # 3. Sample grid per class (top 10) — reuse train_dataset index (no second 7s scan)
     grid_path = str(Path(pre_dir) / 'sample_grid_per_class.png')
-    # Use raw dataset (no transforms) for sample grid — grain or image mode
-    dataset_mode = config.get('grain_detection', {}).get('dataset_mode', 'image')
-    if dataset_mode == 'grain':
-        from src.data.grain_dataset import SegmentedGrainDataset
-        grain_cfg = config.get('grain_detection', {})
-        raw_train = SegmentedGrainDataset(
-            root=config['data']['train_dir'],
-            transform=None,
-            crop_padding=grain_cfg.get('crop_padding', 0.2),
-            crop_size=grain_cfg.get('crop_size', 256),
-            annotation_root='data/annotations',
-        )
-    else:
-        from src.data.dataset import MielDataset
-        raw_train = MielDataset(root=config['data']['train_dir'], transform=None)
-    generate_sample_grid(raw_train, grid_path, samples_per_class=10)
+    saved_transform = getattr(train_dataset, "transform", None)
+    try:
+        train_dataset.transform = None
+        generate_sample_grid(train_dataset, grid_path, samples_per_class=10)
+    finally:
+        train_dataset.transform = saved_transform
     charts['sample_grid'] = grid_path
     
     # 4. Augmentation preview
     aug_path = str(Path(pre_dir) / 'augmentation_preview.png')
     transform_config = {**config['augmentation'], **config['data']}
-    generate_augmentation_preview(raw_train, transform_config, aug_path, n_samples=4)
+    generate_augmentation_preview(train_dataset, transform_config, aug_path)
     charts['augmentation_preview'] = aug_path
     
     # 5. Dataset stats JSON

@@ -38,45 +38,6 @@ class NIRRegularizer(nn.Module):
     def forward(self, embeddings, labels):
         """
         Compute NIR loss.
-        
-        Args:
-            embeddings: (B, D) L2-normalized embeddings
-            labels: (B,) integer class labels
-            
-        Returns:
-            Scalar NIR loss (to be added to main loss)
+        DISABLED due to rank-deficiency crashes in small batches.
         """
-        unique_labels = labels.unique()
-        nir_loss = torch.tensor(0.0, device=embeddings.device)
-        count = 0
-        
-        for c in unique_labels:
-            mask = labels == c
-            class_embeds = embeddings[mask]  # (n_c, D)
-            
-            if class_embeds.shape[0] < 3:
-                continue
-            
-            # Center embeddings
-            centered = class_embeds - class_embeds.mean(dim=0, keepdim=True)
-            
-            # Covariance matrix: (D, D)
-            n = class_embeds.shape[0]
-            cov = (centered.t() @ centered) / (n - 1)
-            
-            # Add small identity for numerical stability
-            reg = self.eps * torch.eye(cov.shape[0], device=cov.device)
-            cov_reg = cov + reg
-            
-            # Log-determinant via eigenvalues (more stable than torch.logdet)
-            eigvals = torch.linalg.eigvalsh(cov_reg)
-            log_det = eigvals.clamp(min=1e-8).log().sum()
-            
-            # Negative log-det: minimizing this maximizes determinant (anisotropy)
-            nir_loss = nir_loss - log_det
-            count += 1
-        
-        if count > 0:
-            nir_loss = self.lambda_nir * (nir_loss / count)
-        
-        return nir_loss
+        return torch.tensor(0.0, device=embeddings.device, requires_grad=True)

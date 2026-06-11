@@ -27,6 +27,17 @@ from PyQt5.QtGui import QFont, QColor, QPalette
 from src.data.transforms_enhanced import get_input_size_for_backbone
 
 
+def set_nested_value(data: dict, dotted_key: str, value):
+    """Escribe un valor en config_data usando clave con puntos (ej. data.loader_policy.x)."""
+    keys = dotted_key.split('.')
+    cur = data
+    for k in keys[:-1]:
+        if k not in cur or not isinstance(cur[k], dict):
+            cur[k] = {}
+        cur = cur[k]
+    cur[keys[-1]] = value
+
+
 class ConfigChangesDialog(QDialog):
     """
     Diálogo para mostrar cambios automáticos aplicados al cambiar backbone.
@@ -329,6 +340,7 @@ class ConfigEditorTab(QWidget):
     Implementa IEEE 9241-143 para diseño de formularios.
     """
     configChanged = pyqtSignal()
+    configSaved = pyqtSignal(str)
     
     def __init__(self, config_path="config.yaml", parent=None):
         super().__init__(parent)
@@ -336,8 +348,11 @@ class ConfigEditorTab(QWidget):
         self.fields = {}
         self.config_data = {}
         self.parent_window = parent
+        self._dirty = False
+        self._suppress_dirty = False
         
         self.init_ui()
+        self._connect_dirty_tracking()
         self.load_config()
     
     def init_ui(self):
@@ -393,8 +408,10 @@ class ConfigEditorTab(QWidget):
         # Crear tabs por sección
         self.create_model_tab()
         self.create_data_tab()
+        self.create_grain_tab()
         self.create_augmentation_tab()
         self.create_training_tab()
+        self.create_evaluation_tab()
         self.create_inference_tab()
         self.create_paths_tab()
         self.create_hardware_tab()
@@ -450,6 +467,39 @@ class ConfigEditorTab(QWidget):
         
         self.setLayout(main_layout)
     
+    def _on_sampler_param_edited(self):
+        if getattr(self, '_updating_batch_params', False): return
+        self._updating_batch_params = True
+        try:
+            p = self.fields['data.classes_per_batch'].get_value()
+            k = self.fields['data.samples_per_class'].get_value()
+            new_batch = p * k
+            if self.fields['data.batch_size'].get_value() != new_batch:
+                self.fields['data.batch_size'].set_value(new_batch)
+                self.batch_warning_label.setText(f"✓ Batch Size actualizado a {new_batch} ({p} × {k})")
+            else:
+                self.batch_warning_label.setText("")
+        finally:
+            self._updating_batch_params = False
+
+    def _on_batch_size_edited(self):
+        if getattr(self, '_updating_batch_params', False): return
+        self._updating_batch_params = True
+        try:
+            b = self.fields['data.batch_size'].get_value()
+            k = self.fields['data.samples_per_class'].get_value()
+            p = max(2, b // k)
+            new_batch = p * k
+            if self.fields['data.classes_per_batch'].get_value() != p:
+                self.fields['data.classes_per_batch'].set_value(p)
+            if b != new_batch:
+                self.fields['data.batch_size'].set_value(new_batch)
+                self.batch_warning_label.setText(f"⚠ Batch auto-ajustado a {new_batch} (múltiplo de {k})")
+            else:
+                self.batch_warning_label.setText(f"✓ Batch OK ({p} × {k})")
+        finally:
+            self._updating_batch_params = False
+
     def create_model_tab(self):
         """Tab de configuración del modelo"""
         tab = QWidget()
@@ -505,6 +555,18 @@ class ConfigEditorTab(QWidget):
             tooltip="Usar pesos pre-entrenados de ImageNet"
         )
         model_layout.addRow("Pretrained:", self.fields['model.pretrained'].widget)
+
+        self.fields['model.freeze_backbone'] = BoolField(
+            "Freeze Backbone",
+            tooltip="Congelar backbone (solo entrena projection head; más rápido, menos calidad)"
+        )
+        model_layout.addRow("Freeze Backbone:", self.fields['model.freeze_backbone'].widget)
+
+        self.fields['model.use_attention'] = BoolField(
+            "Use Attention",
+            tooltip="Capa de atención adicional en el head"
+        )
+        model_layout.addRow("Use Attention:", self.fields['model.use_attention'].widget)
         
         model_group.setLayout(model_layout)
         layout.addWidget(model_group)
@@ -531,6 +593,34 @@ class ConfigEditorTab(QWidget):
             tooltip="Tasa de dropout (0.0 = sin dropout)"
         )
         proj_layout.addRow("Dropout:", self.fields['model.projection_head.dropout'].widget)
+        
+        self.fields['model.projection_head.normalize_embeddings_ln'] = BoolField(
+            "Normalize LN",
+            default=False,
+            tooltip="Aplicar LayerNorm final al projection head"
+        )
+        proj_layout.addRow("Normalize LN:", self.fields['model.projection_head.normalize_embeddings_ln'].widget)
+        
+        self.fields['model.projection_head.use_hardtanh'] = BoolField(
+            "Use HardTanh",
+            default=False,
+            tooltip="Aplicar HardTanh al final de la proyección"
+        )
+        proj_layout.addRow("Use HardTanh:", self.fields['model.projection_head.use_hardtanh'].widget)
+        
+        self.fields['model.projection_head.hardtanh_min'] = FloatField(
+            "HardTanh Min",
+            default=-2.0, min_val=-10.0, max_val=0.0, decimals=1, step=0.5,
+            tooltip="Límite inferior HardTanh"
+        )
+        proj_layout.addRow("HardTanh Min:", self.fields['model.projection_head.hardtanh_min'].widget)
+        
+        self.fields['model.projection_head.hardtanh_max'] = FloatField(
+            "HardTanh Max",
+            default=2.0, min_val=0.0, max_val=10.0, decimals=1, step=0.5,
+            tooltip="Límite superior HardTanh"
+        )
+        proj_layout.addRow("HardTanh Max:", self.fields['model.projection_head.hardtanh_max'].widget)
         
         proj_group.setLayout(proj_layout)
         layout.addWidget(proj_group)
@@ -568,6 +658,13 @@ class ConfigEditorTab(QWidget):
             is_dir=True
         )
         paths_layout.addRow("Test:", self.fields['data.test_dir'].widget_container)
+
+        self.fields['data.annotation_root'] = PathField(
+            "Annotation Root",
+            tooltip="Raíz de anotaciones .seg (modo grain on-the-fly)",
+            is_dir=True
+        )
+        paths_layout.addRow("Anotaciones (.seg):", self.fields['data.annotation_root'].widget_container)
         
         paths_group.setLayout(paths_layout)
         layout.addWidget(paths_group)
@@ -596,6 +693,29 @@ class ConfigEditorTab(QWidget):
             tooltip="Tamaño del batch (P × K)"
         )
         sampler_layout.addRow("Batch Size:", self.fields['data.batch_size'].widget)
+
+        self.batch_warning_label = QLabel()
+        self.batch_warning_label.setStyleSheet("color: #d97706; font-size: 11px; font-weight: bold;")
+        sampler_layout.addRow("", self.batch_warning_label)
+
+        # Connect signals for auto-correction
+        self.fields['data.classes_per_batch'].widget.valueChanged.connect(self._on_sampler_param_edited)
+        self.fields['data.samples_per_class'].widget.valueChanged.connect(self._on_sampler_param_edited)
+        self.fields['data.batch_size'].widget.valueChanged.connect(self._on_batch_size_edited)
+
+        self.fields['data.val_batch_size'] = IntField(
+            "Val Batch Size",
+            default=0, min_val=0, max_val=512,
+            tooltip="0 = mismo que train. Puede ser mayor en val (sin backward) para menos batches"
+        )
+        sampler_layout.addRow("Val Batch Size:", self.fields['data.val_batch_size'].widget)
+
+        self.fields['data.auto_tune_resources'] = BoolField(
+            "Auto Tune Resources",
+            default=True,
+            tooltip="Ajusta workers/prefetch/caché según CPU y RAM disponibles al crear DataLoaders"
+        )
+        sampler_layout.addRow("Auto-tune CPU/RAM:", self.fields['data.auto_tune_resources'].widget)
         
         sampler_group.setLayout(sampler_layout)
         layout.addWidget(sampler_group)
@@ -607,9 +727,23 @@ class ConfigEditorTab(QWidget):
         self.fields['data.num_workers'] = IntField(
             "Num Workers",
             default=0, min_val=0, max_val=16,
-            tooltip="Número de workers (0 para Windows)"
+            tooltip="Workers del DataLoader de entrenamiento (0 = hilo principal)"
         )
         loader_layout.addRow("Num Workers:", self.fields['data.num_workers'].widget)
+
+        self.fields['data.prefetch_factor'] = IntField(
+            "Prefetch Factor",
+            default=2, min_val=1, max_val=8,
+            tooltip="Batches prefetched por worker (requiere num_workers > 0)"
+        )
+        loader_layout.addRow("Prefetch:", self.fields['data.prefetch_factor'].widget)
+
+        self.fields['data.val_num_workers'] = IntField(
+            "Val Workers",
+            default=-1, min_val=-1, max_val=16,
+            tooltip="-1 = mismo que train; 0 = validación en hilo principal"
+        )
+        loader_layout.addRow("Val Workers:", self.fields['data.val_num_workers'].widget)
         
         self.fields['data.pin_memory'] = BoolField(
             "Pin Memory",
@@ -625,6 +759,39 @@ class ConfigEditorTab(QWidget):
         
         loader_group.setLayout(loader_layout)
         layout.addWidget(loader_group)
+
+        policy_group = QGroupBox("Política DataLoader")
+        policy_layout = QFormLayout()
+
+        self.fields['data.loader_policy.exclusive_train_workers_during_val'] = BoolField(
+            "Exclusive Train Workers",
+            default=True,
+            tooltip="Libera workers de train durante validación (evita duplicar RAM)"
+        )
+        policy_layout.addRow(
+            "Workers exclusivos en val:",
+            self.fields['data.loader_policy.exclusive_train_workers_during_val'].widget
+        )
+
+        self.fields['data.loader_policy.persistent_workers'] = BoolField(
+            "Persistent Workers",
+            default=True,
+            tooltip="Mantener workers vivos entre épocas (menos overhead de spawn)"
+        )
+        policy_layout.addRow(
+            "Persistent workers:",
+            self.fields['data.loader_policy.persistent_workers'].widget
+        )
+
+        self.fields['data.worker_ram_budget_mb'] = IntField(
+            "Worker RAM Budget",
+            default=900, min_val=400, max_val=32000,
+            tooltip="Si la RAM estimada de workers supera este valor, se reducen workers/cache automáticamente"
+        )
+        policy_layout.addRow("RAM budget (MB):", self.fields['data.worker_ram_budget_mb'].widget)
+
+        policy_group.setLayout(policy_layout)
+        layout.addWidget(policy_group)
         
         # Image preprocessing
         img_group = QGroupBox("Preprocesamiento de Imágenes")
@@ -650,11 +817,210 @@ class ConfigEditorTab(QWidget):
         layout.addStretch()
         tab.setLayout(layout)
         self.tabs.addTab(tab, "💾 Datos")
+
+    def create_grain_tab(self):
+        """Tab de detección de grano on-the-fly (.seg)"""
+        tab = QWidget()
+        layout = QVBoxLayout()
+
+        mode_group = QGroupBox("Modo Dataset")
+        mode_layout = QFormLayout()
+
+        self.fields['grain_detection.enabled'] = BoolField(
+            "Pipeline grain (.seg)",
+            default=True,
+            tooltip="Siempre on-the-fly: 1 muestra = 1 grano desde anotaciones .seg. "
+                    "Desactivar solo si cada carpeta de clase ya tiene imágenes recortadas listas."
+        )
+        mode_layout.addRow("Habilitado:", self.fields['grain_detection.enabled'].widget)
+
+        mode_note = QLabel(
+            "Con el pipeline activo, cada época lee symlinks + .seg y genera crops/máscaras "
+            "en memoria (no hay modo «image» separado en entrenamiento)."
+        )
+        mode_note.setWordWrap(True)
+        mode_note.setStyleSheet("color: #666; padding: 4px 0;")
+        mode_layout.addRow(mode_note)
+
+        mode_group.setLayout(mode_layout)
+        layout.addWidget(mode_group)
+
+        crop_group = QGroupBox("Crop y Máscara")
+        crop_layout = QFormLayout()
+
+        self.fields['grain_detection.crop_size'] = IntField(
+            "Crop Size",
+            default=252, min_val=64, max_val=512,
+            tooltip="Tamaño del crop (sincronizado con data.image_size al cambiar backbone)"
+        )
+        crop_layout.addRow("Crop Size:", self.fields['grain_detection.crop_size'].widget)
+
+        self.fields['grain_detection.crop_padding'] = FloatField(
+            "Crop Padding",
+            default=0.2, min_val=0.0, max_val=1.0, decimals=2, step=0.05,
+            tooltip="Padding relativo al bbox del grano"
+        )
+        crop_layout.addRow("Crop Padding:", self.fields['grain_detection.crop_padding'].widget)
+
+        self.fields['grain_detection.use_mask'] = BoolField(
+            "Use Mask",
+            default=True,
+            tooltip="Aplicar máscara del grano en augmentación"
+        )
+        crop_layout.addRow("Use Mask:", self.fields['grain_detection.use_mask'].widget)
+
+        self.fields['grain_detection.masked_pooling'] = BoolField(
+            "Masked Pooling",
+            default=True,
+            tooltip="Pooling atento a la máscara en el backbone"
+        )
+        crop_layout.addRow("Masked Pooling:", self.fields['grain_detection.masked_pooling'].widget)
+
+        self.fields['grain_detection.train_mask_bg_mode'] = ChoiceField(
+            "Train BG Mode",
+            ['gray', 'random', 'black'],
+            default='gray',
+            tooltip="Fondo fuera de máscara en entrenamiento"
+        )
+        crop_layout.addRow("Train BG:", self.fields['grain_detection.train_mask_bg_mode'].widget)
+
+        self.fields['grain_detection.val_mask_bg_mode'] = ChoiceField(
+            "Val BG Mode",
+            ['gray', 'random', 'black'],
+            default='gray',
+            tooltip="Fondo fuera de máscara en validación"
+        )
+        crop_layout.addRow("Val BG:", self.fields['grain_detection.val_mask_bg_mode'].widget)
+
+        crop_group.setLayout(crop_layout)
+        layout.addWidget(crop_group)
+
+        cache_group = QGroupBox("Caché de Imágenes (workers)")
+        cache_layout = QFormLayout()
+
+        self.fields['grain_detection.image_cache_size'] = IntField(
+            "Cache Size",
+            default=6, min_val=0, max_val=64,
+            tooltip="Entradas LRU por worker (0 = sin caché)"
+        )
+        cache_layout.addRow("Entradas LRU:", self.fields['grain_detection.image_cache_size'].widget)
+
+        self.fields['grain_detection.image_cache_max_mb'] = IntField(
+            "Cache Max MB",
+            default=48, min_val=0, max_val=512,
+            tooltip="Límite de RAM por worker para caché de imágenes"
+        )
+        cache_layout.addRow("Máx MB/worker:", self.fields['grain_detection.image_cache_max_mb'].widget)
+
+        self.fields['grain_detection.max_cached_image_mb'] = IntField(
+            "Max Frame Cache MB",
+            default=12, min_val=4, max_val=64,
+            tooltip="No cachear en LRU frames más grandes que esto (microscopía full-res ~19MB)"
+        )
+        cache_layout.addRow("Máx frame (MB):", self.fields['grain_detection.max_cached_image_mb'].widget)
+
+        self.fields['grain_detection.max_load_side'] = IntField(
+            "Max Load Side",
+            default=1536, min_val=512, max_val=4096,
+            tooltip="Redimensiona al cargar si el lado mayor supera este valor (menos RAM/CPU, mismo crop)"
+        )
+        cache_layout.addRow("Max load side:", self.fields['grain_detection.max_load_side'].widget)
+
+        cache_group.setLayout(cache_layout)
+        layout.addWidget(cache_group)
+
+        det_group = QGroupBox("Detección (U²-Net / saliency)")
+        det_layout = QFormLayout()
+
+        self.fields['grain_detection.model_type'] = ChoiceField(
+            "Model Type",
+            ['u2netp', 'u2net'],
+            default='u2netp',
+            tooltip="Modelo de segmentación auxiliar"
+        )
+        det_layout.addRow("Modelo:", self.fields['grain_detection.model_type'].widget)
+
+        self.fields['grain_detection.input_size'] = IntField(
+            "Input Size",
+            default=320, min_val=128, max_val=512,
+            tooltip="Resolución de entrada del detector"
+        )
+        det_layout.addRow("Input Size:", self.fields['grain_detection.input_size'].widget)
+
+        self.fields['grain_detection.saliency_threshold'] = FloatField(
+            "Saliency Threshold",
+            default=0.3, min_val=0.0, max_val=1.0, decimals=2, step=0.05,
+            tooltip="Umbral de mapa de saliencia"
+        )
+        det_layout.addRow("Saliency:", self.fields['grain_detection.saliency_threshold'].widget)
+
+        self.fields['grain_detection.adaptive_k'] = FloatField(
+            "Adaptive K",
+            default=0.3, min_val=0.0, max_val=1.0, decimals=2, step=0.05,
+            tooltip="Factor k adaptativo para umbral"
+        )
+        det_layout.addRow("Adaptive K:", self.fields['grain_detection.adaptive_k'].widget)
+
+        self.fields['grain_detection.min_area'] = IntField(
+            "Min Area",
+            default=1000, min_val=0, max_val=1000000,
+            tooltip="Área mínima del grano (px²)"
+        )
+        det_layout.addRow("Min Area:", self.fields['grain_detection.min_area'].widget)
+
+        self.fields['grain_detection.max_area'] = IntField(
+            "Max Area",
+            default=120000, min_val=0, max_val=10000000,
+            tooltip="Área máxima del grano (px²)"
+        )
+        det_layout.addRow("Max Area:", self.fields['grain_detection.max_area'].widget)
+
+        self.fields['grain_detection.min_circularity'] = FloatField(
+            "Min Circularity",
+            default=0.3, min_val=0.0, max_val=1.0, decimals=2, step=0.05,
+            tooltip="Circularidad mínima aceptada"
+        )
+        det_layout.addRow("Min Circularity:", self.fields['grain_detection.min_circularity'].widget)
+
+        self.fields['grain_detection.morph_kernel_size'] = IntField(
+            "Morph Kernel",
+            default=3, min_val=1, max_val=21,
+            tooltip="Tamaño del kernel morfológico"
+        )
+        det_layout.addRow("Morph Kernel:", self.fields['grain_detection.morph_kernel_size'].widget)
+
+        self.fields['grain_detection.distance_threshold'] = FloatField(
+            "Distance Threshold",
+            default=0.7, min_val=0.0, max_val=2.0, decimals=2, step=0.05,
+            tooltip="Umbral de distancia entre granos"
+        )
+        det_layout.addRow("Distance:", self.fields['grain_detection.distance_threshold'].widget)
+
+        det_group.setLayout(det_layout)
+        layout.addWidget(det_group)
+
+        layout.addStretch()
+        tab.setLayout(layout)
+        self.tabs.addTab(tab, "🌾 Grano")
     
     def create_augmentation_tab(self):
         """Tab de augmentación"""
         tab = QWidget()
         layout = QVBoxLayout()
+
+        sota_group = QGroupBox("Modo de Augmentación (SOTA)")
+        sota_layout = QFormLayout()
+
+        self.fields['sota.augmentation_mode'] = ChoiceField(
+            "Augmentation Mode",
+            ['full', 'deit3'],
+            default='full',
+            tooltip="full = pipeline microscopía; deit3 = pipeline más ligero"
+        )
+        sota_layout.addRow("Modo:", self.fields['sota.augmentation_mode'].widget)
+
+        sota_group.setLayout(sota_layout)
+        layout.addWidget(sota_group)
         
         # Geometric
         geom_group = QGroupBox("Augmentaciones Geométricas")
@@ -724,6 +1090,188 @@ class ConfigEditorTab(QWidget):
         
         color_group.setLayout(color_layout)
         layout.addWidget(color_group)
+
+        # Grayscale (RGB + B&N robustness)
+        gray_group = QGroupBox("Escala de grises (RGB + blanco y negro)")
+        gray_layout = QFormLayout()
+
+        self.fields['augmentation.grayscale.enabled'] = BoolField(
+            "Grayscale",
+            default=True,
+            tooltip="Convierte aleatoriamente a escala de grises (3 canales). "
+                    "Entrena resiliencia RGB y B&N."
+        )
+        gray_layout.addRow("Habilitar B&N:", self.fields['augmentation.grayscale.enabled'].widget)
+
+        self.fields['augmentation.grayscale.p'] = FloatField(
+            "Grayscale P",
+            default=0.5, min_val=0.0, max_val=1.0, decimals=2, step=0.1,
+            tooltip="Probabilidad de aplicar ToGray en cada sample"
+        )
+        gray_layout.addRow("Probabilidad:", self.fields['augmentation.grayscale.p'].widget)
+
+        gray_group.setLayout(gray_layout)
+        layout.addWidget(gray_group)
+
+        perf_group = QGroupBox("Rendimiento")
+        perf_layout = QFormLayout()
+        self.fields['augmentation.performance_mode'] = BoolField(
+            "Performance Mode",
+            default=True,
+            tooltip="Desactiva augmentaciones muy costosas en CPU (optical, domain)"
+        )
+        perf_layout.addRow("Modo rendimiento:", self.fields['augmentation.performance_mode'].widget)
+        perf_group.setLayout(perf_layout)
+        layout.addWidget(perf_group)
+
+        micro_group = QGroupBox("Microscopía (Albumentations)")
+        micro_layout = QFormLayout()
+
+        self.fields['augmentation.microscopy_specific.random_gamma.enabled'] = BoolField(
+            "Gamma Enabled", default=True, tooltip="Random gamma correction"
+        )
+        micro_layout.addRow("Gamma:", self.fields['augmentation.microscopy_specific.random_gamma.enabled'].widget)
+
+        self.fields['augmentation.microscopy_specific.random_gamma.p'] = FloatField(
+            "Gamma P", default=0.5, min_val=0.0, max_val=1.0, decimals=2, step=0.1,
+            tooltip="Probabilidad random gamma"
+        )
+        micro_layout.addRow("Gamma P:", self.fields['augmentation.microscopy_specific.random_gamma.p'].widget)
+
+        self.fields['augmentation.microscopy_specific.random_gamma.gamma_limit'] = ListField(
+            "Gamma Limit", default=[80, 120],
+            tooltip="Límites gamma (min, max) en %"
+        )
+        micro_layout.addRow("Gamma Limit:", self.fields['augmentation.microscopy_specific.random_gamma.gamma_limit'].widget)
+
+        self.fields['augmentation.microscopy_specific.gaussian_noise.enabled'] = BoolField(
+            "Noise Enabled", default=True, tooltip="Ruido gaussiano"
+        )
+        micro_layout.addRow("Noise:", self.fields['augmentation.microscopy_specific.gaussian_noise.enabled'].widget)
+
+        self.fields['augmentation.microscopy_specific.gaussian_noise.p'] = FloatField(
+            "Noise P", default=0.5, min_val=0.0, max_val=1.0, decimals=2, step=0.1,
+            tooltip="Probabilidad ruido gaussiano"
+        )
+        micro_layout.addRow("Noise P:", self.fields['augmentation.microscopy_specific.gaussian_noise.p'].widget)
+
+        self.fields['augmentation.microscopy_specific.gaussian_noise.var_limit'] = ListField(
+            "Noise Var Limit", default=[10.0, 50.0],
+            tooltip="Varianza mínima y máxima del ruido"
+        )
+        micro_layout.addRow("Var Limit:", self.fields['augmentation.microscopy_specific.gaussian_noise.var_limit'].widget)
+
+        self.fields['augmentation.microscopy_specific.blur.enabled'] = BoolField(
+            "Blur Enabled", default=True, tooltip="Desenfoque gaussiano"
+        )
+        micro_layout.addRow("Blur:", self.fields['augmentation.microscopy_specific.blur.enabled'].widget)
+
+        self.fields['augmentation.microscopy_specific.blur.p'] = FloatField(
+            "Blur P", default=0.3, min_val=0.0, max_val=1.0, decimals=2, step=0.1,
+            tooltip="Probabilidad blur"
+        )
+        micro_layout.addRow("Blur P:", self.fields['augmentation.microscopy_specific.blur.p'].widget)
+
+        self.fields['augmentation.microscopy_specific.blur.blur_limit'] = IntField(
+            "Blur Limit", default=3, min_val=1, max_val=15,
+            tooltip="Kernel máximo de blur"
+        )
+        micro_layout.addRow("Blur Limit:", self.fields['augmentation.microscopy_specific.blur.blur_limit'].widget)
+
+        self.fields['augmentation.microscopy_specific.optical_distortion.enabled'] = BoolField(
+            "Optical Distortion", default=True,
+            tooltip="Distorsión óptica (costosa en CPU)"
+        )
+        micro_layout.addRow(
+            "Optical Dist:",
+            self.fields['augmentation.microscopy_specific.optical_distortion.enabled'].widget
+        )
+
+        self.fields['augmentation.microscopy_specific.optical_distortion.p'] = FloatField(
+            "Optical P", default=0.3, min_val=0.0, max_val=1.0, decimals=2, step=0.1,
+            tooltip="Probabilidad distorsión óptica"
+        )
+        micro_layout.addRow(
+            "Optical P:",
+            self.fields['augmentation.microscopy_specific.optical_distortion.p'].widget
+        )
+
+        self.fields['augmentation.microscopy_specific.optical_distortion.distort_limit'] = FloatField(
+            "Distort Limit", default=0.1, min_val=0.0, max_val=1.0, decimals=2, step=0.05,
+            tooltip="Magnitud de distorsión"
+        )
+        micro_layout.addRow(
+            "Distort Limit:",
+            self.fields['augmentation.microscopy_specific.optical_distortion.distort_limit'].widget
+        )
+
+        self.fields['augmentation.microscopy_specific.clahe.enabled'] = BoolField(
+            "CLAHE Enabled", default=True, tooltip="CLAHE adaptativo"
+        )
+        micro_layout.addRow("CLAHE:", self.fields['augmentation.microscopy_specific.clahe.enabled'].widget)
+
+        self.fields['augmentation.microscopy_specific.clahe.p'] = FloatField(
+            "CLAHE P", default=0.5, min_val=0.0, max_val=1.0, decimals=2, step=0.1,
+            tooltip="Probabilidad CLAHE"
+        )
+        micro_layout.addRow("CLAHE P:", self.fields['augmentation.microscopy_specific.clahe.p'].widget)
+
+        self.fields['augmentation.microscopy_specific.clahe.clip_limit'] = FloatField(
+            "CLAHE Clip", default=2.0, min_val=0.1, max_val=10.0, decimals=1, step=0.1,
+            tooltip="Clip limit de CLAHE"
+        )
+        micro_layout.addRow("Clip Limit:", self.fields['augmentation.microscopy_specific.clahe.clip_limit'].widget)
+
+        self.fields['augmentation.microscopy_specific.clahe.tile_grid_size'] = ListField(
+            "CLAHE Grid", default=[8, 8],
+            tooltip="Tamaño de rejilla CLAHE (filas, cols)"
+        )
+        micro_layout.addRow("Tile Grid:", self.fields['augmentation.microscopy_specific.clahe.tile_grid_size'].widget)
+
+        micro_group.setLayout(micro_layout)
+        layout.addWidget(micro_group)
+
+        domain_group = QGroupBox("Domain Augmentation")
+        domain_layout = QFormLayout()
+
+        self.fields['augmentation.domain_augmentation.enabled'] = BoolField(
+            "Domain Aug Enabled", default=True,
+            tooltip="Augmentaciones de dominio (costosas; desactivar para más velocidad)"
+        )
+        domain_layout.addRow("Habilitado:", self.fields['augmentation.domain_augmentation.enabled'].widget)
+
+        self.fields['augmentation.domain_augmentation.brightness_contrast_limit'] = FloatField(
+            "BC Limit", default=0.4, min_val=0.0, max_val=1.0, decimals=2, step=0.05,
+            tooltip="Límite brillo/contraste"
+        )
+        domain_layout.addRow("BC Limit:", self.fields['augmentation.domain_augmentation.brightness_contrast_limit'].widget)
+
+        self.fields['augmentation.domain_augmentation.rgb_shift_limit'] = IntField(
+            "RGB Shift", default=25, min_val=0, max_val=100,
+            tooltip="Desplazamiento RGB máximo"
+        )
+        domain_layout.addRow("RGB Shift:", self.fields['augmentation.domain_augmentation.rgb_shift_limit'].widget)
+
+        self.fields['augmentation.domain_augmentation.tone_curve_scale'] = FloatField(
+            "Tone Curve", default=0.2, min_val=0.0, max_val=1.0, decimals=2, step=0.05,
+            tooltip="Escala de curva de tono"
+        )
+        domain_layout.addRow("Tone Curve:", self.fields['augmentation.domain_augmentation.tone_curve_scale'].widget)
+
+        self.fields['augmentation.domain_augmentation.downscale_min'] = FloatField(
+            "Downscale Min", default=0.5, min_val=0.1, max_val=1.0, decimals=2, step=0.05,
+            tooltip="Factor mínimo de downscale"
+        )
+        domain_layout.addRow("Downscale Min:", self.fields['augmentation.domain_augmentation.downscale_min'].widget)
+
+        self.fields['augmentation.domain_augmentation.coarse_dropout_holes'] = IntField(
+            "Coarse Dropout", default=4, min_val=0, max_val=32,
+            tooltip="Número de huecos coarse dropout"
+        )
+        domain_layout.addRow("Dropout Holes:", self.fields['augmentation.domain_augmentation.coarse_dropout_holes'].widget)
+
+        domain_group.setLayout(domain_layout)
+        layout.addWidget(domain_group)
         
         # Normalization
         norm_group = QGroupBox("Normalización (ImageNet)")
@@ -780,8 +1328,9 @@ class ConfigEditorTab(QWidget):
         
         self.fields['training.loss.type'] = ChoiceField(
             "Loss Type",
-            ['multi_similarity', 'triplet', 'arcface'],
-            tooltip="Tipo de función de pérdida"
+            ['multi_similarity', 'triplet', 'arcface', 'hybrid_proxy_ms', 'sliced_ms', 'sliced_proxy'],
+            default='sliced_ms',
+            tooltip="Tipo de función de pérdida. sliced_ms requiere classes_per_batch >= 2."
         )
         loss_layout.addRow("Type:", self.fields['training.loss.type'].widget)
         
@@ -798,9 +1347,241 @@ class ConfigEditorTab(QWidget):
             tooltip="Peso de pares negativos (Multi-Similarity)"
         )
         loss_layout.addRow("Beta:", self.fields['training.loss.params.beta'].widget)
+
+        self.fields['training.loss.params.base_margin'] = FloatField(
+            "Base Margin",
+            default=0.5, min_val=0.1, max_val=2.0, decimals=2, step=0.1,
+            tooltip="Margen base para Multi-Similarity Loss (y LDM)"
+        )
+        loss_layout.addRow("Base Margin:", self.fields['training.loss.params.base_margin'].widget)
+
+        self.fields['training.loss.params.margin'] = FloatField(
+            "ArcFace Margin",
+            default=28.6, min_val=0.0, max_val=180.0, decimals=1, step=0.1,
+            tooltip="Margen angular ArcFace (grados). Para forzar uso de dimensiones, valores altos (90-120) son efectivos."
+        )
+        loss_layout.addRow("ArcFace Margin:", self.fields['training.loss.params.margin'].widget)
+
+        self.fields['training.loss.params.scale'] = FloatField(
+            "ArcFace Scale",
+            default=64.0, min_val=10.0, max_val=100.0, decimals=1, step=1.0,
+            tooltip="Escala para ArcFace logits"
+        )
+        loss_layout.addRow("ArcFace Scale:", self.fields['training.loss.params.scale'].widget)
+
+        self.fields['training.loss.params.proxy_scale'] = FloatField(
+            "Proxy Scale",
+            default=30.0, min_val=10.0, max_val=100.0, decimals=1, step=1.0,
+            tooltip="Escala para Proxy logits (usado en SlicedProxy)"
+        )
+        loss_layout.addRow("Proxy Scale:", self.fields['training.loss.params.proxy_scale'].widget)
+
+        self.fields['training.loss.params.proxy_margin'] = FloatField(
+            "Proxy Margin",
+            default=0.2, min_val=0.0, max_val=1.0, decimals=2, step=0.05,
+            tooltip="Margen aditivo para Proxies (usado en SlicedProxy)"
+        )
+        loss_layout.addRow("Proxy Margin:", self.fields['training.loss.params.proxy_margin'].widget)
+
+        self.fields['training.loss.params.num_slices'] = IntField(
+            "Num Slices",
+            default=4, min_val=2, max_val=16,
+            tooltip="Número de subespacios para Sliced MS Loss (Spectral Embedding Expansion)"
+        )
+        loss_layout.addRow("Slices (SlicedMS):", self.fields['training.loss.params.num_slices'].widget)
+
+        self.fields['training.gradient_accumulation_steps'] = IntField(
+            "Gradient Accumulation",
+            default=1, min_val=1, max_val=32,
+            tooltip="Pasos de acumulación de gradientes. Batch efectivo = batch_size × este valor."
+        )
+        loss_layout.addRow("Grad Accum Steps:", self.fields['training.gradient_accumulation_steps'].widget)
         
         loss_group.setLayout(loss_layout)
         layout.addWidget(loss_group)
+
+        metric_group = QGroupBox("Métrica de Validación")
+        metric_layout = QFormLayout()
+
+        self.fields['training.validation_metric'] = ChoiceField(
+            "Validation Metric",
+            ['recall_at_1', 'recall_at_5', 'map', 'loss'],
+            default='recall_at_1',
+            tooltip="Métrica principal para early stopping y mejor modelo"
+        )
+        metric_layout.addRow("Métrica:", self.fields['training.validation_metric'].widget)
+
+        metric_group.setLayout(metric_layout)
+        layout.addWidget(metric_group)
+
+        mining_group = QGroupBox("Hard Mining (ArcFace OHEM)")
+        mining_layout = QFormLayout()
+
+        self.fields['training.hard_mining.enabled'] = BoolField(
+            "Hard Mining",
+            default=True,
+            tooltip="Online hard example mining en ArcFace"
+        )
+        mining_layout.addRow("Habilitado:", self.fields['training.hard_mining.enabled'].widget)
+
+        self.fields['training.hard_mining.ratio'] = FloatField(
+            "Ratio",
+            default=0.3, min_val=0.0, max_val=1.0, decimals=2, step=0.05,
+            tooltip="Fracción de ejemplos difíciles por batch"
+        )
+        mining_layout.addRow("Ratio:", self.fields['training.hard_mining.ratio'].widget)
+
+        self.fields['training.hard_mining.min_samples'] = IntField(
+            "Min Samples",
+            default=32, min_val=1, max_val=512,
+            tooltip="Mínimo de muestras para activar mining"
+        )
+        mining_layout.addRow("Min Samples:", self.fields['training.hard_mining.min_samples'].widget)
+
+        self.fields['training.hard_mining.warmup_epochs'] = IntField(
+            "Mining Warmup",
+            default=0, min_val=0, max_val=50,
+            tooltip="Épocas antes de activar hard mining"
+        )
+        mining_layout.addRow("Warmup épocas:", self.fields['training.hard_mining.warmup_epochs'].widget)
+
+        self.fields['training.hard_mining.adaptive'] = BoolField(
+            "Adaptive",
+            default=False,
+            tooltip="Ajustar ratio de mining dinámicamente"
+        )
+        mining_layout.addRow("Adaptativo:", self.fields['training.hard_mining.adaptive'].widget)
+
+        mining_group.setLayout(mining_layout)
+        layout.addWidget(mining_group)
+
+        triplet_mining_group = QGroupBox("Triplet Mining (legacy)")
+        triplet_mining_layout = QFormLayout()
+
+        self.fields['training.mining.enabled'] = BoolField(
+            "Mining Enabled",
+            default=False,
+            tooltip="Mining para triplet/multi-similarity (no ArcFace)"
+        )
+        triplet_mining_layout.addRow("Habilitado:", self.fields['training.mining.enabled'].widget)
+
+        self.fields['training.mining.type'] = ChoiceField(
+            "Mining Type",
+            ['semihard', 'hard', 'easy'],
+            default='semihard',
+            tooltip="Estrategia de mining triplet"
+        )
+        triplet_mining_layout.addRow("Tipo:", self.fields['training.mining.type'].widget)
+
+        self.fields['training.mining.margin'] = FloatField(
+            "Mining Margin",
+            default=0.2, min_val=0.0, max_val=2.0, decimals=2, step=0.05,
+            tooltip="Margen para triplet mining"
+        )
+        triplet_mining_layout.addRow("Margen:", self.fields['training.mining.margin'].widget)
+
+        triplet_mining_group.setLayout(triplet_mining_layout)
+        layout.addWidget(triplet_mining_group)
+
+        # Academic Regularizers
+        reg_group = QGroupBox("Regularizadores Académicos (128D)")
+        reg_layout = QFormLayout()
+
+        self.fields['sota.amplitude_penalty.enabled'] = BoolField(
+            "Amplitude Penalty",
+            default=False,
+            tooltip="Penalizar amplitudes extremas en embeddings (antes de LN)"
+        )
+        reg_layout.addRow("Amplitude Penalty:", self.fields['sota.amplitude_penalty.enabled'].widget)
+
+        self.fields['sota.amplitude_penalty.lambda_weight'] = FloatField(
+            "Amplitude Lambda",
+            default=0.1, min_val=0.0, max_val=10.0, decimals=2, step=0.1,
+            tooltip="Peso de la pérdida de amplitud"
+        )
+        reg_layout.addRow("Amplitude Lambda:", self.fields['sota.amplitude_penalty.lambda_weight'].widget)
+
+        self.fields['sota.amplitude_penalty.penalty_type'] = ChoiceField(
+            "Amplitude Type",
+            ['clamping', 'huber', 'l2'],
+            default='clamping',
+            tooltip="Tipo de penalización de amplitud"
+        )
+        reg_layout.addRow("Amplitude Type:", self.fields['sota.amplitude_penalty.penalty_type'].widget)
+
+        self.fields['sota.amplitude_penalty.margin'] = FloatField(
+            "Amplitude Margin",
+            default=0.5, min_val=0.0, max_val=5.0, decimals=2, step=0.1,
+            tooltip="Margen de amplitud segura"
+        )
+        reg_layout.addRow("Amplitude Margin:", self.fields['sota.amplitude_penalty.margin'].widget)
+
+
+        self.fields['sota.uniformity.enabled'] = BoolField(
+            "Uniformity Enabled",
+            default=False,
+            tooltip="Activar Uniformidad Hiperesférica (Wang & Isola, 2020) para maximizar ortogonalidad"
+        )
+        reg_layout.addRow("Uniformidad:", self.fields['sota.uniformity.enabled'].widget)
+
+        self.fields['sota.uniformity.lambda'] = FloatField(
+            "Uniformity Lambda",
+            default=1.0, min_val=0.0, max_val=10.0, decimals=2, step=0.1,
+            tooltip="Peso de la pérdida de uniformidad"
+        )
+        reg_layout.addRow("Uniformidad (Peso):", self.fields['sota.uniformity.lambda'].widget)
+
+        self.fields['sota.uniformity.t'] = FloatField(
+            "Uniformity t (RBF)",
+            default=2.0, min_val=0.1, max_val=10.0, decimals=1, step=0.1,
+            tooltip="Parámetro t del núcleo Gaussiano RBF"
+        )
+        reg_layout.addRow("Uniformidad (t):", self.fields['sota.uniformity.t'].widget)
+
+        self.fields['sota.decorrelation.enabled'] = BoolField(
+            "Decorrelation Enabled",
+            default=False,
+            tooltip="Activar Whitening / Decorrelación (VICReg) para forzar uso de las 128D"
+        )
+        reg_layout.addRow("Decorrelación:", self.fields['sota.decorrelation.enabled'].widget)
+
+        self.fields['sota.decorrelation.lambda'] = FloatField(
+            "Decorrelation Lambda",
+            default=0.5, min_val=0.0, max_val=10.0, decimals=2, step=0.1,
+            tooltip="Peso de la pérdida de decorrelación de covarianza"
+        )
+        reg_layout.addRow("Decorrelación (Peso):", self.fields['sota.decorrelation.lambda'].widget)
+
+        self.fields['sota.decorrelation.target_variance'] = FloatField(
+            "Target Variance",
+            default=1.0, min_val=0.1, max_val=10.0, decimals=2, step=0.1,
+            tooltip="Varianza objetivo (target) para las dimensiones"
+        )
+        reg_layout.addRow("Varianza Target:", self.fields['sota.decorrelation.target_variance'].widget)
+
+        self.fields['sota.disentanglement.enabled'] = BoolField(
+            "Disentanglement Enabled",
+            default=False,
+            tooltip="Activar Desentrelazamiento (MIM) entre Forma y Textura"
+        )
+        reg_layout.addRow("Desentrelazamiento:", self.fields['sota.disentanglement.enabled'].widget)
+
+        self.fields['sota.disentanglement.lambda'] = FloatField(
+            "Disentanglement Lambda",
+            default=5.0, min_val=0.0, max_val=50.0, decimals=2, step=0.5,
+            tooltip="Peso de la penalización de desentrelazamiento"
+        )
+        reg_layout.addRow("Desentrelazamiento (Peso):", self.fields['sota.disentanglement.lambda'].widget)
+
+        self.fields['sota.self_distillation.enabled'] = BoolField(
+            "Self-Distillation",
+            default=False,
+            tooltip="Desactivar con slicing (compite con expansión espectral)"
+        )
+        reg_layout.addRow("Self-Distillation:", self.fields['sota.self_distillation.enabled'].widget)
+
+        reg_group.setLayout(reg_layout)
+        layout.addWidget(reg_group)
         
         # Optimizer
         opt_group = QGroupBox("Optimizador")
@@ -931,6 +1712,77 @@ class ConfigEditorTab(QWidget):
         layout.addStretch()
         tab.setLayout(layout)
         self.tabs.addTab(tab, "🚀 Entrenamiento")
+
+    def create_evaluation_tab(self):
+        """Tab de evaluación durante entrenamiento"""
+        tab = QWidget()
+        layout = QVBoxLayout()
+
+        eval_group = QGroupBox("Validación y Métricas")
+        eval_layout = QFormLayout()
+
+        self.fields['evaluation.progressive_plot_every_epochs'] = IntField(
+            "Progressive Plots",
+            default=2, min_val=0, max_val=10,
+            tooltip="0 = desactivado; actualiza curvas de entrenamiento cada N épocas (no afecta métricas)"
+        )
+        eval_layout.addRow("Plots progresivos:", self.fields['evaluation.progressive_plot_every_epochs'].widget)
+
+        self.fields['evaluation.compute_precision_at_k'] = ListField(
+            "Precision@K",
+            default=[1, 5, 10],
+            tooltip="Valores k para Precision@k"
+        )
+        eval_layout.addRow("Precision@K:", self.fields['evaluation.compute_precision_at_k'].widget)
+
+        self.fields['evaluation.visualize_embeddings'] = BoolField(
+            "Visualize Embeddings",
+            default=True,
+            tooltip="Generar visualización de embeddings"
+        )
+        eval_layout.addRow("Visualizar:", self.fields['evaluation.visualize_embeddings'].widget)
+
+        self.fields['evaluation.embedding_visualization_method'] = ChoiceField(
+            "Viz Method",
+            ['tsne', 'umap', 'pca'],
+            default='tsne',
+            tooltip="Método de reducción dimensional para plots"
+        )
+        eval_layout.addRow("Método viz:", self.fields['evaluation.embedding_visualization_method'].widget)
+
+        eval_group.setLayout(eval_layout)
+        layout.addWidget(eval_group)
+
+        repro_group = QGroupBox("Reproducibilidad")
+        repro_layout = QFormLayout()
+
+        self.fields['reproducibility.seed'] = IntField(
+            "Seed",
+            default=42, min_val=0, max_val=999999,
+            tooltip="Semilla aleatoria global"
+        )
+        repro_layout.addRow("Seed:", self.fields['reproducibility.seed'].widget)
+
+        self.fields['reproducibility.deterministic'] = BoolField(
+            "Deterministic",
+            default=False,
+            tooltip="Modo determinista (más lento)"
+        )
+        repro_layout.addRow("Determinista:", self.fields['reproducibility.deterministic'].widget)
+
+        self.fields['reproducibility.benchmark'] = BoolField(
+            "Benchmark",
+            default=True,
+            tooltip="cudnn.benchmark para convoluciones"
+        )
+        repro_layout.addRow("cuDNN benchmark:", self.fields['reproducibility.benchmark'].widget)
+
+        repro_group.setLayout(repro_layout)
+        layout.addWidget(repro_group)
+
+        layout.addStretch()
+        tab.setLayout(layout)
+        self.tabs.addTab(tab, "📊 Evaluación")
     
     def create_inference_tab(self):
         """Tab de inferencia"""
@@ -1079,6 +1931,13 @@ class ConfigEditorTab(QWidget):
             tooltip="Usar Automatic Mixed Precision"
         )
         gpu_layout.addRow("Mixed Precision:", self.fields['hardware.use_amp'].widget)
+
+        self.fields['hardware.faiss_gpu'] = BoolField(
+            "FAISS GPU",
+            default=True,
+            tooltip="Usar GPU para índices FAISS en evaluación/inferencia"
+        )
+        gpu_layout.addRow("FAISS GPU:", self.fields['hardware.faiss_gpu'].widget)
         
         gpu_group.setLayout(gpu_layout)
         layout.addWidget(gpu_group)
@@ -1107,14 +1966,35 @@ class ConfigEditorTab(QWidget):
         tab.setLayout(layout)
         self.tabs.addTab(tab, "⚡ Hardware")
     
+    def _connect_dirty_tracking(self):
+        """Conecta valueChanged de todos los campos para detectar ediciones sin guardar."""
+        for field in self.fields.values():
+            field.valueChanged.connect(self._mark_dirty)
+    
+    def _mark_dirty(self):
+        if self._suppress_dirty:
+            return
+        self._dirty = True
+        self.status_label.setText("● Cambios sin guardar")
+        self.status_label.setStyleSheet("color: #ffa94d; padding: 5px; font-weight: bold;")
+    
+    def is_dirty(self) -> bool:
+        """True si hay cambios en la UI que no se han guardado en disco."""
+        return self._dirty
+    
+    def get_config_path_str(self) -> str:
+        return str(self.config_path.resolve())
+    
     def load_config(self):
         """Carga configuración desde archivo"""
         try:
+            self._suppress_dirty = True
             with open(self.config_path, 'r', encoding='utf-8') as f:
                 self.config_data = yaml.safe_load(f)
             
             # Cargar valores en campos
             self.load_values_from_dict(self.config_data)
+            self._dirty = False
             
             self.status_label.setText(f"✅ Configuración cargada: {datetime.now().strftime('%H:%M:%S')}")
             self.status_label.setStyleSheet("color: #4ec9b0; padding: 5px;")
@@ -1126,6 +2006,8 @@ class ConfigEditorTab(QWidget):
             QMessageBox.critical(self, "Error", f"Error cargando configuración:\n{str(e)}")
             self.status_label.setText(f"❌ Error: {str(e)}")
             self.status_label.setStyleSheet("color: #f48771; padding: 5px;")
+        finally:
+            self._suppress_dirty = False
     
     def load_values_from_dict(self, data, prefix=""):
         """Carga valores recursivamente desde diccionario"""
@@ -1165,8 +2047,9 @@ class ConfigEditorTab(QWidget):
             backup_path = self.config_path.with_suffix('.yaml.backup')
             shutil.copy2(self.config_path, backup_path)
             
-            # Actualizar diccionario con valores de campos
-            self.update_dict_from_fields(self.config_data)
+            # Actualizar diccionario con valores de campos (incluye claves nuevas anidadas)
+            for full_key, field in self.fields.items():
+                set_nested_value(self.config_data, full_key, field.get_value())
             
             # Guardar
             with open(self.config_path, 'w', encoding='utf-8') as f:
@@ -1187,7 +2070,10 @@ class ConfigEditorTab(QWidget):
                 f"Configuración guardada exitosamente.\n\nBackup creado: {backup_path.name}"
             )
             
+            self._dirty = False
+            saved_path = str(self.config_path.resolve())
             self.configChanged.emit()
+            self.configSaved.emit(saved_path)
         
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Error guardando configuración:\n{str(e)}")
@@ -1216,8 +2102,28 @@ class ConfigEditorTab(QWidget):
                 field.mark_valid()
         
         if all_valid:
-            self.status_label.setText("✅ Todos los campos son válidos")
-            self.status_label.setStyleSheet("color: #4ec9b0; padding: 5px;")
+            from src.utils.config_validator import validate_config
+            draft = dict(self.config_data)
+            for full_key, field in self.fields.items():
+                set_nested_value(draft, full_key, field.get_value())
+            pipeline = validate_config(draft, str(self.config_path))
+            if not pipeline["valid"]:
+                all_valid = False
+                for err in pipeline["errors"]:
+                    self.status_label.setText(f"❌ {err}")
+                    self.status_label.setStyleSheet("color: #f48771; padding: 5px;")
+                    break
+            elif pipeline["warnings"]:
+                self.status_label.setText(
+                    f"✅ Campos OK — {pipeline['pipeline_summary']} "
+                    f"({len(pipeline['warnings'])} aviso(s))"
+                )
+                self.status_label.setStyleSheet("color: #4ec9b0; padding: 5px;")
+            else:
+                self.status_label.setText(
+                    f"✅ Válido — {pipeline['pipeline_summary']}"
+                )
+                self.status_label.setStyleSheet("color: #4ec9b0; padding: 5px;")
         else:
             self.status_label.setText("❌ Hay campos inválidos")
             self.status_label.setStyleSheet("color: #f48771; padding: 5px;")
@@ -1318,8 +2224,8 @@ class ConfigEditorTab(QWidget):
             # 8. Actualizar experiment.description si existe
             if 'experiment.description' in self.fields:
                 backbone_descriptions = {
-                    'dinov2_vits14': 'DINOv2 ViT-S/14 baseline with ArcFace',
-                    'dinov2_vitb14': 'DINOv2 ViT-B/14 baseline with ArcFace',
+                    'dinov2_vits14': 'DINOv2 ViT-S/14 + Sliced MS (metric learning)',
+                    'dinov2_vitb14': 'DINOv2 ViT-B/14 + Sliced MS (metric learning)',
                     'resnet50': 'ResNet-50 baseline (CNN clásico)',
                     'convnext_v2_tiny': 'ConvNeXt V2 Tiny baseline (CNN moderno)',
                     'deit_small_patch16_224': 'DeiT-S baseline (ViT supervisado)',

@@ -45,9 +45,11 @@ class EMATeacher:
             t_param.data.mul_(self.alpha).add_(s_param.data, alpha=1.0 - self.alpha)
     
     @torch.no_grad()
-    def get_teacher_embeddings(self, images):
+    def get_teacher_embeddings(self, images, masks=None):
         """Get embeddings from teacher model (no grad)."""
         self.teacher.eval()
+        if masks is not None:
+            return self.teacher(images, mask=masks)
         return self.teacher(images)
     
     def to(self, device):
@@ -85,9 +87,13 @@ class SelfDistillationLoss(nn.Module):
         Returns:
             Scalar self-distillation loss
         """
+        # Normalize embeddings to properly compute cosine similarity
+        student_norm = F.normalize(student_embeddings, p=2, dim=1, eps=1e-5)
+        teacher_norm = F.normalize(teacher_embeddings, p=2, dim=1, eps=1e-5)
+        
         # Pairwise cosine similarity matrices
-        student_sim = student_embeddings @ student_embeddings.t()
-        teacher_sim = teacher_embeddings @ teacher_embeddings.t()
+        student_sim = student_norm @ student_norm.t()
+        teacher_sim = teacher_norm @ teacher_norm.t()
         
         # Remove diagonal (self-similarity)
         B = student_sim.shape[0]

@@ -54,6 +54,8 @@ class WorkerThread(QThread):
             self.status.emit("Iniciando operación...")
             self.result = self.func(*self.args, **self.kwargs)
             self.finished.emit(self.result)
+        except KeyboardInterrupt:
+            self.error.emit("Operación cancelada por el usuario.")
         except Exception as e:
             tb = traceback.format_exc()
             self.error.emit(f"{str(e)}\n\nTraceback:\n{tb}")
@@ -68,7 +70,6 @@ class LogWidget(QTextEdit):
         super().__init__(parent)
         self.setReadOnly(True)
         self.setMinimumHeight(120)
-        self.setMaximumHeight(250)
         self.setStyleSheet(Styles.LOG_WIDGET)
     
     def append_log(self, message, level="INFO"):
@@ -197,6 +198,32 @@ class TrainingTab(QWidget):
         if file_path:
             self.config_path.setText(file_path)
     
+    def sync_config_path(self, path: str):
+        """Sincroniza la ruta de config desde la pestaña Configuración."""
+        if path:
+            self.config_path.setText(path)
+    
+    def _warn_if_config_unsaved(self) -> bool:
+        """
+        Advierte si la pestaña Config tiene cambios sin guardar.
+        Returns True si se puede continuar, False si el usuario cancela.
+        """
+        main = self.parent_window
+        if main is None or not hasattr(main, "config_tab"):
+            return True
+        if not main.config_tab.is_dirty():
+            return True
+        reply = QMessageBox.warning(
+            self,
+            "Configuración sin guardar",
+            "La pestaña Configuración tiene cambios que no se han guardado en disco.\n\n"
+            "El entrenamiento usará el archivo YAML en disco, no los valores editados en pantalla.\n\n"
+            "¿Desea continuar de todos modos?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return reply == QMessageBox.Yes
+    
     def browse_checkpoint(self):
         """Buscar checkpoint"""
         file_path, _ = QFileDialog.getOpenFileName(
@@ -218,6 +245,8 @@ class TrainingTab(QWidget):
     
     def _validate_inputs(self):
         """Valida inputs y retorna True si son válidos"""
+        if not self._warn_if_config_unsaved():
+            return False
         config_path = self.config_path.text()
         if not config_path or not Path(config_path).exists():
             QMessageBox.warning(self, "Error", "Archivo de configuración no válido")
@@ -257,163 +286,184 @@ class TrainingTab(QWidget):
     
     def _on_estimate_ready(self, estimate):
         """Callback cuando la estimación termina — muestra análisis pre-entrenamiento en output_area"""
-        self.estimate_btn.setEnabled(True)
-        self.progress_bar.setVisible(False)
-        
-        if not isinstance(estimate, dict):
-            self.status_label.setText("❌ Error en estimación")
-            self.parent_window.log_widget.append_log("Estimación no retornó datos válidos", "ERROR")
-            return
-        
-        # Store run_dir and enable training
-        self._run_dir = estimate.get('run_dir')
-        self._estimate_done = True
-        self.train_btn.setEnabled(True)
-        self.train_btn.setToolTip("")
-        
-        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        analysis = estimate.get('analysis', {})
-        charts = analysis.get('charts', {})
-        run_paths = analysis.get('run_paths', {})
-        
-        stats = analysis.get('stats', {})
-        train_stats = stats.get('train', {})
-        
-        sep = '<span style="color: #569cd6;">' + '═' * 60 + '</span><br>'
-        hdr = lambda t: f'<span style="color: #4ec9b0; font-size: 14px; font-weight: bold;">  {t}</span><br>'
-        lbl = lambda t: f'<span style="color: #dcdcaa;">{t}</span>'
-        val = lambda t: f'<span style="color: #d4d4d4;">{t}</span>'
-        dim = lambda t: f'<span style="color: #808080;">{t}</span>'
-        
-        html_parts = [
-            '<div style="font-family: Consolas, monospace; color: #d4d4d4; background: #1e1e1e; padding: 8px;">',
-        ]
-        
-        # === SECTION 1: Run info ===
-        html_parts += [
-            sep,
-            f'<span style="color: #4ec9b0; font-size: 16px; font-weight: bold;">  📋 ANÁLISIS PRE-ENTRENAMIENTO</span><br>',
-            sep,
-            dim(f'  [{ts}]') + '<br>',
-        ]
-        if run_paths:
-            html_parts.append(dim(f'  📁 {run_paths.get("run_dir", "N/A")}') + '<br>')
-        html_parts.append('<br>')
-        
-        # === SECTION 2: Model & Hyperparameters ===
-        html_parts += [
-            hdr('🧠 Modelo & Hiperparámetros'),
-            val(f'     Backbone:      <b>{estimate.get("model_backbone", "N/A")}</b>') + '<br>',
-            val(f'     Embedding dim: <b>{estimate.get("embedding_dim", "N/A")}</b>') + '<br>',
-            val(f'     Loss:          <b>{estimate.get("loss_type", "N/A")}</b>') + '<br>',
-            val(f'     Optimizer:     <b>{estimate.get("optimizer", "N/A")}</b>') + '<br>',
-            val(f'     Learning rate: <b>{estimate.get("learning_rate", "N/A")}</b>') + '<br>',
-            val(f'     Scheduler:     <b>{estimate.get("scheduler", "N/A")}</b>') + '<br>',
-            val(f'     Mixed prec:    <b>{"Sí" if estimate.get("use_amp") else "No"}</b>') + '<br>',
-            val(f'     Workers:       <b>{estimate.get("num_workers", "N/A")}</b>') + '<br>',
-            '<br>',
-        ]
-        
-        # === SECTION 3: Dataset summary ===
-        html_parts += [
-            hdr('📊 Dataset'),
-            val(f'     Train:      <b>{estimate["train_samples"]}</b> imágenes') + '<br>',
-            val(f'     Val:        <b>{estimate["val_samples"]}</b> imágenes') + '<br>',
-            val(f'     Clases:     <b>{estimate.get("num_classes", "N/A")}</b>') + '<br>',
-            val(f'     Batch size: <b>{estimate["batch_size"]}</b>') + '<br>',
-        ]
-        
-        # Image size stats
-        img_sizes = train_stats.get('image_sizes', {})
-        if img_sizes:
-            html_parts += [
-                '<br>' + lbl('     Tamaño de imágenes (muestreo):') + '<br>',
-                val(f'       Ancho:  min={img_sizes["width_min"]}  max={img_sizes["width_max"]}  media={img_sizes["width_mean"]}') + '<br>',
-                val(f'       Alto:   min={img_sizes["height_min"]}  max={img_sizes["height_max"]}  media={img_sizes["height_mean"]}') + '<br>',
-                val(f'       Aspect ratio medio: <b>{img_sizes["aspect_ratio_mean"]}</b>') + '<br>',
-                dim(f'       (muestreadas {img_sizes["sampled"]} imágenes)') + '<br>',
+        try:
+            if not isinstance(estimate, dict):
+                self.status_label.setText("Error en estimacion")
+                self.parent_window.log_widget.append_log("Estimacion no retorno datos validos", "ERROR")
+                return
+
+            self._run_dir = estimate.get('run_dir')
+            self._estimate_done = True
+            self.train_btn.setEnabled(True)
+            self.train_btn.setToolTip("")
+
+            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            analysis = estimate.get('analysis', {})
+            charts = analysis.get('charts', {})
+            run_paths = analysis.get('run_paths', {})
+
+            stats = analysis.get('stats', {})
+            train_stats = stats.get('train', {})
+
+            sep = '<span style="color: #569cd6;">' + '=' * 60 + '</span><br>'
+            hdr = lambda t: f'<span style="color: #4ec9b0; font-size: 14px; font-weight: bold;">  {t}</span><br>'
+            lbl = lambda t: f'<span style="color: #dcdcaa;">{t}</span>'
+            val = lambda t: f'<span style="color: #d4d4d4;">{t}</span>'
+            dim = lambda t: f'<span style="color: #808080;">{t}</span>'
+
+            html_parts = [
+                '<div style="font-family: Consolas, monospace; color: #d4d4d4; background: #1e1e1e; padding: 8px;">',
             ]
-        
-        # Per-class distribution table
-        class_dist = train_stats.get('class_distribution', {})
-        if class_dist:
-            html_parts.append('<br>' + lbl('     Distribución por clase:') + '<br>')
-            max_name_len = max(len(n) for n in class_dist.keys()) if class_dist else 10
-            for cls_name, count in class_dist.items():
-                pct = count / estimate["train_samples"] * 100 if estimate["train_samples"] > 0 else 0
-                bar_len = int(pct / 2)
-                bar = '█' * bar_len + '░' * (50 - bar_len)
-                html_parts.append(
-                    val(f'       {cls_name:<{max_name_len}}  {count:>5}  ({pct:5.1f}%)  ') +
-                    f'<span style="color: #4ec9b0;">{bar}</span><br>'
-                )
-            if train_stats.get('min_samples_per_class') is not None:
-                html_parts.append(dim(
-                    f'       Min: {train_stats["min_samples_per_class"]} | '
-                    f'Max: {train_stats["max_samples_per_class"]} | '
-                    f'Media: {train_stats["mean_samples_per_class"]} | '
-                    f'Std: {train_stats["std_samples_per_class"]}'
-                ) + '<br>')
-        html_parts.append('<br>')
-        
-        # === SECTION 4: Benchmark results ===
-        html_parts += [
-            hdr('⚡ Benchmark de Rendimiento'),
-            val(f'     Forward+Loss+Backward+Opt: <b>{estimate.get("avg_train_step_sec", 0):.3f}s</b>/batch') + '<br>',
-            val(f'     Data loading:              <b>{estimate.get("avg_data_load_sec", 0):.3f}s</b>/batch') + '<br>',
-            val(f'     Overhead factor:           <b>{estimate.get("data_overhead_factor", 1):.2f}x</b>') + '<br>',
-            val(f'     Validación:                <b>{estimate["avg_val_batch_sec"]:.3f}s</b>/batch') + '<br>',
-            '<br>',
-        ]
-        
-        # === SECTION 5: Time estimate ===
-        html_parts += [
-            hdr('⏱️ Estimación de Tiempo'),
-            val(f'     Entrenamiento: {estimate["train_batches_per_epoch"]} batches × '
-                f'{estimate["avg_train_batch_sec"]:.2f}s = <b>{estimate["train_epoch_fmt"]}</b>') + '<br>',
-            val(f'     Validación:    {estimate["val_batches_per_epoch"]} batches × '
-                f'{estimate["avg_val_batch_sec"]:.2f}s + recall = <b>{estimate["val_epoch_fmt"]}</b>') + '<br>',
-            val(f'     Ref. embeddings (una vez, post-training):  <b>{estimate.get("ref_embed_overhead_sec", 0):.0f}s</b>') + '<br>',
-            val(f'     Total época:   <b>{estimate["epoch_total_fmt"]}</b>') + '<br>',
-            '<br>',
-            f'<span style="color: #4ec9b0; font-size: 15px; font-weight: bold;">'
-            f'  🕐 TOTAL ESTIMADO: {estimate["epochs"]} épocas × '
-            f'{estimate["epoch_total_fmt"]} + ref_embed = {estimate["total_fmt"]}</span><br>',
-            '<br>', sep,
-        ]
-        
-        # === SECTION 6: Pre-training chart images ===
-        chart_titles = {
-            'class_distribution': '📊 Distribución de Clases',
-            'train_val_balance': '⚖️ Balance Train vs Validación',
-            'sample_grid': '🖼️ Muestras por Clase (Top 10)',
-            'augmentation_preview': '🔄 Vista Previa de Aumentación',
-        }
-        
-        for key, title in chart_titles.items():
-            img_path = charts.get(key)
-            if img_path and Path(img_path).exists():
-                abs_path = str(Path(img_path).resolve()).replace('\\', '/')
-                html_parts.append(f'<br>{hdr(title)}')
-                html_parts.append(f'<img src="file:///{abs_path}" width="750"><br>')
-        
-        html_parts.append('</div>')
-        
-        self.output_area.clear()
-        self.output_area.setHtml("".join(html_parts))
-        
-        # Scroll to top
-        cursor = self.output_area.textCursor()
-        cursor.movePosition(QTextCursor.Start)
-        self.output_area.setTextCursor(cursor)
-        
-        self.status_label.setText(f"✅ Análisis listo — Estimado: {estimate['total_fmt']} ({estimate['epochs']} épocas) — Listo para entrenar")
-        self.parent_window.log_widget.append_log(
-            f"Análisis pre-entrenamiento completado: {estimate['total_fmt']} total ({estimate['epochs']} épocas)", "SUCCESS"
-        )
-        self.parent_window.log_widget.append_log(
-            f"Carpeta de resultados: {self._run_dir}", "INFO"
-        )
+
+            html_parts += [
+                sep,
+                f'<span style="color: #4ec9b0; font-size: 16px; font-weight: bold;">  ANALISIS PRE-ENTRENAMIENTO</span><br>',
+                sep,
+                dim(f'  [{ts}]') + '<br>',
+            ]
+            if run_paths:
+                html_parts.append(dim(f'  Run: {run_paths.get("run_dir", "N/A")}') + '<br>')
+            html_parts.append('<br>')
+
+            html_parts += [
+                hdr('Modelo & Hiperparametros'),
+                val(f'     Backbone:      <b>{estimate.get("model_backbone", "N/A")}</b>') + '<br>',
+                val(f'     Embedding dim: <b>{estimate.get("embedding_dim", "N/A")}</b>') + '<br>',
+                val(f'     Loss:          <b>{estimate.get("loss_type", "N/A")}</b>') + '<br>',
+                val(f'     Optimizer:     <b>{estimate.get("optimizer", "N/A")}</b>') + '<br>',
+                val(f'     Learning rate: <b>{estimate.get("learning_rate", "N/A")}</b>') + '<br>',
+                val(f'     Scheduler:     <b>{estimate.get("scheduler", "N/A")}</b>') + '<br>',
+                val(f'     Mixed prec:    <b>{"Si" if estimate.get("use_amp") else "No"}</b>') + '<br>',
+                val(f'     Workers:       <b>{estimate.get("num_workers", "N/A")}</b>') + '<br>',
+                '<br>',
+            ]
+
+            html_parts += [
+                hdr('Dataset'),
+                val(f'     Train:      <b>{estimate.get("train_samples", "N/A")}</b> granos') + '<br>',
+                val(f'     Val:        <b>{estimate.get("val_samples", "N/A")}</b> granos') + '<br>',
+                val(f'     Clases:     <b>{estimate.get("num_classes", "N/A")}</b>') + '<br>',
+                val(f'     Batch size: <b>{estimate.get("batch_size", "N/A")}</b>') + '<br>',
+            ]
+
+            img_sizes = train_stats.get('image_sizes', {})
+            if img_sizes:
+                html_parts += [
+                    '<br>' + lbl('     Tamano de crops (muestreo):') + '<br>',
+                    val(
+                        f'       Ancho:  min={img_sizes.get("width_min", "?")}  '
+                        f'max={img_sizes.get("width_max", "?")}  '
+                        f'media={img_sizes.get("width_mean", "?")}'
+                    ) + '<br>',
+                    val(
+                        f'       Alto:   min={img_sizes.get("height_min", "?")}  '
+                        f'max={img_sizes.get("height_max", "?")}  '
+                        f'media={img_sizes.get("height_mean", "?")}'
+                    ) + '<br>',
+                ]
+                if img_sizes.get('aspect_ratio_mean') is not None:
+                    html_parts.append(
+                        val(f'       Aspect ratio medio: <b>{img_sizes["aspect_ratio_mean"]}</b>') + '<br>'
+                    )
+                if img_sizes.get('sampled') is not None:
+                    html_parts.append(dim(f'       (muestreadas {img_sizes["sampled"]} muestras)') + '<br>')
+
+            class_dist = train_stats.get('class_distribution', {})
+            if class_dist:
+                html_parts.append('<br>' + lbl('     Distribucion por clase:') + '<br>')
+                max_name_len = max(len(n) for n in class_dist.keys())
+                for cls_name, count in class_dist.items():
+                    train_n = estimate.get("train_samples") or 0
+                    pct = count / train_n * 100 if train_n > 0 else 0
+                    bar_len = min(50, int(pct / 2))
+                    bar = '#' * bar_len + '.' * (50 - bar_len)
+                    html_parts.append(
+                        val(f'       {cls_name:<{max_name_len}}  {count:>5}  ({pct:5.1f}%)  ') +
+                        f'<span style="color: #4ec9b0;">{bar}</span><br>'
+                    )
+                if train_stats.get('min_samples_per_class') is not None:
+                    html_parts.append(dim(
+                        f'       Min: {train_stats["min_samples_per_class"]} | '
+                        f'Max: {train_stats["max_samples_per_class"]} | '
+                        f'Media: {train_stats["mean_samples_per_class"]} | '
+                        f'Std: {train_stats["std_samples_per_class"]}'
+                    ) + '<br>')
+            html_parts.append('<br>')
+
+            html_parts += [
+                hdr('Benchmark de Rendimiento'),
+                val(f'     Forward+Loss+Backward+Opt: <b>{estimate.get("avg_train_step_sec", 0):.3f}s</b>/batch') + '<br>',
+                val(f'     Data loading:              <b>{estimate.get("avg_data_load_sec", 0):.3f}s</b>/batch') + '<br>',
+                val(f'     Overhead factor:           <b>{estimate.get("data_overhead_factor", 1):.2f}x</b>') + '<br>',
+                val(f'     Validacion:                <b>{estimate.get("avg_val_batch_sec", 0):.3f}s</b>/batch') + '<br>',
+                '<br>',
+            ]
+
+            html_parts += [
+                hdr('Estimacion de Tiempo'),
+                val(
+                    f'     Entrenamiento: {estimate.get("train_batches_per_epoch", 0)} batches x '
+                    f'{estimate.get("avg_train_batch_sec", 0):.2f}s = '
+                    f'<b>{estimate.get("train_epoch_fmt", "N/A")}</b>'
+                ) + '<br>',
+                val(
+                    f'     Validacion:    {estimate.get("val_batches_per_epoch", 0)} batches x '
+                    f'{estimate.get("avg_val_batch_sec", 0):.2f}s + recall = '
+                    f'<b>{estimate.get("val_epoch_fmt", "N/A")}</b>'
+                ) + '<br>',
+                val(
+                    f'     Ref. embeddings (una vez, post-training):  '
+                    f'<b>{estimate.get("ref_embed_overhead_sec", 0):.0f}s</b>'
+                ) + '<br>',
+                val(f'     Total epoca:   <b>{estimate.get("epoch_total_fmt", "N/A")}</b>') + '<br>',
+                '<br>',
+                f'<span style="color: #4ec9b0; font-size: 15px; font-weight: bold;">'
+                f'  TOTAL ESTIMADO: {estimate.get("epochs", "?")} epocas x '
+                f'{estimate.get("epoch_total_fmt", "N/A")} + ref_embed = '
+                f'{estimate.get("total_fmt", "N/A")}</span><br>',
+                '<br>', sep,
+            ]
+
+            chart_titles = {
+                'class_distribution': 'Distribucion de Clases',
+                'train_val_balance': 'Balance Train vs Validacion',
+                'sample_grid': 'Muestras por Clase (Top 10)',
+                'augmentation_preview': 'Vista Previa de Aumentacion',
+            }
+
+            for key, title in chart_titles.items():
+                img_path = charts.get(key)
+                if img_path and Path(img_path).exists():
+                    abs_path = Path(img_path).resolve().as_posix()
+                    html_parts.append(f'<br>{hdr(title)}')
+                    html_parts.append(f'<img src="file:///{abs_path}" width="750"><br>')
+
+            html_parts.append('</div>')
+
+            self.output_area.clear()
+            self.output_area.setHtml("".join(html_parts))
+
+            cursor = self.output_area.textCursor()
+            cursor.movePosition(QTextCursor.Start)
+            self.output_area.setTextCursor(cursor)
+
+            total_fmt = estimate.get('total_fmt', 'N/A')
+            epochs = estimate.get('epochs', '?')
+            self.status_label.setText(
+                f"Analisis listo - Estimado: {total_fmt} ({epochs} epocas) - Listo para entrenar"
+            )
+            self.parent_window.log_widget.append_log(
+                f"Analisis pre-entrenamiento completado: {total_fmt} total ({epochs} epocas)", "SUCCESS"
+            )
+            self.parent_window.log_widget.append_log(
+                f"Carpeta de resultados: {self._run_dir}", "INFO"
+            )
+        except Exception as e:
+            tb = traceback.format_exc()
+            self._on_estimate_error(f"{e}\n\nTraceback:\n{tb}")
+        finally:
+            self.estimate_btn.setEnabled(True)
+            self.progress_bar.setVisible(False)
     
     def start_training(self):
         """Inicia entrenamiento directamente en thread separado"""
@@ -505,7 +555,7 @@ class EvaluationTab(QWidget):
         layout = QVBoxLayout()
         
         # === Configuración ===
-        config_group = QGroupBox("Configuración de Evaluación")
+        config_group = QGroupBox("Post-Entrenamiento — regenera val y test (mismo pipeline que train.py)")
         config_layout = QFormLayout()
         
         # Checkpoint
@@ -518,21 +568,20 @@ class EvaluationTab(QWidget):
         checkpoint_layout.addWidget(checkpoint_browse)
         config_layout.addRow("Checkpoint:", checkpoint_layout)
         
-        # Output dir
+        # Output dir (Auto-detected from checkpoint)
         output_layout = QHBoxLayout()
-        self.output_path = QLineEdit("results/")
-        self.output_path.setPlaceholderText("Directorio de salida")
-        output_browse = QPushButton("📁 Buscar")
-        output_browse.clicked.connect(self.browse_output)
+        self.output_path = QLineEdit()
+        self.output_path.setPlaceholderText("Se detectará automáticamente desde el checkpoint")
+        self.output_path.setReadOnly(True)
+        self.output_path.setStyleSheet("background-color: #f0f0f0; color: #555;")
         output_layout.addWidget(self.output_path)
-        output_layout.addWidget(output_browse)
-        config_layout.addRow("Salida:", output_layout)
+        config_layout.addRow("Salida (Auto):", output_layout)
         
         config_group.setLayout(config_layout)
         layout.addWidget(config_group)
         
         # === Controles ===
-        self.evaluate_btn = QPushButton("📊 EVALUAR MODELO")
+        self.evaluate_btn = QPushButton("📊 REGENERAR RESULTADOS")
         self.evaluate_btn.setStyleSheet(Styles.BUTTON_PRIMARY)
         self.evaluate_btn.clicked.connect(self.run_evaluation)
         layout.addWidget(self.evaluate_btn)
@@ -557,16 +606,16 @@ class EvaluationTab(QWidget):
         )
         if file_path:
             self.checkpoint_path.setText(file_path)
-    
-    def browse_output(self):
-        dir_path = QFileDialog.getExistingDirectory(
-            self, "Seleccionar Directorio de Salida"
-        )
-        if dir_path:
-            self.output_path.setText(dir_path)
+            # Auto-detect run directory
+            from pathlib import Path
+            try:
+                run_dir = Path(file_path).parent.parent
+                self.output_path.setText(str(run_dir))
+            except Exception:
+                pass
     
     def run_evaluation(self):
-        """Ejecuta evaluacion completa con post-training analysis"""
+        """Regenera el pipeline post-entrenamiento completo (val + test, mismo que train.py)"""
         checkpoint = self.checkpoint_path.text()
         output_dir = self.output_path.text()
         
@@ -577,7 +626,7 @@ class EvaluationTab(QWidget):
         self.evaluate_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
-        self.status_label.setText("Evaluando modelo...")
+        self.status_label.setText("Regenerando resultados post-entrenamiento (val + test)...")
         self.status_label.setStyleSheet(Styles.LABEL_INFO if hasattr(Styles, 'LABEL_INFO') else "")
         
         self.parent_window.log_widget.append_log(f"Evaluacion: {checkpoint}", "INFO")
@@ -600,21 +649,21 @@ class EvaluationTab(QWidget):
         self.status_label.setStyleSheet(Styles.LABEL_SUCCESS)
         
         output_dir = self.output_path.text()
-        acc = result.get('accuracy', 0) if isinstance(result, dict) else 0
+        slice_acc = knn_acc = 0.0
+        if isinstance(result, dict):
+            slice_acc = result.get('slice_accuracy', result.get('accuracy', 0))
+            knn_acc = result.get('knn_accuracy', slice_acc)
         self.parent_window.log_widget.append_log(
-            f"Evaluacion finalizada — Accuracy: {acc:.1%}", "SUCCESS"
+            f"Evaluacion finalizada — Slice accuracy: {slice_acc:.1%} | kNN: {knn_acc:.1%}",
+            "SUCCESS",
         )
-        
+
         QMessageBox.information(
             self, "Evaluacion Completa",
             f"Resultados guardados en: {output_dir}\n\n"
-            f"Accuracy (kNN): {acc:.1%}\n\n"
-            f"Archivos generados:\n"
-            f"  - t-SNE 3D + 2D\n"
-            f"  - Confusion Matrix\n"
-            f"  - Distance Distribution\n"
-            f"  - Inference Preview (10 imgs)\n"
-            f"  - Evaluation Report (.md)"
+            f"Slice accuracy (principal): {slice_acc:.1%}\n"
+            f"kNN accuracy (secundaria): {knn_acc:.1%}\n\n"
+            f"Artefactos: val + test, slice_representatives.pt, Grad-CAM, informes espectrales"
         )
     
     def evaluation_error(self, error_msg):
@@ -702,6 +751,10 @@ class MainWindow(QMainWindow):
         
         self.tabs.currentChanged.connect(self._on_tab_changed)
         
+        # Sync Config → Training al guardar y al arranque
+        self.config_tab.configSaved.connect(self._on_config_saved)
+        self.training_tab.sync_config_path(self.config_tab.get_config_path_str())
+        
         splitter.addWidget(self.tabs)
         
         # === Log Widget ===
@@ -748,14 +801,61 @@ class MainWindow(QMainWindow):
         # Log inicial
         self.log_widget.append_log("Aplicación iniciada correctamente", "SUCCESS")
         self.logger.info("GUI iniciada")
+        self._run_startup_validation()
+    
+    def _run_startup_validation(self):
+        """Valida config.yaml al arranque y muestra estado del pipeline en status bar."""
+        from src.utils.config_validator import validate_config_file
+
+        path = self.config_tab.get_config_path_str()
+        result = validate_config_file(path)
+        summary = result.get("pipeline_summary", "")
+
+        if result["valid"]:
+            gpu_ok = not any("CUDA" in w for w in result["warnings"])
+            gpu_label = "GPU OK" if gpu_ok else "GPU N/A"
+            self._pipeline_status = f"Pipeline: {summary} | {gpu_label}"
+            self.status_bar.showMessage(self._pipeline_status)
+        else:
+            self._pipeline_status = ""
+            self.status_bar.showMessage(f"Config inválida: {result['errors'][0]}")
+            for err in result["errors"]:
+                self.log_widget.append_log(err, "ERROR")
+
+        for warn in result["warnings"]:
+            self.log_widget.append_log(warn, "WARNING")
+
+        if result["valid"]:
+            self.log_widget.append_log(f"Validación arranque OK — {summary}", "INFO")
     
     def log_widget_clear(self):
         """Limpia el widget de logs"""
         self.log_widget.clear()
         self.log_widget.append_log("Logs limpiados", "INFO")
     
+    def _on_config_saved(self, config_path: str):
+        """Propaga la ruta YAML guardada a la pestaña de entrenamiento."""
+        self.training_tab.sync_config_path(config_path)
+        self._run_startup_validation()
+        self.log_widget.append_log(
+            f"Config sincronizada con Entrenamiento: {config_path}", "INFO"
+        )
+    
     def _on_tab_changed(self, index):
         """Callback cuando se cambia de tab — actualiza header y registra"""
+        previous = getattr(self, "_previous_tab_index", 0)
+        self._previous_tab_index = index
+        
+        # Aviso al ir de Configuración → Entrenamiento con cambios sin guardar
+        if previous == 0 and index == 3 and self.config_tab.is_dirty():
+            QMessageBox.information(
+                self,
+                "Cambios sin guardar",
+                "La pestaña Configuración tiene cambios pendientes.\n\n"
+                "Guarde con 💾 Guardar antes de entrenar, o el YAML en disco "
+                "no reflejará las ediciones actuales.",
+            )
+        
         tab_titles = {
             0: "Configuracion del Sistema",
             1: "Gestion de Datasets",
@@ -767,7 +867,11 @@ class MainWindow(QMainWindow):
         tab_names = ["Configuracion", "Gestor de Datos", "Contornos", "Entrenamiento", "Inferencia", "Evaluacion"]
         if 0 <= index < len(tab_names):
             self.header.setText(f"MetricLearning  |  {tab_titles.get(index, '')}")
-            self.status_bar.showMessage(f"Tab: {tab_names[index]}")
+            pipeline = getattr(self, "_pipeline_status", "")
+            if pipeline:
+                self.status_bar.showMessage(f"{tab_names[index]} | {pipeline}")
+            else:
+                self.status_bar.showMessage(f"Tab: {tab_names[index]}")
             self.log_widget.append_log(f"Navegacion -> {tab_names[index]}", "DEBUG")
     
     def create_menu_bar(self):
@@ -797,13 +901,13 @@ class MainWindow(QMainWindow):
             "Acerca de MetricLearning",
             """
             <h2>MetricLearning v2.0</h2>
-            <p>Sistema de clasificación de imágenes usando Metric Learning.</p>
+            <p>Sistema de clasificación de granos con metric learning y slicing dimensional.</p>
             <p><b>Características:</b></p>
             <ul>
-                <li>Arquitectura ResNet50 + Projection Head</li>
-                <li>Multi-Similarity Loss</li>
-                <li>Clasificación k-NN</li>
-                <li>Interfaz gráfica profesional</li>
+                <li>Backbones ViT/CNN (DINOv2, ConvNeXt, etc.) + AnalogyNet</li>
+                <li>Sliced MS Loss (expansión espectral por subespacios)</li>
+                <li>Clasificación slice-aware + kNN de referencia</li>
+                <li>Post-entrenamiento: val + test, Grad-CAM, informe espectral</li>
             </ul>
             <p><b>Desarrollado con:</b> PyTorch, PyQt5</p>
             """
@@ -816,11 +920,8 @@ class MainWindow(QMainWindow):
             "Documentación",
             """
             <h3>Documentación disponible en:</h3>
-            <p>📁 <b>docs/README_ANALISIS.md</b></p>
-            <p>📁 <b>docs/NUEVA_ESTRUCTURA_PROYECTO.md</b></p>
+            <p>📁 <b>docs/2026-06-09_INFORME_MODIFICACIONES_PIPELINE_MULTI_SLICE.md</b> — informe unificado pipeline slice-aware</p>
             <p>📁 <b>README.md</b></p>
-            <br>
-            <p>Para más información, consulta los archivos de documentación en la carpeta docs/</p>
             """
         )
     

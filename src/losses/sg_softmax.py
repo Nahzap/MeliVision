@@ -63,16 +63,45 @@ class SGSoftmaxLoss(nn.Module):
         # Cosine similarity: (B, C)
         sim = embeddings @ proxies.t()
         
-        # Add angular margin to positive (target) classes
+        # 1. Corrección Matemática: ArcFace Angular Margin
+        # cos(theta + m) = cos(theta)cos(m) - sin(theta)sin(m)
+        import math
+        cos_m = math.cos(self.margin)
+        sin_m = math.sin(self.margin)
+        
+        # Calcular sin(theta) de forma segura
+        sin_theta = torch.sqrt(1.0 - torch.pow(sim, 2).clamp(0, 1) + 1e-6)
+        cos_theta_m = sim * cos_m - sin_theta * sin_m
+        
+        # Target fallback para evitar inestabilidad si theta + m > pi
+        threshold = math.cos(math.pi - self.margin)
+        cond = sim > threshold
+        cos_theta_m = torch.where(cond, cos_theta_m, sim - sin_m * self.margin)
+        
         one_hot = F.one_hot(labels, num_classes=self.num_classes).float()
-        sim_with_margin = sim - self.margin * one_hot
+        
+        # Aplicar margen angular solo a las clases positivas
+        sim_with_margin = torch.where(one_hot.bool(), cos_theta_m, sim)
         
         # Scale logits
         logits = self.scale * sim_with_margin
         
-        # Stop-gradient softmax: detach denominator
-        log_numerator = logits.gather(1, labels.unsqueeze(1)).squeeze(1)
-        log_denominator = torch.logsumexp(logits.detach(), dim=1)
+        # Correct SG-Softmax: Apply stop-gradient to the positive logit in the denominator
+        # to prevent gradients from penalizing the positive class in the logsumexp term.
+        pos_mask = one_hot.bool()
+        logits_sg = torch.where(pos_mask, logits.detach(), logits)
         
-        loss = -(log_numerator - log_denominator).mean()
+        log_numerator = logits.gather(1, labels.unsqueeze(1)).squeeze(1)
+        log_denominator = torch.logsumexp(logits_sg, dim=1)
+        
+        loss_ce = -(log_numerator - log_denominator).mean()
+        
+        # 2. Corrección Matemática: Penalización de Ortogonalidad en Proxies
+        # Penaliza fuertemente cualquier similitud proxy-proxy > 0 (es decir, ángulos < 90°)
+        proxy_sim = proxies @ proxies.t()
+        proxy_mask = ~torch.eye(self.num_classes, dtype=torch.bool, device=embeddings.device)
+        ortho_penalty = torch.relu(proxy_sim[proxy_mask]).mean()
+        
+        # Sumar la penalización para forzar activamente que los centroides se repelan a >90°
+        loss = loss_ce + self.scale * ortho_penalty
         return loss

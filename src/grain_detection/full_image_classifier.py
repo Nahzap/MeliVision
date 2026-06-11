@@ -5,7 +5,7 @@ Flujo:
     1. Detecta granos con PollenGrainDetector (U²-Net saliency)
     2. Recorta cada grano detectado
     3. Extrae embedding con AnalogyNet (modelo entrenado con metric learning)
-    4. Clasifica via k-NN contra base de referencia (centroides o embeddings)
+    4. Clasifica via slice-aware classifier o k-NN de referencia
     5. Genera visualización con bboxes, labels, y heatmap de confianza
 
 Uso:
@@ -38,7 +38,7 @@ class FullImageClassifier:
     Combina:
     - PollenGrainDetector (U²-Net) para localizar granos
     - AnalogyNet (metric learning) para extraer embeddings
-    - k-NN para clasificar cada grano contra la base de referencia
+    - Slice-aware classifier (primario) o k-NN contra embeddings de referencia
     """
 
     def __init__(
@@ -51,6 +51,8 @@ class FullImageClassifier:
         device: torch.device,
         grain_config: Optional[Dict] = None,
         k: int = 5,
+        metric_type: str = "cosine",
+        slice_classifier=None,
     ):
         """
         Args:
@@ -78,11 +80,14 @@ class FullImageClassifier:
             class_names=class_names,
             k=k,
             distance_threshold=dist_threshold,
+            metric_type=metric_type,
         )
+        self.slice_classifier = slice_classifier
         self.class_names = class_names
 
         # Detector de granos (lazy-loaded)
         self._grain_config = grain_config or {}
+        self.max_load_side = int(self._grain_config.get("max_load_side", 1536))
         self._detector = None
 
         # Parámetros de crop (deben coincidir con el entrenamiento)
@@ -90,9 +95,10 @@ class FullImageClassifier:
         self.crop_size = self._grain_config.get("crop_size", 256)
         self.use_mask = self._grain_config.get("use_mask", True)
 
+        mode = "slice-aware" if slice_classifier is not None else f"kNN (k={k})"
         logger.info(
             f"[FullImageClassifier] Inicializado — "
-            f"{len(class_names)} clases, k={k}, "
+            f"{len(class_names)} clases, {mode}, "
             f"{len(reference_embeddings)} embeddings de referencia"
         )
 
@@ -125,9 +131,11 @@ class FullImageClassifier:
         Returns:
             FullImageClassifier listo para usar
         """
-        from src.utils.config_utils import load_config, get_transforms_from_config
+        from src.utils.config_utils import load_config, get_transforms_from_config, resolve_run_config_path
         from src.utils.model_utils import load_model_from_checkpoint
+        from src.inference.slice_classifier import load_slice_classifier_from_run
 
+        config_path = resolve_run_config_path(checkpoint_path, config_path)
         config = load_config(config_path)
         device = torch.device(
             "cuda" if torch.cuda.is_available() and config.get("use_gpu", True)
@@ -148,8 +156,12 @@ class FullImageClassifier:
         reference_labels = ref_data["labels"]
         class_names = ref_data["class_names"]
 
-        # Config de detección de granos
         grain_config = config.get("grain_detection", {})
+
+        run_dir = Path(checkpoint_path).resolve().parent.parent
+        embed_dim = config.get("model", {}).get("embedding_dim", 128)
+        num_slices = config.get("training", {}).get("loss", {}).get("params", {}).get("num_slices", 4)
+        slice_classifier = load_slice_classifier_from_run(run_dir, device, embed_dim, num_slices)
 
         return cls(
             model=model,
@@ -160,6 +172,8 @@ class FullImageClassifier:
             device=device,
             grain_config=grain_config,
             k=k,
+            metric_type=config.get("loss", {}).get("metric", "cosine"),
+            slice_classifier=slice_classifier,
         )
 
     @staticmethod
@@ -187,15 +201,21 @@ class FullImageClassifier:
         for search_dir in search_dirs:
             ref_file = search_dir / "reference_embeddings.pt"
             cent_file = search_dir / "class_centroids.pt"
-            if ref_file.exists() and cent_file.exists():
+            slice_file = search_dir / "slice_representatives.pt"
+            if ref_file.exists() and (cent_file.exists() or slice_file.exists()):
                 ref_data = torch.load(ref_file, map_location="cpu", weights_only=False)
-                cent_data = torch.load(cent_file, map_location="cpu", weights_only=False)
+                if cent_file.exists():
+                    meta = torch.load(cent_file, map_location="cpu", weights_only=False)
+                    class_names = meta["class_names"]
+                else:
+                    slice_data = torch.load(slice_file, map_location="cpu", weights_only=False)
+                    class_names = slice_data["class_names"]
                 embs = ref_data["embeddings"].numpy() if torch.is_tensor(ref_data["embeddings"]) else ref_data["embeddings"]
                 labels = ref_data["labels"].numpy() if torch.is_tensor(ref_data["labels"]) else ref_data["labels"]
                 return {
                     "embeddings": embs,
                     "labels": labels,
-                    "class_names": cent_data["class_names"],
+                    "class_names": class_names,
                 }
 
         # 3. Intentar desde dentro del checkpoint
@@ -218,6 +238,37 @@ class FullImageClassifier:
             f"Buscado en: {reference_path}, {ckpt_dir}, y dentro del checkpoint.\n"
             f"Ejecuta post_training.py primero para generar reference_embeddings.pt"
         )
+
+    def _classify_embedding(self, emb_1d: np.ndarray) -> Dict[str, Any]:
+        """Classify one embedding: slice-aware if available, else kNN."""
+        if self.slice_classifier is not None:
+            emb_t = torch.tensor(emb_1d, dtype=torch.float32).unsqueeze(0)
+            preds, scores, class_scores = self.slice_classifier.predict(emb_t)
+            pred_idx = int(preds[0].item())
+            confidence = float(scores[0].item())
+            cs = class_scores[0].detach().cpu().numpy()
+            distribution = {
+                self.class_names[i]: float(cs[i]) for i in range(len(self.class_names))
+            }
+            return {
+                "predicted_class": self.class_names[pred_idx],
+                "predicted_label": pred_idx,
+                "confidence": confidence,
+                "mean_distance": 1.0 - confidence,
+                "class_distribution": distribution,
+            }
+
+        emb_2d = np.expand_dims(emb_1d, axis=0)
+        prediction = self.knn.predict(
+            emb_2d, return_distances=True, return_neighbors=False
+        )
+        return {
+            "predicted_class": prediction["predicted_class"],
+            "predicted_label": prediction["predicted_label"],
+            "confidence": prediction["confidence"],
+            "mean_distance": prediction["mean_distance"],
+            "class_distribution": self.knn.get_class_distribution(emb_2d),
+        }
 
     # =========================================================================
     # Pipeline principal
@@ -253,12 +304,51 @@ class FullImageClassifier:
         else:
             image = image_or_path
 
+        # 3.1 Explicit Grayscale detection
+        if len(image.shape) == 2:
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+            logger.info("[FullImage] Converted single-channel grayscale to BGR")
+        elif image.shape[2] == 3:
+            b, g, r = cv2.split(image)
+            if np.allclose(b, g, atol=3) and np.allclose(g, r, atol=3):
+                logger.info("[FullImage] Detected 3-channel grayscale input")
+                
+        # Reducir resolución SÓLO para detección (ahorra RAM/cálculo)
+        # Los crops se extraerán de la imagen en resolución original
+        orig_image = image
+        scale = 1.0
         h, w = image.shape[:2]
+        longest = max(h, w)
+        if self.max_load_side > 0 and longest > self.max_load_side:
+            scale = self.max_load_side / float(longest)
+            image = cv2.resize(
+                image,
+                (int(w * scale), int(h * scale)),
+                interpolation=cv2.INTER_AREA,
+            )
+            logger.info(f"[FullImage] Resized for detection from {h}x{w} to {image.shape[0]}x{image.shape[1]}")
 
         # 1. Detectar granos con U²-Net
         t1 = time.perf_counter()
         saliency_map, detected_grains = self.detector.detect(image)
         t_detect = (time.perf_counter() - t1) * 1000
+
+        # Escalar coordenadas detectadas de vuelta a la resolución original
+        if scale != 1.0:
+            orig_h, orig_w = orig_image.shape[:2]
+            for grain in detected_grains:
+                bx, by, bw, bh = grain.bbox
+                grain.bbox = (
+                    int(bx / scale),
+                    int(by / scale),
+                    max(1, int(bw / scale)),
+                    max(1, int(bh / scale))
+                )
+                if grain.contour is not None:
+                    grain.contour = (np.asarray(grain.contour, dtype=np.float32) / scale).astype(np.int32)
+            saliency_map = cv2.resize(saliency_map, (orig_w, orig_h))
+            image = orig_image  # Volver a usar la imagen original para extraer los crops
+            h, w = orig_h, orig_w
 
         logger.info(
             f"[FullImage] Detección: {len(detected_grains)} granos en {t_detect:.0f}ms"
@@ -280,21 +370,40 @@ class FullImageClassifier:
         t2 = time.perf_counter()
         grain_results = []
         tensor_list = []
+        mask_tensor_list = []
         crop_bgr_list = []
 
         # 2.1. Preparar lista de tensores
         for grain in detected_grains:
             crop_bgr = self._extract_crop(image, grain)
+            if crop_bgr is None:
+                continue
             if self.use_mask and grain.contour is not None:
-                crop_bgr, _ = self._apply_contour_mask(crop_bgr, image, grain)
+                crop_bgr, mask_crop = self._apply_contour_mask(crop_bgr, image, grain)
+                mask_float = torch.from_numpy(mask_crop.astype(np.float32) / 255.0)
+            else:
+                mask_float = torch.ones(self.crop_size, self.crop_size, dtype=torch.float32)
+                
+            mask_tensor_list.append(mask_float)
             crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-            crop_pil = Image.fromarray(crop_rgb)
 
+            # Ruta unificada: numpy directo a Albumentations (igual que entrenamiento)
             if self.transforms:
-                tensor = self.transforms(crop_pil)
+                mask_uint8 = (mask_float.numpy() * 255).astype(np.uint8) if self.use_mask else None
+                if mask_uint8 is not None and hasattr(self.transforms, 'apply_with_mask'):
+                    tensor, mask_t = self.transforms.apply_with_mask(crop_rgb, mask_uint8)
+                    mask_tensor_list[-1] = mask_t
+                elif mask_uint8 is not None and hasattr(self.transforms, '__call__'):
+                    tensor = self.transforms(crop_rgb, mask=mask_uint8)
+                    if isinstance(tensor, tuple):
+                        tensor, mask_t = tensor
+                        mask_tensor_list[-1] = mask_t
+                    # Si devuelve solo tensor, la máscara ya está en mask_tensor_list
+                else:
+                    tensor = self.transforms(crop_rgb)
             else:
                 from torchvision import transforms as T
-                tensor = T.ToTensor()(crop_pil)
+                tensor = T.ToTensor()(crop_rgb)
             
             tensor_list.append(tensor)
             if return_crops:
@@ -305,8 +414,9 @@ class FullImageClassifier:
         embeddings_list = []
         for i in range(0, len(tensor_list), batch_size):
             batch_chunk = torch.stack(tensor_list[i:i+batch_size]).to(self.device)
+            mask_chunk = torch.stack(mask_tensor_list[i:i+batch_size]).to(self.device)
             with torch.no_grad():
-                emb_chunk = self.model(batch_chunk).cpu().numpy()
+                emb_chunk = self.model(batch_chunk, mask=mask_chunk).cpu().numpy()
                 embeddings_list.append(emb_chunk)
         
         batch_embeddings = np.vstack(embeddings_list)
@@ -316,26 +426,23 @@ class FullImageClassifier:
             emb_1d = batch_embeddings[i]
             emb_2d = np.expand_dims(emb_1d, axis=0)
 
-            # Clasificar via k-NN
-            prediction = self.knn.predict(
-                emb_2d, return_distances=True, return_neighbors=False
-            )
-            distribution = self.knn.get_class_distribution(emb_2d)
+            pred_info = self._classify_embedding(emb_1d)
 
             result = {
                 "index": grain.index,
                 "bbox": grain.bbox,
                 "contour": grain.contour,
                 "saliency": grain.saliency_prob,
-                "predicted_class": prediction["predicted_class"],
-                "predicted_label": prediction["predicted_label"],
-                "confidence": prediction["confidence"],
-                "mean_distance": prediction["mean_distance"],
-                "class_distribution": distribution,
+                "predicted_class": pred_info["predicted_class"],
+                "predicted_label": pred_info["predicted_label"],
+                "confidence": pred_info["confidence"],
+                "mean_distance": pred_info["mean_distance"],
+                "class_distribution": pred_info["class_distribution"],
                 "embedding": emb_1d,
             }
             if return_crops:
                 result["crop"] = crop_bgr_list[i]
+                result["tensor"] = tensor_list[i]
 
             grain_results.append(result)
 
@@ -378,16 +485,27 @@ class FullImageClassifier:
 
         cx = bx + bw // 2
         cy = by + bh // 2
-        x1 = max(0, cx - side // 2)
-        y1 = max(0, cy - side // 2)
-        x2 = min(w_img, x1 + side)
-        y2 = min(h_img, y1 + side)
+        x1 = cx - side // 2
+        y1 = cy - side // 2
+        x2 = x1 + side
+        y2 = y1 + side
 
-        crop = image[y1:y2, x1:x2]
+        valid_x1 = max(0, x1)
+        valid_y1 = max(0, y1)
+        valid_x2 = min(w_img, x2)
+        valid_y2 = min(h_img, y2)
+
+        crop = image[valid_y1:valid_y2, valid_x1:valid_x2]
         if crop.size == 0:
-            crop = np.zeros((self.crop_size, self.crop_size, 3), dtype=np.uint8)
-        else:
-            crop = cv2.resize(crop, (self.crop_size, self.crop_size))
+            return None
+        
+        if x1 < 0 or y1 < 0 or x2 > w_img or y2 > h_img:
+            top = max(0, -y1)
+            bottom = max(0, y2 - h_img)
+            left = max(0, -x1)
+            right = max(0, x2 - w_img)
+            crop = cv2.copyMakeBorder(crop, top, bottom, left, right, cv2.BORDER_REFLECT_101)
+            
         return crop
 
     def _apply_contour_mask(
@@ -402,7 +520,7 @@ class FullImageClassifier:
         """
         contour = grain.contour
         if contour is None or len(contour) < 3:
-            full_mask = np.full((self.crop_size, self.crop_size), 255, dtype=np.uint8)
+            full_mask = np.full(crop.shape[:2], 255, dtype=np.uint8)
             return crop, full_mask
 
         h_img, w_img = image.shape[:2]
@@ -413,22 +531,30 @@ class FullImageClassifier:
 
         cx = bx + bw // 2
         cy = by + bh // 2
-        x1 = max(0, cx - side // 2)
-        y1 = max(0, cy - side // 2)
-        x2 = min(w_img, x1 + side)
-        y2 = min(h_img, y1 + side)
+        x1 = cx - side // 2
+        y1 = cy - side // 2
+        x2 = x1 + side
+        y2 = y1 + side
 
         # Crear máscara en coordenadas de imagen completa
         mask_full = np.zeros((h_img, w_img), dtype=np.uint8)
         pts = contour.reshape(-1, 1, 2).astype(np.int32)
         cv2.drawContours(mask_full, [pts], -1, 255, -1)
 
-        # Recortar y redimensionar la máscara igual que el crop
-        mask_crop = mask_full[y1:y2, x1:x2]
-        mask_crop = cv2.resize(
-            mask_crop, (self.crop_size, self.crop_size),
-            interpolation=cv2.INTER_NEAREST,
-        )
+        valid_x1 = max(0, x1)
+        valid_y1 = max(0, y1)
+        valid_x2 = min(w_img, x2)
+        valid_y2 = min(h_img, y2)
+
+        # Recortar la máscara igual que el crop (sin resize interpolado)
+        mask_crop = mask_full[valid_y1:valid_y2, valid_x1:valid_x2]
+
+        if x1 < 0 or y1 < 0 or x2 > w_img or y2 > h_img:
+            top = max(0, -y1)
+            bottom = max(0, y2 - h_img)
+            left = max(0, -x1)
+            right = max(0, x2 - w_img)
+            mask_crop = cv2.copyMakeBorder(mask_crop, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0)
 
         # Fondo gris neutro (consistente con training val: mask_bg_mode='gray')
         crop = crop.copy()

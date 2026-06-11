@@ -14,6 +14,7 @@ Author: MetricLearning Project
 Date: 2026-02-06
 """
 
+import shutil
 import torch
 import numpy as np
 import pandas as pd
@@ -26,6 +27,13 @@ import seaborn as sns
 from pathlib import Path
 from sklearn.manifold import TSNE
 from sklearn.metrics import confusion_matrix as sk_confusion_matrix
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    precision_score,
+    f1_score,
+    precision_recall_fscore_support
+)
 from sklearn.metrics.pairwise import euclidean_distances
 from sklearn.neighbors import KNeighborsClassifier
 from tqdm import tqdm
@@ -37,8 +45,420 @@ from PIL import Image
 # Análisis espectral (SOTA 2026)
 from src.visualization.embedding_analysis import EmbeddingSpaceAnalyzer
 from src.utils.unicode_utils import sanitize_for_ascii
+from src.visualization.save_utils import save_plot_with_data
+from src.inference.slice_classifier import (
+    SliceAwareClassifier,
+    SliceRepresentatives,
+    compute_slice_centroids_from_embeddings,
+    export_proxies_tensor_from_loss_state,
+    load_slice_classifier_from_run,
+    load_slice_representatives,
+    save_slice_representatives,
+)
 
 logger = logging.getLogger(__name__)
+
+# Paper-ready defaults for generated figures.
+# Journal requirement: minimum 600 dpi; preferred 1200 dpi.
+DEFAULT_FIG_DPI = 1200
+
+
+def _free_step_memory(stage: str) -> None:
+    """Release GPU/RAM between post-training steps to avoid OOM cascades."""
+    from src.data.dataloader_utils import free_training_memory
+    free_training_memory(stage)
+
+
+def _resolve_run_config_path(run_dir: Path) -> Path:
+    """Return the run-specific config path (config/config.yaml preferred)."""
+    nested = run_dir / "config" / "config.yaml"
+    if nested.exists():
+        return nested
+    flat = run_dir / "config.yaml"
+    if flat.exists():
+        return flat
+    return nested
+
+
+def _clear_prefix_artifacts(run_dir: Path, prefix: str) -> Path:
+    """Remove all post-training artifacts for a prefix before regenerating."""
+    run_dir = Path(run_dir)
+    post_dir = run_dir / "images" / "post_training" / prefix
+
+    if post_dir.exists():
+        shutil.rmtree(post_dir)
+        logger.info(f"Cleared post-training directory: {post_dir}")
+
+    post_dir.mkdir(parents=True, exist_ok=True)
+
+    for artifact in (
+        run_dir / f"evaluation_metrics_summary_{prefix}.json",
+        run_dir / f"training_report_{prefix}.md",
+    ):
+        if artifact.exists():
+            artifact.unlink()
+            logger.info(f"Removed: {artifact}")
+
+    if prefix == "val":
+        protocol = run_dir / "training_protocol.md"
+        if protocol.exists():
+            protocol.unlink()
+            logger.info(f"Removed: {protocol}")
+
+    return post_dir
+
+
+def create_eval_dataloaders(config: dict):
+    """Create val/test loaders using the same GrainDataEngine path as training."""
+    import copy
+    from src.data.data_engine import GrainDataEngine
+
+    eval_config = copy.deepcopy(config)
+    eval_config.setdefault("data", {})["pin_memory"] = False
+    engine = GrainDataEngine.from_config(eval_config)
+    return engine.val_loader, getattr(engine, "test_loader", None), engine
+
+
+def finalize_self_contained_checkpoint(run_dir: Path) -> None:
+    """Re-save best_model.pth with embedded reference embeddings and centroids."""
+    run_dir = Path(run_dir)
+    best_ckpt = run_dir / "checkpoints" / "best_model.pth"
+    ref_path = run_dir / "reference_embeddings.pt"
+    cent_path = run_dir / "class_centroids.pt"
+    config_path = _resolve_run_config_path(run_dir)
+
+    if not (best_ckpt.exists() and ref_path.exists() and cent_path.exists()):
+        logger.warning("Cannot finalize self-contained checkpoint — missing artifacts")
+        return
+
+    import yaml
+
+    best_data = torch.load(str(best_ckpt), map_location="cpu", weights_only=False)
+    ref_data = torch.load(str(ref_path), map_location="cpu", weights_only=False)
+    cent_data = torch.load(str(cent_path), map_location="cpu", weights_only=False)
+
+    config = {}
+    if config_path.exists():
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+
+    best_data["reference_embeddings"] = (
+        ref_data["embeddings"].numpy()
+        if torch.is_tensor(ref_data["embeddings"])
+        else ref_data["embeddings"]
+    )
+    best_data["reference_labels"] = (
+        ref_data["labels"].numpy()
+        if torch.is_tensor(ref_data["labels"])
+        else ref_data["labels"]
+    )
+    best_data["class_names"] = cent_data["class_names"]
+    best_data["centroids"] = cent_data["centroids"]
+    best_data["config"] = config
+
+    slice_path = run_dir / "slice_representatives.pt"
+    if slice_path.exists():
+        slice_data = torch.load(str(slice_path), map_location="cpu", weights_only=False)
+        best_data["slice_representatives"] = slice_data["representatives"]
+        best_data["slice_metadata"] = {
+            "num_slices": slice_data["num_slices"],
+            "slice_dim": slice_data["slice_dim"],
+            "mode": slice_data.get("mode", "slice_centroids"),
+            "loss_type": slice_data.get("loss_type", "sliced_ms"),
+        }
+    proxy_path = run_dir / "class_proxies.pt"
+    if proxy_path.exists():
+        proxy_data = torch.load(str(proxy_path), map_location="cpu", weights_only=False)
+        best_data["class_proxies"] = proxy_data["proxies"]
+
+    torch.save(best_data, str(best_ckpt))
+    logger.info(
+        f"Self-contained checkpoint saved: {best_ckpt} "
+        f"({len(best_data['class_names'])} classes, "
+        f"{len(best_data['reference_embeddings'])} ref embeddings)"
+    )
+
+
+def generate_pr_f1_epoch_curves(csv_path: str, output_dir: str):
+    """
+    Generate Precision-Recall trajectory and F1 curves across epochs.
+
+    Requires columns in training_metrics.csv:
+      - epoch
+      - precision_macro
+      - recall_at_1
+
+    F1 is computed explicitly from precision/recall:
+      F1 = 2 * (P * R) / (P + R)
+
+    Returns:
+        Dict with generated artifact paths (when available).
+    """
+    csv_path = Path(csv_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    artifacts = {}
+
+    if not csv_path.exists():
+        logger.warning(f"PR/F1 curves skipped: metrics CSV not found at {csv_path}")
+        return artifacts
+
+    df = pd.read_csv(csv_path)
+    if df.empty:
+        logger.warning("PR/F1 curves skipped: training_metrics.csv is empty")
+        return artifacts
+
+    required_cols = ['epoch', 'precision_macro', 'recall_at_1']
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        logger.warning(f"PR/F1 curves skipped: missing columns in CSV: {missing}")
+        return artifacts
+
+    # Ensure numeric plotting data even if CSV stores formatted strings
+    for col in required_cols:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    df = df.dropna(subset=['epoch', 'precision_macro', 'recall_at_1'])
+    if df.empty:
+        logger.warning("PR/F1 curves skipped: no valid numeric rows after parsing")
+        return artifacts
+
+    # Choose plotting precision source.
+    # Some historical runs have precision_macro frozen across epochs due metric mismatch.
+    precision_source = 'precision_macro'
+    precision_std = float(df['precision_macro'].std(ddof=0)) if len(df) > 1 else 0.0
+
+    # If native F1 columns exist, keep them for reference only (optional comparison).
+    if 'F1_macro' in df.columns:
+        df['F1_macro'] = pd.to_numeric(df['F1_macro'], errors='coerce')
+    if 'F1_weighted' in df.columns:
+        df['F1_weighted'] = pd.to_numeric(df['F1_weighted'], errors='coerce')
+
+    # Fallback: derive precision from (F1_macro, recall) when precision is effectively constant.
+    # Rearranged equation: P = (F1 * R) / (2R - F1)
+    if (
+        precision_std < 1e-9
+        and 'F1_macro' in df.columns
+        and df['F1_macro'].notna().sum() > 0
+        and float(df['F1_macro'].std(ddof=0)) > 1e-9
+    ):
+        denom_pr = 2.0 * df['recall_at_1'] - df['F1_macro']
+        derived_precision = np.where(
+            np.abs(denom_pr) > 1e-12,
+            (df['F1_macro'] * df['recall_at_1']) / denom_pr,
+            np.nan
+        )
+        valid = np.isfinite(derived_precision) & (derived_precision >= 0.0) & (derived_precision <= 1.0)
+        if np.any(valid):
+            df['precision_from_f1_recall'] = np.where(valid, derived_precision, np.nan)
+            precision_source = 'precision_from_f1_recall'
+            logger.warning(
+                "precision_macro is constant across epochs; using precision reconstructed "
+                "from (F1_macro, recall_at_1) for PR trajectory plotting."
+            )
+
+    precision_for_plot = df[precision_source]
+
+    # Compute F1 directly from the equation attached by the user:
+    # F1 = 2 * (P * R) / (P + R)
+    denom = precision_for_plot + df['recall_at_1']
+    df['f1_from_pr'] = np.where(denom > 0, 2.0 * (precision_for_plot * df['recall_at_1']) / denom, 0.0)
+
+    if 'F1_macro' in df.columns:
+        df['delta_f1_macro_vs_formula'] = (df['F1_macro'] - df['f1_from_pr']).abs()
+
+    # --- Precision vs Recall trajectory by epoch with F1(iso) ---
+    fig, ax = plt.subplots(figsize=(10, 7))
+    scatter = ax.scatter(
+        df['recall_at_1'],
+        precision_for_plot,
+        c=df['epoch'],
+        cmap='viridis',
+        s=60,
+        alpha=0.9,
+        edgecolors='black',
+        linewidths=0.3
+    )
+    ax.plot(
+        df['recall_at_1'],
+        precision_for_plot,
+        linestyle='--',
+        linewidth=1.2,
+        color='#666',
+        alpha=0.7
+    )
+
+    # Annotate first/last for readability without cluttering every point
+    first = df.iloc[0]
+    last = df.iloc[-1]
+    ax.annotate(
+        f"E{int(first['epoch'])}",
+        (first['recall_at_1'], first[precision_source]),
+        textcoords='offset points',
+        xytext=(6, 6),
+        fontsize=9,
+        fontweight='bold',
+        color='#1f77b4'
+    )
+    ax.annotate(
+        f"E{int(last['epoch'])}",
+        (last['recall_at_1'], last[precision_source]),
+        textcoords='offset points',
+        xytext=(6, -12),
+        fontsize=9,
+        fontweight='bold',
+        color='#d62728'
+    )
+
+    # Draw iso-F1 helper curves to visualize formula behavior on PR plane.
+    r_vals = np.linspace(0.01, 1.0, 500)
+    for f1_level in [0.70, 0.80, 0.90, 0.95]:
+        # From F1 = 2PR/(P+R) => P = (F1 * R) / (2R - F1)
+        denom_iso = (2 * r_vals - f1_level)
+        p_vals = np.where(denom_iso > 0, (f1_level * r_vals) / denom_iso, np.nan)
+        valid = (p_vals >= 0) & (p_vals <= 1)
+        if np.any(valid):
+            ax.plot(
+                r_vals[valid],
+                p_vals[valid],
+                linestyle=':',
+                linewidth=1.0,
+                color='#999',
+                alpha=0.7
+            )
+            ax.text(
+                r_vals[valid][-1] - 0.03,
+                p_vals[valid][-1] - 0.01,
+                f'F1={f1_level:.2f}',
+                fontsize=8,
+                color='#666'
+            )
+
+    cbar = plt.colorbar(scatter, ax=ax)
+    cbar.set_label('Epoch', fontsize=11)
+    # Auto-zoom axes to the effective data region for better readability.
+    x_min = float(df['recall_at_1'].min())
+    x_max = float(df['recall_at_1'].max())
+    y_min = float(precision_for_plot.min())
+    y_max = float(precision_for_plot.max())
+
+    x_span = max(x_max - x_min, 1e-6)
+    y_span = max(y_max - y_min, 1e-6)
+    x_pad = max(0.005, x_span * 0.20)
+    y_pad = max(0.005, y_span * 0.20)
+
+    x_lo = max(0.0, x_min - x_pad)
+    x_hi = min(1.0, x_max + x_pad)
+    y_lo = max(0.0, y_min - y_pad)
+    y_hi = min(1.0, y_max + y_pad)
+
+    # Handle near-constant edge case where limits collapse.
+    if x_hi - x_lo < 0.01:
+        center_x = (x_hi + x_lo) / 2.0
+        x_lo = max(0.0, center_x - 0.01)
+        x_hi = min(1.0, center_x + 0.01)
+    if y_hi - y_lo < 0.01:
+        center_y = (y_hi + y_lo) / 2.0
+        y_lo = max(0.0, center_y - 0.01)
+        y_hi = min(1.0, center_y + 0.01)
+
+    ax.set_xlabel('Recall@1', fontsize=12)
+    ylabel_suffix = ' (reconstructed)' if precision_source == 'precision_from_f1_recall' else ''
+    ax.set_ylabel(f'Precision Macro{ylabel_suffix}', fontsize=12)
+    ax.set_title('Precision vs Recall by Epoch (with iso-F1 lines)', fontsize=14, fontweight='bold')
+    ax.set_xlim(x_lo, x_hi)
+    ax.set_ylim(y_lo, y_hi)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    pr_path = output_dir / 'precision_recall_by_epoch.png'
+    # Avoid bbox expansion issues with dense annotations when zooming.
+    save_plot_with_data(pr_path, df[['epoch', 'recall_at_1', precision_source]], dpi=DEFAULT_FIG_DPI)
+    plt.close()
+    logger.info(f"PR trajectory saved: {pr_path}")
+    artifacts['precision_recall_by_epoch'] = str(pr_path)
+
+    # --- F1 curves over epochs (formula-based) ---
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.plot(
+        df['epoch'],
+        df['f1_from_pr'],
+        'o-',
+        color='#4ec9b0',
+        linewidth=2,
+        markersize=4,
+        label='F1 from Precision/Recall'
+    )
+    if 'F1_macro' in df.columns and df['F1_macro'].notna().any():
+        ax.plot(
+            df['epoch'],
+            df['F1_macro'],
+            's--',
+            color='#569cd6',
+            linewidth=1.5,
+            markersize=3,
+            alpha=0.85,
+            label='F1 Macro (logged)'
+        )
+    if 'F1_weighted' in df.columns and df['F1_weighted'].notna().any():
+        ax.plot(
+            df['epoch'],
+            df['F1_weighted'],
+            'd--',
+            color='#c586c0',
+            linewidth=1.5,
+            markersize=3,
+            alpha=0.85,
+            label='F1 Weighted (logged)'
+        )
+    ax.set_xlabel('Epoch', fontsize=12)
+    ax.set_ylabel('F1 Score', fontsize=12)
+    ax.set_title('F1 Across Epochs (computed from Precision & Recall)', fontsize=14, fontweight='bold')
+    ax.set_ylim(0, 1.05)
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=11)
+    plt.tight_layout()
+    f1_path = output_dir / 'f1_curves_by_epoch.png'
+    cols_to_save = ['epoch', 'f1_from_pr']
+    if 'F1_macro' in df.columns: cols_to_save.append('F1_macro')
+    if 'F1_weighted' in df.columns: cols_to_save.append('F1_weighted')
+    save_plot_with_data(f1_path, df[cols_to_save], dpi=DEFAULT_FIG_DPI, bbox_inches='tight')
+    plt.close()
+    logger.info(f"F1 curves saved: {f1_path}")
+    artifacts['f1_curves_by_epoch'] = str(f1_path)
+
+    # --- Export equation-based values to TXT for auditability ---
+    txt_path = output_dir / 'f1_from_precision_recall_by_epoch.txt'
+    with open(txt_path, 'w', encoding='utf-8') as f:
+        f.write("F1 computed from Precision and Recall per epoch\n")
+        f.write("Formula: F1 = 2 * (precision * recall) / (precision + recall)\n\n")
+        f.write(f"precision_source_for_plot: {precision_source}\n")
+        f.write(f"precision_macro_std: {precision_std:.12f}\n")
+        f.write("epoch\tprecision_used\trecall_at_1\tf1_from_pr")
+        if 'F1_macro' in df.columns:
+            f.write("\tF1_macro_logged\tabs_delta")
+        if 'precision_from_f1_recall' in df.columns:
+            f.write("\tprecision_macro_logged\tprecision_from_f1_recall")
+        f.write("\n")
+        for _, row in df.iterrows():
+            line = (
+                f"{int(row['epoch'])}\t"
+                f"{float(row[precision_source]):.6f}\t"
+                f"{row['recall_at_1']:.6f}\t"
+                f"{row['f1_from_pr']:.6f}"
+            )
+            if 'F1_macro' in df.columns and pd.notna(row.get('F1_macro')):
+                delta = abs(float(row['F1_macro']) - float(row['f1_from_pr']))
+                line += f"\t{float(row['F1_macro']):.6f}\t{delta:.6f}"
+            if 'precision_from_f1_recall' in df.columns and pd.notna(row.get('precision_from_f1_recall')):
+                line += (
+                    f"\t{float(row['precision_macro']):.6f}"
+                    f"\t{float(row['precision_from_f1_recall']):.6f}"
+                )
+            line += "\n"
+            f.write(line)
+    logger.info(f"F1 equation audit file saved: {txt_path}")
+    artifacts['f1_from_precision_recall_txt'] = str(txt_path)
+
+    return artifacts
 
 
 def extract_embeddings(model, dataloader, device):
@@ -75,6 +495,10 @@ def plot_training_curves(csv_path: str, output_dir: str):
     df = pd.read_csv(csv_path)
     output_dir = Path(output_dir)
 
+    # Determine whether training stopped before configured max epoch.
+    final_epoch = int(df['epoch'].iloc[-1]) if not df.empty else 0
+    max_epoch_seen = int(df['epoch'].max()) if not df.empty else final_epoch
+
     # --- Loss Curves ---
     fig, ax = plt.subplots(figsize=(12, 6))
     ax.plot(df['epoch'], df['train_loss'], 'b-o', markersize=4, label='Train Loss', linewidth=2)
@@ -85,6 +509,14 @@ def plot_training_curves(csv_path: str, output_dir: str):
     if not best_rows.empty:
         last_best = best_rows.iloc[-1]
         ax.axvline(x=last_best['epoch'], color='green', linestyle='--', alpha=0.5, label=f"Best (epoch {int(last_best['epoch'])})")
+        if int(last_best['epoch']) < max_epoch_seen:
+            ax.axvline(
+                x=final_epoch,
+                color='orange',
+                linestyle=':',
+                alpha=0.7,
+                label=f"Stop (epoch {final_epoch})"
+            )
 
     ax.set_xlabel('Epoch', fontsize=12)
     ax.set_ylabel('Loss', fontsize=12)
@@ -92,7 +524,7 @@ def plot_training_curves(csv_path: str, output_dir: str):
     ax.legend(fontsize=11)
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig(output_dir / 'loss_curves.png', dpi=150, bbox_inches='tight')
+    save_plot_with_data(output_dir / 'loss_curves.png', df[['epoch', 'train_loss', 'val_loss']], dpi=DEFAULT_FIG_DPI, bbox_inches='tight')
     plt.close()
     logger.info(f"Loss curves saved: {output_dir / 'loss_curves.png'}")
 
@@ -109,9 +541,34 @@ def plot_training_curves(csv_path: str, output_dir: str):
     ax.grid(True, alpha=0.3)
     ax.set_ylim(0, 1.05)
     plt.tight_layout()
-    plt.savefig(output_dir / 'recall_curves.png', dpi=150, bbox_inches='tight')
+    save_plot_with_data(output_dir / 'recall_curves.png', df[['epoch', 'recall_at_1', 'recall_at_5', 'best_recall_at_1']], dpi=DEFAULT_FIG_DPI, bbox_inches='tight')
     plt.close()
     logger.info(f"Recall curves saved: {output_dir / 'recall_curves.png'}")
+
+    # --- SOTA validation metrics (retrieval + clustering) ---
+    sota_cols = [
+        ('recall_at_1', 'Recall@1', 'g'),
+        ('recall_at_5', 'Recall@5', 'm'),
+        ('mAP@R', 'mAP@R', 'b'),
+        ('NMI', 'NMI', 'c'),
+        ('F1_macro', 'F1-macro', 'r'),
+    ]
+    present = [(col, label, color) for col, label, color in sota_cols if col in df.columns]
+    if present:
+        fig, ax = plt.subplots(figsize=(12, 6))
+        for col, label, color in present:
+            ax.plot(df['epoch'], df[col], f'{color}-o', markersize=4, label=label, linewidth=2)
+        ax.set_xlabel('Epoch', fontsize=12)
+        ax.set_ylabel('Score', fontsize=12)
+        ax.set_title('Validation Metrics (retrieval + clustering)', fontsize=16, fontweight='bold')
+        ax.legend(fontsize=11)
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim(0, 1.05)
+        plt.tight_layout()
+        metrics_cols = [col for col, _, _ in present]
+        save_plot_with_data(output_dir / 'validation_metrics.png', df[['epoch'] + metrics_cols], dpi=DEFAULT_FIG_DPI, bbox_inches='tight')
+        plt.close()
+        logger.info(f"Validation metrics curve saved: {output_dir / 'validation_metrics.png'}")
 
     # --- Learning Rate Curve ---
     fig, ax = plt.subplots(figsize=(12, 4))
@@ -122,7 +579,7 @@ def plot_training_curves(csv_path: str, output_dir: str):
     ax.set_yscale('log')
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig(output_dir / 'lr_curve.png', dpi=150, bbox_inches='tight')
+    save_plot_with_data(output_dir / 'lr_curve.png', df[['epoch', 'learning_rate']], dpi=DEFAULT_FIG_DPI, bbox_inches='tight')
     plt.close()
     logger.info(f"LR curve saved: {output_dir / 'lr_curve.png'}")
 
@@ -134,26 +591,40 @@ def plot_training_curves(csv_path: str, output_dir: str):
     ax.set_title('Epoch Duration', fontsize=14, fontweight='bold')
     ax.grid(True, alpha=0.3, axis='y')
     plt.tight_layout()
-    plt.savefig(output_dir / 'epoch_times.png', dpi=150, bbox_inches='tight')
+    save_plot_with_data(output_dir / 'epoch_times.png', df[['epoch', 'epoch_time_sec']], dpi=DEFAULT_FIG_DPI, bbox_inches='tight')
     plt.close()
     logger.info(f"Epoch times saved: {output_dir / 'epoch_times.png'}")
 
     return df
 
 
-def plot_tsne_3d(model, dataloader, device, output_path, class_names, perplexity=30):
-    """Generate 3D t-SNE embedding visualization with embedding space metadata."""
+def plot_tsne_3d(embeddings, labels, output_path, class_names, max_samples=3000):
+    """Generate and save a 3D t-SNE plot and a 2D t-SNE plot of the embeddings."""
     logger.info("Generating 3D t-SNE visualization...")
+    
+    # --- Subsampling for TSNE performance (O(N^2) complexity) ---
+    max_tsne_samples = 3000
+    if len(embeddings) > max_tsne_samples:
+        logger.info(f"Subsampling TSNE from {len(embeddings)} to {max_tsne_samples} points to speed up calculations...")
+        np.random.seed(42)
+        indices = np.random.choice(len(embeddings), max_tsne_samples, replace=False)
+        tsne_embeddings = embeddings[indices]
+        tsne_labels = labels[indices]
+    else:
+        tsne_embeddings = embeddings
+        tsne_labels = labels
 
-    embeddings, labels = extract_embeddings(model, dataloader, device)
     embed_dim = embeddings.shape[1]
     n_samples = embeddings.shape[0]
     norms = np.linalg.norm(embeddings, axis=1)
     logger.info(f"Embeddings shape: {embeddings.shape}, norms: mean={norms.mean():.4f} std={norms.std():.4f}")
 
+    # Determine safe perplexity (must be < n_samples)
+    perplexity = min(30, max(5, len(tsne_embeddings) // 3))
+
     # Run t-SNE with 3 components
-    tsne = TSNE(n_components=3, perplexity=perplexity, max_iter=1000, random_state=42, n_jobs=-1)
-    emb_3d = tsne.fit_transform(embeddings)
+    tsne = TSNE(n_components=3, perplexity=perplexity, init='pca', max_iter=1000, random_state=42, n_jobs=-1)
+    emb_3d = tsne.fit_transform(tsne_embeddings)
 
     # Color palette
     n_classes = len(class_names)
@@ -167,7 +638,7 @@ def plot_tsne_3d(model, dataloader, device, output_path, class_names, perplexity
     for idx, (elev, azim) in enumerate(angles):
         ax = fig.add_subplot(2, 2, idx + 1, projection='3d')
         for class_id, class_name in enumerate(class_names):
-            mask = labels == class_id
+            mask = tsne_labels == class_id
             ax.scatter(
                 emb_3d[mask, 0], emb_3d[mask, 1], emb_3d[mask, 2],
                 c=[colors[class_id]], label=class_name, alpha=0.6, s=15
@@ -187,17 +658,24 @@ def plot_tsne_3d(model, dataloader, device, output_path, class_names, perplexity
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    df_3d = pd.DataFrame({
+        'tsne_3d_dim1': emb_3d[:, 0],
+        'tsne_3d_dim2': emb_3d[:, 1],
+        'tsne_3d_dim3': emb_3d[:, 2],
+        'label_id': tsne_labels,
+        'label_name': [class_names[l] for l in tsne_labels]
+    })
+    save_plot_with_data(output_path, df_3d, dpi=DEFAULT_FIG_DPI, bbox_inches='tight')
     plt.close()
     logger.info(f"3D t-SNE saved: {output_path}")
 
     # Also save 2D t-SNE
-    tsne_2d = TSNE(n_components=2, perplexity=perplexity, max_iter=1000, random_state=42, n_jobs=-1)
-    emb_2d = tsne_2d.fit_transform(embeddings)
+    tsne_2d = TSNE(n_components=2, perplexity=perplexity, init='pca', max_iter=1000, random_state=42, n_jobs=-1)
+    emb_2d = tsne_2d.fit_transform(tsne_embeddings)
 
     fig, axes = plt.subplots(1, 2, figsize=(20, 8))
     for class_id, class_name in enumerate(class_names):
-        mask = labels == class_id
+        mask = tsne_labels == class_id
         axes[0].scatter(emb_2d[mask, 0], emb_2d[mask, 1], c=[colors[class_id]],
                         label=class_name, alpha=0.6, s=20)
     axes[0].set_title(
@@ -209,11 +687,20 @@ def plot_tsne_3d(model, dataloader, device, output_path, class_names, perplexity
 
     # Density plot
     from scipy.stats import gaussian_kde
-    xy = np.vstack([emb_2d[:, 0], emb_2d[:, 1]])
+    # Cap KDE samples at 3000 to prevent infinite hanging
+    kde_emb = emb_2d[:3000]
+    xy = np.vstack([kde_emb[:, 0], kde_emb[:, 1]])
     z = gaussian_kde(xy)(xy)
-    scatter = axes[1].scatter(emb_2d[:, 0], emb_2d[:, 1], c=z, s=20, cmap='viridis', alpha=0.6)
+    
+    # Plot KDE points (only the sampled ones to match z)
+    scatter = axes[1].scatter(kde_emb[:, 0], kde_emb[:, 1], c=z, s=20, cmap='viridis', alpha=0.6)
+    
+    # Plot remaining points in light gray if any
+    if len(emb_2d) > 3000:
+        axes[1].scatter(emb_2d[3000:, 0], emb_2d[3000:, 1], c='gray', s=10, alpha=0.1)
+        
     axes[1].set_title(
-        f'S^{embed_dim} -> t-SNE 2D Densidad ({n_samples} muestras)',
+        f'S^{embed_dim} -> t-SNE 2D Densidad (KDE max 3000 pts)',
         fontsize=14, fontweight='bold'
     )
     plt.colorbar(scatter, ax=axes[1], label='Density')
@@ -221,11 +708,16 @@ def plot_tsne_3d(model, dataloader, device, output_path, class_names, perplexity
 
     plt.tight_layout()
     tsne_2d_path = output_path.parent / 'tsne_2d.png'
-    plt.savefig(tsne_2d_path, dpi=150, bbox_inches='tight')
+    df_2d = pd.DataFrame({
+        'tsne_2d_dim1': emb_2d[:, 0],
+        'tsne_2d_dim2': emb_2d[:, 1],
+        'label_id': tsne_labels,
+        'label_name': [class_names[l] for l in tsne_labels],
+        'density': np.pad(z, (0, len(emb_2d) - len(z)), constant_values=0)
+    })
+    save_plot_with_data(tsne_2d_path, df_2d, dpi=DEFAULT_FIG_DPI, bbox_inches='tight')
     plt.close()
     logger.info(f"2D t-SNE saved: {tsne_2d_path}")
-
-    return embeddings, labels
 
 
 def plot_embedding_space_analysis(embeddings, labels, class_names, output_path):
@@ -365,7 +857,35 @@ def plot_embedding_space_analysis(embeddings, labels, class_names, output_path):
     plt.tight_layout(rect=[0, 0, 1, 0.94])
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+
+    # -- NEW CODE TO EXPORT ALL 4 GRAPHS TO SEPARATE CSVs --
+    base_dir = output_path.parent
+    base_name = output_path.stem
+
+    # Panel 1: Norms or Cosine Distances
+    if norm_range < 1e-6:
+        pd.DataFrame({'cosine_distance': cos_dist_vals}).to_csv(base_dir / f"{base_name}_panel1_cos_dist.csv", index=False)
+    else:
+        pd.DataFrame({'norm': norms}).to_csv(base_dir / f"{base_name}_panel1_norms.csv", index=False)
+
+    # Panel 2: Cosine Similarity Matrix
+    pd.DataFrame(cos_sim, index=class_names, columns=class_names).to_csv(base_dir / f"{base_name}_panel2_cossim.csv")
+
+    # Panel 3: Compactness (already present in analysis_data, but good to have explicit)
+    pd.DataFrame({
+        'class_name': class_names,
+        'compactness': compactness
+    }).to_csv(base_dir / f"{base_name}_panel3_compactness.csv", index=False)
+
+    # Panel 4: Angular Separation Matrix
+    pd.DataFrame(angular_dist, index=class_names, columns=class_names).to_csv(base_dir / f"{base_name}_panel4_angular.csv")
+    # -----------------------------------------------------
+
+    analysis_data = pd.DataFrame({
+        'class_name': class_names,
+        'compactness': compactness,
+    })
+    save_plot_with_data(output_path, analysis_data, dpi=DEFAULT_FIG_DPI, bbox_inches='tight')
     plt.close()
     logger.info(f"Embedding space analysis saved: {output_path}")
 
@@ -381,24 +901,145 @@ def plot_embedding_space_analysis(embeddings, labels, class_names, output_path):
     }
 
 
+def compute_slice_predictions(embeddings, slice_classifier: SliceAwareClassifier):
+    """Classify numpy embeddings with slice-aware classifier."""
+    device = slice_classifier.reps.representatives.device
+    emb_t = torch.tensor(embeddings, dtype=torch.float32, device=device)
+    preds, _, _ = slice_classifier.predict(emb_t)
+    return preds.cpu().numpy()
+
+
+def compute_knn_predictions(embeddings, labels, n_classes, k=1):
+    """Compute leave-one-out k-NN predictions in embedding space."""
+    dists = euclidean_distances(embeddings)
+    np.fill_diagonal(dists, np.inf)
+    predictions = []
+    for i in range(len(labels)):
+        nearest_idx = np.argsort(dists[i])[:k]
+        nearest_labels = labels[nearest_idx]
+        pred = np.bincount(nearest_labels, minlength=n_classes).argmax()
+        predictions.append(pred)
+    return np.array(predictions)
+
+
+def compute_standard_metrics_from_predictions(labels, predictions, class_names):
+    """Compute standard classification metrics from y_true/y_pred."""
+    precision, recall, f1, support = precision_recall_fscore_support(
+        labels, predictions, labels=list(range(len(class_names))), zero_division=0
+    )
+    per_class_df = pd.DataFrame({
+        'class': class_names,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'support': support
+    })
+    summary = {
+        'accuracy': float(accuracy_score(labels, predictions)),
+        'balanced_accuracy': float(balanced_accuracy_score(labels, predictions)),
+        'precision_macro': float(precision_score(labels, predictions, average='macro', zero_division=0)),
+        'precision_weighted': float(precision_score(labels, predictions, average='weighted', zero_division=0)),
+        'f1_macro': float(f1_score(labels, predictions, average='macro', zero_division=0)),
+        'f1_weighted': float(f1_score(labels, predictions, average='weighted', zero_division=0)),
+    }
+    return summary, per_class_df
+
+
+def plot_per_class_f1(per_class_df, output_path):
+    """Generate F1-by-class horizontal bar chart."""
+    fig, ax = plt.subplots(figsize=(10, 6))
+    sorted_df = per_class_df.sort_values('f1', ascending=True)
+    bars = ax.barh(sorted_df['class'], sorted_df['f1'], color='#4ec9b0', edgecolor='#333', linewidth=0.6)
+    ax.set_xlim(0, 1.05)
+    ax.set_xlabel('F1-score', fontsize=12)
+    ax.set_title('F1-score por Clase (k-NN leave-one-out)', fontsize=14, fontweight='bold')
+    ax.grid(axis='x', alpha=0.3)
+    for bar, value in zip(bars, sorted_df['f1']):
+        ax.text(min(value + 0.01, 1.02), bar.get_y() + bar.get_height() / 2,
+                f'{value:.3f}', va='center', fontsize=9, fontweight='bold')
+    plt.tight_layout()
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    save_plot_with_data(output_path, sorted_df[['class', 'f1']], dpi=DEFAULT_FIG_DPI, bbox_inches='tight')
+    plt.close()
+    logger.info(f"Per-class F1 chart saved: {output_path}")
+
+
+def generate_training_protocol(config, run_dir):
+    """
+    Build a detailed training protocol markdown file for traceability.
+    Returns: (protocol_path, protocol_markdown)
+    """
+    run_dir = Path(run_dir)
+    protocol_path = run_dir / 'training_protocol.md'
+    dataset_stats_path = run_dir / 'images' / 'pre_training' / 'dataset_stats.json'
+
+    stats = None
+    if dataset_stats_path.exists():
+        try:
+            with open(dataset_stats_path, 'r', encoding='utf-8') as f:
+                stats = json.load(f)
+        except Exception as exc:
+            logger.warning(f"Could not load dataset stats for protocol: {exc}")
+
+    # Best-effort split metadata
+    split_note = "No explicit split metadata found in run artifacts."
+    if stats is not None:
+        split_note = (
+            f"Train={stats.get('train', {}).get('total_samples', 'N/A')}, "
+            f"Val={stats.get('val', {}).get('total_samples', 'N/A')}."
+        )
+
+    lines = [
+        "# Training Protocol",
+        f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  ",
+        "",
+        "## Dataset Split Strategy",
+        "",
+        f"- Source paths: train=`{config.get('data', {}).get('train_dir', 'N/A')}`, "
+        f"val=`{config.get('data', {}).get('val_dir', 'N/A')}`, "
+        f"test=`{config.get('data', {}).get('test_dir', 'N/A')}`",
+        f"- Split summary: {split_note}",
+        "- Stratification by class: expected from Dataset Manager workflow (to be confirmed by metadata/maps).",
+        "- Cross-validation: not applied in current pipeline (single train/val/test split).",
+        "",
+        "## Training Hyperparameters",
+        "",
+        f"- Epochs: {config.get('training', {}).get('epochs', 'N/A')}",
+        f"- Batch size: {config.get('data', {}).get('batch_size', 'N/A')}",
+        f"- Optimizer: {config.get('training', {}).get('optimizer', 'N/A')}",
+        f"- Learning rate: {config.get('training', {}).get('learning_rate', 'N/A')}",
+        f"- Weight decay: {config.get('training', {}).get('weight_decay', 'N/A')}",
+        f"- Scheduler: {config.get('training', {}).get('scheduler', 'N/A')}",
+        f"- Warmup epochs: {config.get('training', {}).get('warmup_epochs', 'N/A')}",
+        f"- Loss: {config.get('training', {}).get('loss', {}).get('type', 'N/A')}",
+        f"- Validation metric for best model: {config.get('training', {}).get('validation_metric', 'recall_at_1')}",
+        "",
+        "## Hyperparameter Optimization Notes",
+        "",
+        "- Current run stores explicit final hyperparameters in `config/config.yaml`.",
+        "- Automated cross-validated HPO is not part of this pipeline yet.",
+        "- Comparative optimization is performed through multiple named runs.",
+        "",
+        "## Reproducibility",
+        "",
+        f"- Seed: {config.get('reproducibility', {}).get('seed', 'N/A')}",
+        f"- Deterministic mode: {config.get('reproducibility', {}).get('deterministic', 'N/A')}",
+        f"- cuDNN benchmark: {config.get('reproducibility', {}).get('benchmark', 'N/A')}",
+    ]
+
+    protocol_text = "\n".join(lines)
+    with open(protocol_path, 'w', encoding='utf-8') as f:
+        f.write(protocol_text)
+    logger.info(f"Training protocol saved: {protocol_path}")
+    return protocol_path, protocol_text
+
+
 def plot_confusion_matrix_knn(embeddings, labels, class_names, output_path, k=1):
     """Generate confusion matrix using leave-one-out k-NN classification."""
     logger.info(f"Generating confusion matrix (k-NN, k={k})...")
 
-    # Leave-one-out: for each sample, find its k nearest neighbors (excluding itself)
-    n = len(labels)
-    dists = euclidean_distances(embeddings)
-    np.fill_diagonal(dists, np.inf)
-
-    # k-NN predictions
-    predictions = []
-    for i in range(n):
-        nearest_idx = np.argsort(dists[i])[:k]
-        nearest_labels = labels[nearest_idx]
-        # Majority vote
-        pred = np.bincount(nearest_labels, minlength=len(class_names)).argmax()
-        predictions.append(pred)
-    predictions = np.array(predictions)
+    predictions = compute_knn_predictions(embeddings, labels, len(class_names), k=k)
 
     # Compute confusion matrix
     cm = sk_confusion_matrix(labels, predictions, labels=list(range(len(class_names))))
@@ -409,6 +1050,7 @@ def plot_confusion_matrix_knn(embeddings, labels, class_names, output_path, k=1)
 
     # Accuracy
     accuracy = np.trace(cm) / cm.sum()
+    std_metrics, per_class_df = compute_standard_metrics_from_predictions(labels, predictions, class_names)
 
     # Plot
     fig, axes = plt.subplots(1, 2, figsize=(20, 8))
@@ -430,16 +1072,29 @@ def plot_confusion_matrix_knn(embeddings, labels, class_names, output_path, k=1)
     plt.tight_layout()
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.savefig(output_path, dpi=DEFAULT_FIG_DPI, bbox_inches='tight')
     plt.close()
     logger.info(f"Confusion matrix saved: {output_path}")
+
+    # Save normalized confusion matrix as standalone artifact
+    fig2, ax2 = plt.subplots(figsize=(10, 8))
+    sns.heatmap(cm_norm, annot=True, fmt='.2f', cmap='YlOrRd',
+                xticklabels=class_names, yticklabels=class_names, vmin=0, vmax=1, ax=ax2)
+    ax2.set_title('Confusion Matrix (Normalized)', fontsize=14, fontweight='bold')
+    ax2.set_xlabel('Predicted', fontsize=12)
+    ax2.set_ylabel('True', fontsize=12)
+    plt.tight_layout()
+    norm_path = output_path.parent / 'confusion_matrix_normalized.png'
+    plt.savefig(norm_path, dpi=DEFAULT_FIG_DPI, bbox_inches='tight')
+    plt.close()
+    logger.info(f"Normalized confusion matrix saved: {norm_path}")
 
     # Per-class accuracy
     per_class_acc = cm_norm.diagonal()
     for i, name in enumerate(class_names):
         logger.info(f"  {name}: {per_class_acc[i]:.1%}")
 
-    return accuracy, per_class_acc
+    return accuracy, per_class_acc, std_metrics, per_class_df, predictions
 
 
 def plot_distance_distribution(embeddings, labels, class_names, output_path, max_pairs=50000):
@@ -470,6 +1125,10 @@ def plot_distance_distribution(embeddings, labels, class_names, output_path, max
 
     intra_dists = np.array(intra_dists)
     inter_dists = np.array(inter_dists)
+
+    mean_intra = np.mean(intra_dists) if len(intra_dists) > 0 else 0
+    mean_inter = np.mean(inter_dists) if len(inter_dists) > 0 else 0
+    ratio = mean_inter / mean_intra if mean_intra > 0 else 0
 
     fig, axes = plt.subplots(1, 2, figsize=(18, 6))
 
@@ -503,7 +1162,7 @@ def plot_distance_distribution(embeddings, labels, class_names, output_path, max
     plt.tight_layout()
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.savefig(output_path, dpi=DEFAULT_FIG_DPI, bbox_inches='tight')
     plt.close()
 
     mean_intra = np.mean(intra_dists) if len(intra_dists) > 0 else 0
@@ -516,7 +1175,13 @@ def plot_distance_distribution(embeddings, labels, class_names, output_path, max
     return mean_intra, mean_inter, ratio
 
 
-def plot_inference_preview(model, centroids, val_loader, device, output_path, class_names,
+def _classify_embeddings(embeddings, slice_classifier: SliceAwareClassifier):
+    """Slice-aware classification; returns preds and pseudo-distances (1 - cosine)."""
+    preds, scores, _ = slice_classifier.predict(embeddings)
+    return preds, 1.0 - scores
+
+
+def plot_inference_preview(model, slice_classifier, val_loader, device, output_path, class_names,
                           n_samples=10):
     """
     Generate an inference preview grid: random val images with predictions,
@@ -524,7 +1189,7 @@ def plot_inference_preview(model, centroids, val_loader, device, output_path, cl
 
     Args:
         model: Trained model on device
-        centroids: Pre-computed class centroids tensor (n_classes, embed_dim) on device
+        slice_classifier: SliceAwareClassifier with per-slice representatives
         val_loader: Validation DataLoader
         device: torch.device
         output_path: Path to save the image
@@ -566,9 +1231,7 @@ def plot_inference_preview(model, centroids, val_loader, device, output_path, cl
     # 4. Run inference
     with torch.no_grad():
         sel_embs = model(sel_images.to(device))
-        dists = torch.cdist(sel_embs, centroids)
-        pred_classes = torch.argmin(dists, dim=1)
-        min_dists = torch.min(dists, dim=1)[0]
+        pred_classes, min_dists = _classify_embeddings(sel_embs, slice_classifier)
 
     # 5. Denormalize images for display
     mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
@@ -621,31 +1284,41 @@ def plot_inference_preview(model, centroids, val_loader, device, output_path, cl
     n_correct = sum(1 for i in range(n_samples) if sel_labels[i].item() == pred_classes[i].item())
     fig.suptitle(
         f'Inference Preview — {n_correct}/{n_samples} correct '
-        f'(Best Model, Centroid-based Classification)',
+        f'(Best Model, Slice-aware Classification)',
         fontsize=16, fontweight='bold', y=1.01
     )
 
     plt.tight_layout()
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.savefig(output_path, dpi=DEFAULT_FIG_DPI, bbox_inches='tight')
     plt.close()
 
     logger.info(f"Inference preview saved: {output_path} ({n_correct}/{n_samples} correct)")
     return n_correct, n_samples
 
 
-def compute_and_save_centroids(model, train_loader, device, save_dir, class_names):
+def compute_and_save_centroids(
+    model,
+    train_loader,
+    device,
+    save_dir,
+    class_names,
+    num_slices: int = 4,
+    loss_state_dict=None,
+    loss_type: str = None,
+):
     """
-    Compute class centroids and reference embeddings from the training set.
-    Saves two artifacts:
-      - class_centroids.pt  (lightweight — just centroids + metadata)
-      - reference_embeddings.pt (full embeddings + labels for kNN)
+    Compute class centroids, slice representatives, and reference embeddings.
 
-    This should be called ONCE at the end of training, not during evaluation.
+    Saves:
+      - slice_representatives.pt  (S, C, slice_dim) — primary slice classifier
+      - class_centroids.pt          (C, embed_dim) — kNN / legacy compat
+      - class_proxies.pt            (optional, sliced_proxy learned proxies)
+      - reference_embeddings.pt
 
     Returns:
-        centroids: tensor (n_classes, embed_dim) on device
+        (centroids, slice_classifier)
     """
     logger.info("Computing class centroids from training set (one-time)...")
     model.eval()
@@ -655,9 +1328,14 @@ def compute_and_save_centroids(model, train_loader, device, save_dir, class_name
 
     with torch.no_grad():
         for batch_data in tqdm(train_loader, desc="Extracting train embeddings", leave=False):
-            images, labels = batch_data[0], batch_data[1]
+            if len(batch_data) == 3:
+                images, labels, masks = batch_data
+                masks = masks.to(device, non_blocking=True)
+            else:
+                images, labels = batch_data[0], batch_data[1]
+                masks = None
             images = images.to(device, non_blocking=True)
-            embs = model(images)
+            embs = model(images, mask=masks)
             all_embs.append(embs.cpu())
             all_labels.append(labels)
 
@@ -710,7 +1388,40 @@ def compute_and_save_centroids(model, train_loader, device, save_dir, class_name
     logger.info(f"Reference embeddings saved: {save_dir / 'reference_embeddings.pt'} "
                 f"({all_embs.shape[0]} samples)")
 
-    return centroids.to(device)
+    slice_reps = compute_slice_centroids_from_embeddings(
+        all_embs, all_labels, class_names, num_slices=num_slices
+    )
+    save_slice_representatives(save_dir / 'slice_representatives.pt', slice_reps)
+    slice_classifier = SliceAwareClassifier(slice_reps.to(device))
+
+    if loss_type == 'sliced_proxy' and loss_state_dict:
+        try:
+            slice_dim = embed_dim // num_slices
+            proxies = export_proxies_tensor_from_loss_state(
+                loss_state_dict, num_slices, n_classes, slice_dim
+            )
+            torch.save(
+                {
+                    'proxies': proxies,
+                    'class_names': list(class_names),
+                    'num_slices': num_slices,
+                    'slice_dim': slice_dim,
+                    'embedding_dim': embed_dim,
+                    'loss_type': 'sliced_proxy',
+                },
+                save_dir / 'class_proxies.pt',
+            )
+            logger.info(
+                "Learned slice proxies saved: %s (%d slices x %d classes x %dD)",
+                save_dir / 'class_proxies.pt',
+                num_slices,
+                n_classes,
+                slice_dim,
+            )
+        except (KeyError, ValueError) as exc:
+            logger.warning("Could not export learned proxies: %s", exc)
+
+    return centroids.to(device), slice_classifier
 
 
 def load_centroids(centroids_path, device):
@@ -729,7 +1440,7 @@ def load_centroids(centroids_path, device):
     return centroids, class_names
 
 
-def generate_inference_gallery(model, centroids, val_loader, device, output_dir, class_names,
+def generate_inference_gallery(model, slice_classifier, val_loader, device, output_dir, class_names,
                                n_per_class=10):
     """
     Generate a per-class inference gallery with n_per_class random images per class.
@@ -738,7 +1449,7 @@ def generate_inference_gallery(model, centroids, val_loader, device, output_dir,
 
     Args:
         model: Trained model on device
-        centroids: Pre-computed class centroids tensor (n_classes, embed_dim) on device
+        slice_classifier: SliceAwareClassifier
         val_loader: Validation DataLoader
         device: torch.device
         output_dir: Directory to save gallery images
@@ -750,9 +1461,8 @@ def generate_inference_gallery(model, centroids, val_loader, device, output_dir,
 
     model.eval()
 
-    # 1. Collect ALL val images and run inference
+    # Pass 1: inference metadata only (no images stored)
     logger.info("  Running inference on full validation set...")
-    all_images = []
     all_labels = []
     all_preds = []
     all_dists = []
@@ -765,18 +1475,14 @@ def generate_inference_gallery(model, centroids, val_loader, device, output_dir,
         for batch_data in tqdm(val_loader, desc="Gallery inference", leave=False):
             images, labels = batch_data[0], batch_data[1]
             embs = model(images.to(device))
-            dists = torch.cdist(embs, centroids)
-            preds = torch.argmin(dists, dim=1)
-            min_d = torch.min(dists, dim=1)[0]
+            preds, min_d = _classify_embeddings(embs, slice_classifier)
+            _, _, class_scores = slice_classifier.predict(embs)
 
-            denorm = (images * std + mean).clamp(0, 1)
-            all_images.append(denorm.cpu())
             all_labels.append(labels.cpu())
             all_preds.append(preds.cpu())
             all_dists.append(min_d.cpu())
-            all_all_dists.append(dists.cpu())
+            all_all_dists.append(class_scores.cpu())
 
-    all_images = torch.cat(all_images)
     all_labels = torch.cat(all_labels)
     all_preds = torch.cat(all_preds)
     all_dists = torch.cat(all_dists)
@@ -784,8 +1490,10 @@ def generate_inference_gallery(model, centroids, val_loader, device, output_dir,
 
     rng = np.random.RandomState(42)
     class_stats = {}
+    needed_indices = set()
+    class_selected = {}
 
-    # 3. Generate per-class gallery
+    # Select samples per class (same RNG sequence as original single-pass code)
     for cls_idx, cls_name in enumerate(class_names):
         mask = (all_labels == cls_idx).numpy()
         cls_indices = np.where(mask)[0]
@@ -800,14 +1508,11 @@ def generate_inference_gallery(model, centroids, val_loader, device, output_dir,
         cls_acc = n_correct / n_total if n_total > 0 else 0
         class_stats[cls_name] = {'correct': n_correct, 'total': n_total, 'accuracy': cls_acc}
 
-        # Select samples: mix of correct and incorrect
         correct_idx = cls_indices[cls_correct]
         wrong_idx = cls_indices[~cls_correct]
 
-        # Try to show both correct and incorrect — prioritize showing errors
         n_wrong_show = min(len(wrong_idx), max(3, n_per_class // 3))
         n_correct_show = min(len(correct_idx), n_per_class - n_wrong_show)
-        # If not enough wrong, fill with correct
         if n_wrong_show + n_correct_show < n_per_class:
             n_correct_show = min(len(correct_idx), n_per_class - n_wrong_show)
 
@@ -820,12 +1525,42 @@ def generate_inference_gallery(model, centroids, val_loader, device, output_dir,
             selected.extend(chosen_correct.tolist())
 
         rng.shuffle(selected)
-        n_show = len(selected)
-
-        if n_show == 0:
+        if not selected:
             continue
 
-        # Create grid
+        class_selected[cls_name] = {
+            'indices': selected,
+            'cls_idx': cls_idx,
+            'n_correct': n_correct,
+            'n_total': n_total,
+            'cls_acc': cls_acc,
+        }
+        needed_indices.update(selected)
+
+    logger.info(f"  Fetching {len(needed_indices)} images for inference gallery (2-pass, memory-safe)...")
+    image_cache = {}
+    global_idx = 0
+    with torch.no_grad():
+        for batch_data in tqdm(val_loader, desc="Gallery image fetch", leave=False):
+            images, _ = batch_data[0], batch_data[1]
+            denorm = (images * std + mean).clamp(0, 1)
+            batch_size = images.shape[0]
+            for i in range(batch_size):
+                if global_idx in needed_indices:
+                    image_cache[global_idx] = denorm[i].cpu()
+                global_idx += 1
+
+    _free_step_memory("inference_gallery_pass1")
+
+    # 3. Generate per-class gallery
+    for cls_name, sel_info in class_selected.items():
+        cls_idx = sel_info['cls_idx']
+        selected = sel_info['indices']
+        n_correct = sel_info['n_correct']
+        n_total = sel_info['n_total']
+        cls_acc = sel_info['cls_acc']
+        n_show = len(selected)
+
         n_cols = min(5, n_show)
         n_rows = (n_show + n_cols - 1) // n_cols
         fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.5 * n_cols, 5.5 * n_rows))
@@ -841,7 +1576,7 @@ def generate_inference_gallery(model, centroids, val_loader, device, output_dir,
             row, col = divmod(i, n_cols)
             ax = axes[row][col]
 
-            img_np = all_images[idx].permute(1, 2, 0).numpy()
+            img_np = image_cache[idx].permute(1, 2, 0).numpy()
             pred_lbl = all_preds[idx].item()
             dist_val = all_dists[idx].item()
             correct = pred_lbl == cls_idx
@@ -886,7 +1621,7 @@ def generate_inference_gallery(model, centroids, val_loader, device, output_dir,
 
         plt.tight_layout()
         save_path = gallery_dir / f'{cls_name}.png'
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.savefig(save_path, dpi=DEFAULT_FIG_DPI, bbox_inches='tight')
         plt.close()
 
         logger.info(f"  {cls_name}: {n_correct}/{n_total} ({cls_acc:.1%}) -> {save_path.name}")
@@ -913,7 +1648,7 @@ def generate_inference_gallery(model, centroids, val_loader, device, output_dir,
 
     ax.grid(True, axis='x', alpha=0.3)
     plt.tight_layout()
-    plt.savefig(gallery_dir / 'summary.png', dpi=150, bbox_inches='tight')
+    plt.savefig(gallery_dir / 'summary.png', dpi=DEFAULT_FIG_DPI, bbox_inches='tight')
     plt.close()
 
     total_correct = sum(class_stats[n]['correct'] for n in names)
@@ -921,11 +1656,15 @@ def generate_inference_gallery(model, centroids, val_loader, device, output_dir,
     overall_acc = total_correct / total_samples if total_samples > 0 else 0
 
     logger.info(f"Inference gallery saved: {gallery_dir} ({total_correct}/{total_samples} = {overall_acc:.1%})")
+
+    del image_cache, all_labels, all_preds, all_dists, all_all_dists
+    _free_step_memory("inference_gallery_complete")
     return class_stats
 
 
 def generate_summary_report(csv_path, config, output_path, accuracy=0, per_class_acc=None,
-                            dist_ratio=0, class_names=None, emb_stats=None):
+                            dist_ratio=0, class_names=None, emb_stats=None,
+                            std_metrics=None, per_class_df=None, training_protocol_path=None):
     """Generate a markdown summary report of training results."""
     df = pd.read_csv(csv_path)
     output_path = Path(output_path)
@@ -974,6 +1713,22 @@ def generate_summary_report(csv_path, config, output_path, accuracy=0, per_class
         "",
     ]
 
+    # Standard classification metrics
+    if std_metrics:
+        lines.extend([
+            "## Standard Classification Metrics",
+            "",
+            "| Metric | Value |",
+            "|--------|-------|",
+            f"| Accuracy | {std_metrics.get('accuracy', 0.0):.4f} ({std_metrics.get('accuracy', 0.0):.1%}) |",
+            f"| Balanced Accuracy | {std_metrics.get('balanced_accuracy', 0.0):.4f} ({std_metrics.get('balanced_accuracy', 0.0):.1%}) |",
+            f"| Precision Macro | {std_metrics.get('precision_macro', 0.0):.4f} |",
+            f"| Precision Weighted | {std_metrics.get('precision_weighted', 0.0):.4f} |",
+            f"| F1 Macro | {std_metrics.get('f1_macro', 0.0):.4f} |",
+            f"| F1 Weighted | {std_metrics.get('f1_weighted', 0.0):.4f} |",
+            "",
+        ])
+
     # Per-class accuracy table
     if per_class_acc is not None and class_names is not None:
         lines.append("## Per-Class Accuracy (kNN)")
@@ -982,6 +1737,18 @@ def generate_summary_report(csv_path, config, output_path, accuracy=0, per_class
         lines.append("|-------|----------|")
         for i, name in enumerate(class_names):
             lines.append(f"| {name} | {per_class_acc[i]:.1%} |")
+        lines.append("")
+
+    if per_class_df is not None and not per_class_df.empty:
+        lines.append("## Per-Class Precision/Recall/F1")
+        lines.append("")
+        lines.append("| Class | Precision | Recall | F1 | Support |")
+        lines.append("|-------|-----------|--------|----|---------|")
+        for _, row in per_class_df.iterrows():
+            lines.append(
+                f"| {row['class']} | {float(row['precision']):.4f} | {float(row['recall']):.4f} | "
+                f"{float(row['f1']):.4f} | {int(row['support'])} |"
+            )
         lines.append("")
 
     # Training configuration
@@ -1043,6 +1810,22 @@ def generate_summary_report(csv_path, config, output_path, accuracy=0, per_class
         "",
         f"**Overall: {quality}** (R@1 = {r1:.1%})",
         "",
+        "## Training Protocol",
+        "",
+    ])
+    if training_protocol_path:
+        lines.extend([
+            f"- Detailed protocol: `{training_protocol_path}`",
+            "- Includes split details, stratification/cross-validation statement, and effective hyperparameters.",
+            "",
+        ])
+    else:
+        lines.extend([
+            "- Detailed protocol file not available in this run.",
+            "",
+        ])
+
+    lines.extend([
         "---",
         "",
         "## Generated Files",
@@ -1056,7 +1839,15 @@ def generate_summary_report(csv_path, config, output_path, accuracy=0, per_class
         "- `images/post_training/tsne_2d.png` — 2D t-SNE + density (S^D)",
         "- `images/post_training/embedding_space_analysis.png` — Análisis S^D: normas, coseno, compacidad, separación angular",
         "- `images/post_training/confusion_matrix.png` — kNN confusion matrix",
+        "- `images/post_training/confusion_matrix_normalized.png` — normalized confusion matrix",
+        "- `images/post_training/classification_report.csv` — per-class precision/recall/F1/support",
+        "- `images/post_training/per_class_f1.png` — F1-score per class",
+        "- `images/post_training/precision_recall_by_epoch.png` — trayectoria Precision vs Recall por época",
+        "- `images/post_training/f1_curves_by_epoch.png` — F1 Macro/Weighted por época",
+        "- `images/post_training/f1_from_precision_recall_by_epoch.txt` — F1 calculado con la ecuación 2PR/(P+R)",
         "- `images/post_training/distance_distribution.png` — Intra/Inter distances",
+        "- `evaluation_metrics_summary.json` — resumen estructurado de métricas",
+        "- `training_protocol.md` — protocolo detallado del entrenamiento",
     ])
 
     report_text = "\n".join(lines)
@@ -1068,7 +1859,7 @@ def generate_summary_report(csv_path, config, output_path, accuracy=0, per_class
     return report_text
 
 
-def generate_gradcam_gallery(model, centroids, val_loader, device, output_dir, class_names,
+def generate_gradcam_gallery(model, slice_classifier, val_loader, device, output_dir, class_names,
                               n_per_class=4):
     """
     Generate per-class Grad-CAM heatmap gallery.
@@ -1080,7 +1871,7 @@ def generate_gradcam_gallery(model, centroids, val_loader, device, output_dir, c
 
     Args:
         model: Trained model on device (eval mode)
-        centroids: Pre-computed class centroids tensor (n_classes, embed_dim) on device
+        slice_classifier: SliceAwareClassifier
         val_loader: Validation DataLoader
         device: torch.device
         output_dir: Base directory to save gallery (creates gradcam_gallery/ subfolder)
@@ -1099,9 +1890,8 @@ def generate_gradcam_gallery(model, centroids, val_loader, device, output_dir, c
     mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 
-    # 1. Collect all val images, embeddings, predictions
-    logger.info("  Collecting validation data for Grad-CAM...")
-    all_images = []
+    # Pass 1: collect labels/predictions only (avoid storing all images in RAM/VRAM)
+    logger.info("  Collecting validation predictions for Grad-CAM...")
     all_labels = []
     all_preds = []
     all_dists = []
@@ -1110,16 +1900,12 @@ def generate_gradcam_gallery(model, centroids, val_loader, device, output_dir, c
         for batch_data in tqdm(val_loader, desc="Grad-CAM inference", leave=False):
             images, labels = batch_data[0], batch_data[1]
             embs = model(images.to(device))
-            dists = torch.cdist(embs, centroids)
-            preds = torch.argmin(dists, dim=1)
-            min_d = torch.min(dists, dim=1)[0]
+            preds, min_d = _classify_embeddings(embs, slice_classifier)
 
-            all_images.append(images.cpu())
             all_labels.append(labels.cpu())
             all_preds.append(preds.cpu())
             all_dists.append(min_d.cpu())
 
-    all_images = torch.cat(all_images)
     all_labels = torch.cat(all_labels)
     all_preds = torch.cat(all_preds)
     all_dists = torch.cat(all_dists)
@@ -1127,38 +1913,63 @@ def generate_gradcam_gallery(model, centroids, val_loader, device, output_dir, c
     rng = np.random.RandomState(42)
     n_classes = len(class_names)
 
-    # 2. For each class, select n_per_class samples and generate Grad-CAM
+    needed_indices = set()
+    class_selected = {}
+    summary_indices = {}
     for c_idx in range(n_classes):
-        class_name = class_names[c_idx]
         mask = (all_labels == c_idx)
         indices = torch.where(mask)[0].numpy()
-
         if len(indices) == 0:
+            continue
+        sel_count = min(n_per_class, len(indices))
+        sel_indices = rng.choice(indices, size=sel_count, replace=False)
+        class_selected[c_idx] = sel_indices
+        needed_indices.update(sel_indices.tolist())
+        summary_indices[c_idx] = int(rng.choice(indices))
+
+    # Pass 2: fetch only the images required for visualization
+    logger.info(f"  Fetching {len(needed_indices)} images for Grad-CAM (2-pass, memory-safe)...")
+    image_cache = {}
+    global_idx = 0
+    with torch.no_grad():
+        for batch_data in tqdm(val_loader, desc="Grad-CAM image fetch", leave=False):
+            images, _ = batch_data[0], batch_data[1]
+            batch_size = images.shape[0]
+            for i in range(batch_size):
+                if global_idx in needed_indices or global_idx in summary_indices.values():
+                    image_cache[global_idx] = images[i].cpu()
+                global_idx += 1
+
+    _free_step_memory("gradcam_pass1")
+
+    # 2. For each class, generate Grad-CAM for pre-selected samples
+    for c_idx in range(n_classes):
+        class_name = class_names[c_idx]
+        if c_idx not in class_selected:
             logger.warning(f"  No samples for class {class_name}, skipping.")
             continue
 
-        sel_count = min(n_per_class, len(indices))
-        sel_indices = rng.choice(indices, size=sel_count, replace=False)
+        sel_indices = class_selected[c_idx]
+        sel_count = len(sel_indices)
 
         fig, axes = plt.subplots(sel_count, 3, figsize=(15, 5 * sel_count))
         if sel_count == 1:
             axes = axes[np.newaxis, :]
 
         for row, idx in enumerate(sel_indices):
-            img_tensor = all_images[idx]
-            true_lbl = all_labels[idx].item()
-            pred_lbl = all_preds[idx].item()
-            dist_val = all_dists[idx].item()
+            img_tensor = image_cache[int(idx)]
+            true_lbl = c_idx
+            pred_lbl = all_preds[int(idx)].item()
+            dist_val = all_dists[int(idx)].item()
             correct = true_lbl == pred_lbl
 
             # Denormalize for display
             img_denorm = (img_tensor.unsqueeze(0) * std + mean).clamp(0, 1)[0]
             img_np = img_denorm.permute(1, 2, 0).numpy()
 
-            # Generate Grad-CAM with predicted class centroid
-            pred_centroid = centroids[pred_lbl]
+            pred_target = slice_classifier.get_target_for_gradcam(pred_lbl, device)
             heatmap = explainer.generate_heatmap(
-                img_tensor.unsqueeze(0), centroid=pred_centroid
+                img_tensor.unsqueeze(0), centroid=pred_target
             )
 
             # Overlay
@@ -1194,7 +2005,7 @@ def generate_gradcam_gallery(model, centroids, val_loader, device, output_dir, c
 
         safe_name = class_name.replace(' ', '_').replace('/', '_')
         save_path = gallery_dir / f'{safe_name}_gradcam.png'
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.savefig(save_path, dpi=DEFAULT_FIG_DPI, bbox_inches='tight')
         plt.close()
 
         logger.info(f"  Grad-CAM gallery saved: {save_path}")
@@ -1207,26 +2018,23 @@ def generate_gradcam_gallery(model, centroids, val_loader, device, output_dir, c
 
     for c_idx in range(n_classes):
         class_name = class_names[c_idx]
-        mask = (all_labels == c_idx)
-        indices = torch.where(mask)[0].numpy()
-
-        if len(indices) == 0:
+        if c_idx not in summary_indices:
             for col in range(3):
                 axes[c_idx, col].axis('off')
             continue
 
-        idx = rng.choice(indices)
-        img_tensor = all_images[idx]
+        idx = summary_indices[c_idx]
+        img_tensor = image_cache[idx]
         pred_lbl = all_preds[idx].item()
         dist_val = all_dists[idx].item()
-        correct = all_labels[idx].item() == pred_lbl
+        correct = c_idx == pred_lbl
 
         img_denorm = (img_tensor.unsqueeze(0) * std + mean).clamp(0, 1)[0]
         img_np = img_denorm.permute(1, 2, 0).numpy()
 
-        pred_centroid = centroids[pred_lbl]
+        pred_target = slice_classifier.get_target_for_gradcam(pred_lbl, device)
         heatmap = explainer.generate_heatmap(
-            img_tensor.unsqueeze(0), centroid=pred_centroid
+            img_tensor.unsqueeze(0), centroid=pred_target
         )
         overlay = overlay_gradcam_on_image(
             (img_np * 255).astype(np.uint8), heatmap, alpha=0.5
@@ -1258,14 +2066,17 @@ def generate_gradcam_gallery(model, centroids, val_loader, device, output_dir, c
     fig.suptitle('Grad-CAM Summary — All Classes', fontsize=18, fontweight='bold', y=1.005)
     plt.tight_layout()
     summary_path = gallery_dir / 'gradcam_summary.png'
-    plt.savefig(summary_path, dpi=150, bbox_inches='tight')
+    plt.savefig(summary_path, dpi=DEFAULT_FIG_DPI, bbox_inches='tight')
     plt.close()
 
     logger.info(f"  Grad-CAM summary saved: {summary_path}")
     logger.info(f"  Grad-CAM gallery complete: {gallery_dir}")
 
+    del image_cache, explainer, all_preds, all_dists
+    _free_step_memory("gradcam_complete")
 
-def generate_fullimage_inference(model, centroids, device, config, output_dir, class_names,
+
+def generate_fullimage_inference(model, slice_classifier, device, config, output_dir, class_names,
                                   n_images_per_class=3, with_gradcam=True):
     """
     Run inference on FULL-RESOLUTION original images using FullImageClassifier.
@@ -1283,7 +2094,7 @@ def generate_fullimage_inference(model, centroids, device, config, output_dir, c
     
     Args:
         model: Trained AnalogyNet on device (eval mode)
-        centroids: Pre-computed class centroids (n_classes, embed_dim) on device
+        slice_classifier: SliceAwareClassifier for Grad-CAM targets
         device: torch.device
         config: Full configuration dict
         output_dir: Directory to save results
@@ -1310,7 +2121,7 @@ def generate_fullimage_inference(model, centroids, device, config, output_dir, c
     val_transform = get_val_transforms(val_config)
     
     # Cargar reference embeddings para FullImageClassifier
-    run_dir = Path(output_dir).parent.parent
+    run_dir = Path(output_dir).parent.parent.parent
     ref_path = run_dir / 'reference_embeddings.pt'
     if not ref_path.exists():
         logger.warning(f"  Reference embeddings not found at {ref_path}, skipping fullimage inference")
@@ -1409,7 +2220,7 @@ def generate_fullimage_inference(model, centroids, device, config, output_dir, c
                     continue
                 
                 # Usar FullImageClassifier para detección + clasificación automática
-                results = full_classifier.classify_full_image(str(img_path))
+                results = full_classifier.classify_full_image(str(img_path), return_crops=True)
                 grains = results.get('grains', [])
                 
                 if len(grains) == 0:
@@ -1429,6 +2240,7 @@ def generate_fullimage_inference(model, centroids, device, config, output_dir, c
 
             img_grains_correct = 0
             img_grains_total = len(grains)
+            heatmaps_and_bboxes = []
             
             # FullImageClassifier ya hizo la detección y clasificación
             # Solo necesitamos visualizar los resultados
@@ -1454,6 +2266,39 @@ def generate_fullimage_inference(model, centroids, device, config, output_dir, c
                 cv2.rectangle(display_img, (bx, by - th - 6), (bx + tw + 4, by), box_color, -1)
                 cv2.putText(display_img, label, (bx + 2, by - 4),
                             cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
+
+                # Save crop and prepare Grad-CAM
+                if 'crop' in grain and grain['crop'] is not None:
+                    crops_dir = gallery_dir / 'crops'
+                    crops_dir.mkdir(parents=True, exist_ok=True)
+                    crop_bgr = grain['crop']
+                    
+                    safe_cls_name = cls_name.replace(' ', '_').replace('/', '_')
+                    safe_pred_cls_name = pred_cls_name.replace(' ', '_').replace('/', '_')
+                    base_name = f"{safe_cls_name}_{img_path.stem}_grain_{g_idx}_{safe_pred_cls_name}"
+                    
+                    # Opcionalmente seguimos guardando el crop para debug sin Grad-CAM
+                    crop_save_path = crops_dir / f"{base_name}.png"
+                    cv2.imwrite(str(crop_save_path), crop_bgr)
+                    
+                    if with_gradcam and explainer is not None and 'tensor' in grain:
+                        tensor = grain['tensor']
+                        target_cls = pred_cls if pred_cls != -1 else 0
+                        pred_target = slice_classifier.get_target_for_gradcam(target_cls, device)
+                        heatmap = explainer.generate_heatmap(tensor.unsqueeze(0), centroid=pred_target)
+                        heatmaps_and_bboxes.append((heatmap, grain['bbox']))
+
+            # Overlay ALL heatmaps on the full image
+            if with_gradcam and explainer is not None and len(heatmaps_and_bboxes) > 0:
+                from src.utils.inference_utils import overlay_full_image_gradcam
+                full_img_rgb = cv2.cvtColor(full_img, cv2.COLOR_BGR2RGB)
+                full_gradcam_overlay = overlay_full_image_gradcam(
+                    full_image=full_img_rgb,
+                    heatmaps_and_bboxes=heatmaps_and_bboxes,
+                    crop_padding=full_classifier.crop_padding,
+                    alpha=0.5
+                )
+                display_img = cv2.cvtColor(full_gradcam_overlay, cv2.COLOR_RGB2BGR)
 
             total_grains += img_grains_total
             total_correct += img_grains_correct
@@ -1506,7 +2351,7 @@ def generate_fullimage_inference(model, centroids, device, config, output_dir, c
                     f'{a:.1%}', va='center', fontsize=10, fontweight='bold')
         ax.grid(True, axis='x', alpha=0.3)
         plt.tight_layout()
-        plt.savefig(gallery_dir / 'fullimage_summary.png', dpi=150, bbox_inches='tight')
+        plt.savefig(gallery_dir / 'fullimage_summary.png', dpi=DEFAULT_FIG_DPI, bbox_inches='tight')
         plt.close()
 
         logger.info(f"  Full-image inference: {total_correct}/{total_grains} grains "
@@ -1515,118 +2360,153 @@ def generate_fullimage_inference(model, centroids, device, config, output_dir, c
     return all_results
 
 
-def run_post_training_analysis(model, val_loader, config, run_dir, device, centroids=None):
+def run_post_training_analysis(
+    model,
+    loader,
+    config,
+    run_dir,
+    device,
+    slice_classifier=None,
+    centroids=None,
+    prefix="val",
+):
     """
     Full post-training analysis pipeline.
-    Generates all visualizations and saves them to run_dir/images/post_training/.
+    Clears existing artifacts for the prefix, then regenerates all visualizations
+    under run_dir/images/post_training/{prefix}/.
     Uses the BEST model (must be loaded before calling this).
-
-    Centroids must be pre-computed and saved before calling this function.
-    If centroids tensor is not passed, loads from class_centroids.pt in run_dir.
 
     Args:
         model: Trained model (best checkpoint, already on device)
-        val_loader: Validation DataLoader (for evaluation)
+        loader: DataLoader (for evaluation, e.g. val_loader or test_loader)
         config: Full configuration dict
-        run_dir: Run directory path (e.g., runs/2026-02-06_20-17-07)
+        run_dir: Run directory path
         device: torch.device
-        centroids: Pre-computed centroids tensor (n_classes, embed_dim). If None, loaded from file.
+        slice_classifier: SliceAwareClassifier; loaded from run_dir if None
+        centroids: Legacy full centroids (kNN compat only)
     """
     run_dir = Path(run_dir)
-    post_dir = run_dir / 'images' / 'post_training'
-    post_dir.mkdir(parents=True, exist_ok=True)
-
-    class_names = val_loader.dataset.classes
+    class_names = loader.dataset.classes
     csv_path = run_dir / 'training_metrics.csv'
 
-    # Load centroids from file if not provided
-    if centroids is None:
-        centroids_path = run_dir / 'class_centroids.pt'
-        if centroids_path.exists():
-            centroids, _ = load_centroids(str(centroids_path), device)
-        else:
-            logger.error(f"Centroids file not found: {centroids_path}")
-            logger.error("Cannot run inference-based analyses without centroids.")
-            return
+    if slice_classifier is None:
+        embed_dim = config.get('model', {}).get('embedding_dim', 128)
+        num_slices = config.get('training', {}).get('loss', {}).get('params', {}).get('num_slices', 4)
+        slice_classifier = load_slice_classifier_from_run(run_dir, device, embed_dim, num_slices)
+
+    if slice_classifier is None:
+        logger.error("Slice classifier not available — run compute_and_save_centroids first")
+        return
+
+    if centroids is None and (run_dir / 'class_centroids.pt').exists():
+        centroids, _ = load_centroids(str(run_dir / 'class_centroids.pt'), device)
 
     logger.info("=" * 70)
-    logger.info("POST-TRAINING ANALYSIS (Best Model)")
+    logger.info(f"POST-TRAINING ANALYSIS (Best Model) - Prefix: {prefix.upper()}")
     logger.info("=" * 70)
+
+    post_dir = _clear_prefix_artifacts(run_dir, prefix)
+    emb_stats = None
+    protocol_path = run_dir / 'training_protocol.md'
 
     # 1. Training curves from CSV
     if csv_path.exists():
-        logger.info("[1/10] Generating training curves...")
+        logger.info("[1/11] Generating training curves...")
         plot_training_curves(str(csv_path), str(post_dir))
     else:
         logger.warning(f"Metrics CSV not found: {csv_path}")
 
-    # 2. t-SNE 3D visualization
-    logger.info("[2/10] Generating t-SNE visualizations (2D + 3D)...")
-    embeddings, labels = plot_tsne_3d(
-        model, val_loader, device,
-        str(post_dir / 'tsne_3d.png'),
-        class_names
-    )
+    # 2. PR/F1 curves by epoch
+    if csv_path.exists():
+        logger.info("[2/11] Generating PR/F1 epoch curves...")
+        generate_pr_f1_epoch_curves(str(csv_path), str(post_dir))
+    else:
+        logger.warning("PR/F1 epoch curves skipped (no training_metrics.csv)")
 
-    # 3. Embedding space analysis (S^D hypersphere)
-    logger.info("[3/10] Generating embedding space analysis...")
-    emb_stats = None
+    # 3. Embeddings + graphical analysis
+    logger.info("[3/11] Extracting embeddings for graphical analysis...")
+    embeddings, labels = extract_embeddings(model, loader, device)
+    _free_step_memory("extract_embeddings")
+
+    logger.info("[*] Generando gráficos secuencialmente (matplotlib state machine)...")
+    plot_tsne_3d(embeddings, labels, str(post_dir / 'tsne_3d.png'), class_names)
+
     try:
         emb_stats = plot_embedding_space_analysis(
-            embeddings, labels, class_names,
-            str(post_dir / 'embedding_space_analysis.png')
+            embeddings, labels, class_names, str(post_dir / 'embedding_space_analysis.png')
         )
     except Exception as e:
         logger.error(f"Embedding space analysis failed: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
+        emb_stats = None
 
-    # 4. Confusion matrix (kNN)
-    logger.info("[4/10] Generating confusion matrix...")
-    accuracy, per_class_acc = plot_confusion_matrix_knn(
-        embeddings, labels, class_names,
-        str(post_dir / 'confusion_matrix.png')
+    knn_accuracy, per_class_acc, std_metrics, per_class_df, _knn_predictions = plot_confusion_matrix_knn(
+        embeddings, labels, class_names, str(post_dir / 'confusion_matrix.png')
     )
 
-    # 5. Distance distribution
-    logger.info("[5/10] Generating distance distributions...")
+    slice_predictions = compute_slice_predictions(embeddings, slice_classifier)
+    slice_accuracy = accuracy_score(labels, slice_predictions)
+    slice_std_metrics, slice_per_class_df = compute_standard_metrics_from_predictions(
+        labels, slice_predictions, class_names
+    )
+    logger.info(
+        "Slice-aware accuracy: %.4f | kNN accuracy: %.4f",
+        slice_accuracy,
+        knn_accuracy,
+    )
+    accuracy = slice_accuracy
+    std_metrics = slice_std_metrics
+    per_class_df = slice_per_class_df
+
     mean_intra, mean_inter, dist_ratio = plot_distance_distribution(
-        embeddings, labels, class_names,
-        str(post_dir / 'distance_distribution.png')
+        embeddings, labels, class_names, str(post_dir / 'distance_distribution.png')
     )
 
-    # 6. Inference preview (uses pre-computed centroids — no training data needed)
-    logger.info("[6/10] Generating inference preview...")
+    class_report_path = post_dir / 'classification_report.csv'
+    per_class_df.to_csv(class_report_path, index=False, encoding='utf-8')
+    logger.info(f"Classification report CSV saved: {class_report_path}")
+    plot_per_class_f1(per_class_df, str(post_dir / 'per_class_f1.png'))
+    _free_step_memory("step3_plots")
+
+    # 7. Inference preview
+    logger.info("[7/11] Generating inference preview...")
     plot_inference_preview(
-        model, centroids, val_loader, device,
+        model, slice_classifier, loader, device,
         str(post_dir / 'inference_preview.png'),
         class_names, n_samples=10
     )
+    _free_step_memory("inference_preview")
 
-    # 7. Attention/Grad-CAM heatmap gallery (uses pre-computed centroids)
-    logger.info("[7/10] Generating attention heatmap gallery...")
+    # 8. Grad-CAM gallery
+    logger.info("[8/11] Generating attention heatmap gallery...")
     try:
         generate_gradcam_gallery(
-            model, centroids, val_loader, device,
+            model, slice_classifier, loader, device,
             str(post_dir), class_names, n_per_class=4
         )
     except Exception as e:
         logger.error(f"Attention/Grad-CAM generation FAILED: {e}")
         import traceback
         logger.error(traceback.format_exc())
+    _free_step_memory("gradcam_gallery")
 
-    # 8. Per-class inference gallery (uses pre-computed centroids)
-    logger.info("[8/10] Generating per-class inference gallery...")
-    generate_inference_gallery(
-        model, centroids, val_loader, device,
-        str(post_dir), class_names, n_per_class=10
-    )
+    # 9. Per-class inference gallery
+    logger.info("[9/11] Generating per-class inference gallery...")
+    try:
+        generate_inference_gallery(
+            model, slice_classifier, loader, device,
+            str(post_dir), class_names, n_per_class=10
+        )
+    except Exception as e:
+        logger.error(f"Inference gallery generation FAILED: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+    _free_step_memory("inference_gallery")
 
-    # 9. Full-image inference on original test images
-    logger.info("[9/10] Generating full-image inference on test images...")
+    # 10. Full-image inference
+    logger.info("[10/11] Generating full-image inference on test images...")
     try:
         generate_fullimage_inference(
-            model, centroids, device, config,
+            model, slice_classifier, device, config,
             str(post_dir), class_names,
             n_images_per_class=3, with_gradcam=True
         )
@@ -1634,62 +2514,92 @@ def run_post_training_analysis(model, val_loader, config, run_dir, device, centr
         logger.warning(f"Full-image inference failed (non-critical): {e}")
         import traceback
         logger.debug(traceback.format_exc())
+    _free_step_memory("fullimage_inference")
 
-    # 10. Summary report
-    logger.info("[10/11] Generating summary report...")
+    # 11. Training protocol (once per run, regenerated on val pass)
+    if prefix == "val":
+        logger.info("[11/12] Generating training protocol...")
+        protocol_path, _ = generate_training_protocol(config, run_dir)
+    elif not protocol_path.exists():
+        logger.info("[11/12] Generating training protocol (missing)...")
+        protocol_path, _ = generate_training_protocol(config, run_dir)
+    else:
+        logger.info("[11/12] Using existing training protocol")
+
+    # 12. Evaluation summary JSON
+    logger.info("[12/12] Generating evaluation summary JSON...")
+    summary_json_path = run_dir / f'evaluation_metrics_summary_{prefix}.json'
+    eval_summary = {
+        'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'run_dir': str(run_dir),
+        'prefix': prefix,
+        'metric_learning': {
+            'slice_accuracy': float(slice_accuracy),
+            'knn_accuracy': float(knn_accuracy),
+            'distance_ratio_inter_intra': float(dist_ratio),
+        },
+        'classification_standard': std_metrics,
+        'per_class': per_class_df.to_dict(orient='records')
+    }
+    with open(summary_json_path, 'w', encoding='utf-8') as f:
+        json.dump(eval_summary, f, indent=2, ensure_ascii=False)
+    logger.info(f"Evaluation summary saved: {summary_json_path}")
+
+    # 13. Summary report
+    logger.info("[13/13] Generating summary report...")
+    report_path = run_dir / f'training_report_{prefix}.md'
     generate_summary_report(
         csv_path=str(csv_path),
         config=config,
-        output_path=str(run_dir / 'training_report.md'),
+        output_path=str(report_path),
         accuracy=accuracy,
         per_class_acc=per_class_acc,
         dist_ratio=dist_ratio,
         class_names=class_names,
-        emb_stats=emb_stats
+        emb_stats=emb_stats,
+        std_metrics=std_metrics,
+        per_class_df=per_class_df,
+        training_protocol_path=protocol_path.name if protocol_path.exists() else None
     )
 
-    # 11. Spectral Analysis (SOTA 2026) - Validación algebraica del colapso dimensional
+    # Spectral analysis
     logger.info("=" * 70)
-    logger.info("[11/11] SPECTRAL ANALYSIS - Dimensional Collapse Detection")
+    logger.info("SPECTRAL ANALYSIS - Dimensional Collapse Detection")
     logger.info("=" * 70)
+    spectral_dir = post_dir / 'spectral_analysis'
+    spectral_dir.mkdir(parents=True, exist_ok=True)
     try:
-        spectral_dir = post_dir / 'spectral_analysis'
-        spectral_dir.mkdir(parents=True, exist_ok=True)
-        
         analyzer = EmbeddingSpaceAnalyzer(
             embeddings=embeddings,
             labels=labels,
             class_names=class_names
         )
-        
-        # Análisis global del espacio completo
+
         logger.info("  -> Global spectrum analysis...")
         global_results = analyzer.analyze_global_spectrum(str(spectral_dir))
-        
+
         msg1 = f"     Global λ₁: {global_results['collapse_severity']:.3f}"
         logger.info(sanitize_for_ascii(msg1))
         logger.info(f"     Global Effective Rank: {global_results['effective_rank']}/{analyzer.n_dim}")
-        
-        # Análisis de todos los pares de clases
+
         logger.info("  -> Analyzing all class pairs...")
         pair_results = analyzer.analyze_all_pairs(str(spectral_dir))
-        
-        # Identificar clases problemáticas
+
         collapsed_pairs = [
             (pair, res) for pair, res in pair_results.items()
             if res.get('is_collapsed', False)
         ]
-        
+
         if collapsed_pairs:
             logger.warning(f"  ! COLLAPSED PAIRS DETECTED: {len(collapsed_pairs)}/{len(pair_results)}")
-            for (ca, cb), res in collapsed_pairs[:3]:  # Top 3
+            for (ca, cb), res in collapsed_pairs[:3]:
                 msg_warn = f"     - {ca} vs {cb}: λ₁={res['collapse_severity']:.3f}, Rank={res['effective_rank']}"
                 logger.warning(sanitize_for_ascii(msg_warn))
         else:
-            logger.info(f"  OK No collapsed pairs detected (all healthy)")
-        
+            logger.info("  OK No collapsed pairs detected (all healthy)")
+
         logger.info(f"  Spectral analysis complete: {spectral_dir}")
-        
+
     except Exception as e:
         logger.error(f"Spectral analysis failed: {e}")
         import traceback
@@ -1700,198 +2610,155 @@ def run_post_training_analysis(model, val_loader, config, run_dir, device, centr
     logger.info(f"Results in: {post_dir}")
     logger.info("=" * 70)
 
+    return {
+        'output_dir': str(post_dir),
+        'accuracy': accuracy,
+        'slice_accuracy': float(slice_accuracy),
+        'knn_accuracy': float(knn_accuracy),
+        'per_class_acc': per_class_acc.tolist() if per_class_acc is not None else [],
+        'dist_ratio': dist_ratio,
+        'class_names': class_names,
+    }
 
-def run_evaluation_from_checkpoint(checkpoint_path, config_path='config.yaml', output_dir='results'):
+
+def run_evaluation_from_checkpoint(
+    checkpoint_path,
+    config_path='config.yaml',
+    output_dir='results',
+    skip_test=False,
+):
     """
-    Standalone evaluation entry point for the GUI Evaluation tab.
-    Loads model from checkpoint, loads pre-computed centroids, and runs the
-    full analysis pipeline WITHOUT touching the training data.
+    Run the exact post-training pipeline from train.py on an existing run.
 
-    Falls back to computing centroids only if the file is missing (with warning).
+    Clears and regenerates all artifacts for val (and test if available).
+    Uses best_model.pth, class_centroids.pt, reference_embeddings.pt and the run's
+    config/config.yaml.
 
     Args:
-        checkpoint_path: Path to model checkpoint (.pth)
-        config_path: Path to config YAML
-        output_dir: Directory to save all results
+        checkpoint_path: Path to model checkpoint (.pth), typically checkpoints/best_model.pth
+        config_path: Fallback config YAML (project root config.yaml)
+        output_dir: Ignored — results always go to the run directory
+        skip_test: When True, skip test post-training analysis (default False: val + test)
 
     Returns:
         dict with output paths and metrics
     """
     import yaml
-    from torch.utils.data import DataLoader
-    from src.models.analogy_net import AnalogyNet
-    from src.data.dataset import MielDataset
-    from src.data.transforms_enhanced import get_val_transforms
+    from src.data.dataloader_utils import dispose_data_engine, free_training_memory
+    from scripts.train import create_model
+
+    checkpoint_path = Path(checkpoint_path)
+    run_dir = checkpoint_path.parent.parent
+    run_config_path = _resolve_run_config_path(run_dir)
 
     logger.info("=" * 70)
-    logger.info("MODEL EVALUATION")
+    logger.info("POST-TRAINING EVALUATION (full regeneration)")
     logger.info("=" * 70)
+    logger.info(f"Run directory: {run_dir}")
+    logger.info(f"Checkpoint: {checkpoint_path}")
 
-    # Load current config (for data paths) and checkpoint
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
+    if run_config_path.exists():
+        logger.info(f"Loading run config: {run_config_path}")
+        with open(run_config_path, 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f)
+    else:
+        logger.warning(f"Run config not found at {run_config_path}, using {config_path}")
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f)
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logger.info(f"Device: {device}")
-
-    # Load checkpoint FIRST to get the training config for model architecture
-    logger.info(f"Loading checkpoint: {checkpoint_path}")
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-
-    # Use the config stored in checkpoint for model architecture (it matches the weights)
-    train_config = ckpt.get('config', config)
-    model_cfg = train_config.get('model', config['model'])
-    if train_config is not config:
-        logger.info("Using model architecture from checkpoint config (ensures weight compatibility)")
-
-    model = AnalogyNet(
-        backbone=model_cfg['backbone'],
-        embedding_dim=model_cfg['embedding_dim'],
-        pretrained=False,
-        projection_head_config=model_cfg.get('projection_head'),
-        use_attention=model_cfg.get('use_attention', False),
-        freeze_backbone=False
+    device = torch.device(
+        'cuda' if torch.cuda.is_available() and config.get('hardware', {}).get('use_gpu', True) else 'cpu'
     )
+    logger.info(f"Device: {device}")
+    free_training_memory("pre_evaluation")
 
+    logger.info(f"Loading checkpoint: {checkpoint_path}")
+    ckpt = torch.load(str(checkpoint_path), map_location=device, weights_only=False)
+
+    config['model']['pretrained'] = False
+    config['model']['freeze_backbone'] = False
+    model = create_model(config)
     model.load_state_dict(ckpt['model_state_dict'])
     model.to(device)
     model.eval()
 
     epoch_info = ckpt.get('epoch', '?')
     val_loss_info = ckpt.get('val_loss', '?')
-    logger.info(f"Model loaded (epoch {epoch_info}, val_loss={val_loss_info})")
+    logger.info(f"Best model loaded (epoch {epoch_info}, val_loss={val_loss_info})")
 
-    # Use training config for transforms (image_size etc must match what model expects)
-    # but current config for data paths (user may have moved data)
-    train_aug = train_config.get('augmentation', config.get('augmentation', {}))
-    train_data = train_config.get('data', config['data'])
-    transform_config = {**train_aug, **train_data}
-    # Override data paths from current config (in case they changed)
-    transform_config['train_dir'] = config['data']['train_dir']
-    transform_config['val_dir'] = config['data']['val_dir']
-    val_transforms = get_val_transforms(transform_config)
-
-    # --- Load pre-computed centroids (preferred) or fallback ---
-    ckpt_parent = Path(checkpoint_path).parent.parent
-    centroids_path = ckpt_parent / 'class_centroids.pt'
+    embed_dim = config.get('model', {}).get('embedding_dim', 128)
+    num_slices = config.get('training', {}).get('loss', {}).get('params', {}).get('num_slices', 4)
+    slice_classifier = load_slice_classifier_from_run(run_dir, device, embed_dim, num_slices)
     centroids = None
 
-    if centroids_path.exists():
-        centroids, _ = load_centroids(str(centroids_path), device)
-        logger.info("Using pre-computed centroids from training phase (no train data needed)")
+    if slice_classifier is None:
+        logger.info("Slice artifacts missing — computing from training set...")
+        from src.data.data_engine import GrainDataEngine
+        import copy
+        train_config = copy.deepcopy(config)
+        train_config.setdefault("data", {})["pin_memory"] = False
+        train_engine = GrainDataEngine.from_config(train_config)
+        class_names_train = train_engine.train_loader.dataset.classes
+        centroids, slice_classifier = compute_and_save_centroids(
+            model,
+            train_engine.train_loader,
+            device,
+            str(run_dir),
+            class_names_train,
+            num_slices=num_slices,
+            loss_state_dict=ckpt.get('loss_state_dict'),
+            loss_type=ckpt.get('loss_type'),
+        )
+        dispose_data_engine(train_engine)
+    elif (run_dir / 'class_centroids.pt').exists():
+        centroids, _ = load_centroids(str(run_dir / 'class_centroids.pt'), device)
+
+    val_loader, test_loader, data_engine = create_eval_dataloaders(config)
+    _free_step_memory("eval_dataloaders")
+
+    logger.info("=" * 70)
+    logger.info("RUNNING POST-TRAINING ANALYSIS (VAL)")
+    logger.info("=" * 70)
+    val_results = run_post_training_analysis(
+        model, val_loader, config, str(run_dir), device,
+        slice_classifier=slice_classifier, centroids=centroids, prefix="val"
+    )
+
+    if skip_test:
+        logger.info("Test post-training skipped (--skip-test / skip_test=True)")
+    elif test_loader is not None:
+        logger.info("=" * 70)
+        logger.info("RUNNING POST-TRAINING ANALYSIS (TEST)")
+        logger.info("=" * 70)
+        run_post_training_analysis(
+            model, test_loader, config, str(run_dir), device,
+            slice_classifier=slice_classifier, centroids=centroids, prefix="test"
+        )
     else:
-        logger.warning("class_centroids.pt not found — computing centroids from training data (fallback)")
-        logger.warning("This is slow. Re-run training to generate centroids automatically.")
-        train_dataset = MielDataset(root=config['data']['train_dir'], transform=val_transforms)
-        train_loader = DataLoader(train_dataset, batch_size=config['data']['batch_size'],
-                                  shuffle=False, num_workers=0, pin_memory=True)
-        class_names_train = train_dataset.classes
-        centroids = compute_and_save_centroids(model, train_loader, device, str(ckpt_parent), class_names_train)
-
-    # Create val dataloader only (evaluation never needs train data when centroids exist)
-    logger.info(f"Loading validation data from: {config['data']['val_dir']}")
-    val_dataset = MielDataset(root=config['data']['val_dir'], transform=val_transforms)
-    logger.info(f"Val: {len(val_dataset)} | Classes: {len(val_dataset.classes)}")
-
-    val_loader = DataLoader(val_dataset, batch_size=config['data']['batch_size'],
-                            shuffle=False, num_workers=0, pin_memory=True)
-
-    # Create output directory
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    post_dir = output_dir / 'images'
-    post_dir.mkdir(parents=True, exist_ok=True)
-
-    class_names = val_dataset.classes
-
-    # Check if there's a training_metrics.csv alongside the checkpoint
-    csv_path = ckpt_parent / 'training_metrics.csv'
-
-    logger.info("=" * 70)
-    logger.info("RUNNING EVALUATION ANALYSIS")
-    logger.info("=" * 70)
-
-    # 1. Training curves (if CSV exists)
-    if csv_path.exists():
-        logger.info("[1/9] Generating training curves from CSV...")
-        plot_training_curves(str(csv_path), str(post_dir))
-    else:
-        logger.info("[1/9] No training_metrics.csv found — skipping training curves")
-
-    # 2. t-SNE
-    logger.info("[2/9] Generating t-SNE visualizations...")
-    embeddings, labels = plot_tsne_3d(
-        model, val_loader, device, str(post_dir / 'tsne_3d.png'), class_names
-    )
-
-    # 3. Embedding space analysis (S^D hypersphere)
-    logger.info("[3/9] Generating embedding space analysis...")
-    emb_stats = None
-    try:
-        emb_stats = plot_embedding_space_analysis(
-            embeddings, labels, class_names,
-            str(post_dir / 'embedding_space_analysis.png')
-        )
-    except Exception as e:
-        logger.error(f"Embedding space analysis failed: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-
-    # 4. Confusion matrix
-    logger.info("[4/9] Generating confusion matrix...")
-    accuracy, per_class_acc = plot_confusion_matrix_knn(
-        embeddings, labels, class_names, str(post_dir / 'confusion_matrix.png')
-    )
-
-    # 5. Distance distribution
-    logger.info("[5/9] Generating distance distributions...")
-    mean_intra, mean_inter, dist_ratio = plot_distance_distribution(
-        embeddings, labels, class_names, str(post_dir / 'distance_distribution.png')
-    )
-
-    # 6. Inference preview (uses pre-computed centroids)
-    logger.info("[6/9] Generating inference preview...")
-    plot_inference_preview(
-        model, centroids, val_loader, device,
-        str(post_dir / 'inference_preview.png'), class_names, n_samples=10
-    )
-
-    # 7. Grad-CAM heatmap gallery (uses pre-computed centroids)
-    logger.info("[7/9] Generating Grad-CAM heatmap gallery...")
-    try:
-        generate_gradcam_gallery(
-            model, centroids, val_loader, device,
-            str(post_dir), class_names, n_per_class=4
-        )
-    except Exception as e:
-        logger.warning(f"Grad-CAM generation failed (non-critical): {e}")
-
-    # 8. Per-class inference gallery (uses pre-computed centroids)
-    logger.info("[8/9] Generating per-class inference gallery...")
-    generate_inference_gallery(
-        model, centroids, val_loader, device,
-        str(post_dir), class_names, n_per_class=10
-    )
-
-    # 9. Summary report
-    logger.info("[9/9] Generating summary report...")
-    if csv_path.exists():
-        generate_summary_report(
-            csv_path=str(csv_path), config=config,
-            output_path=str(output_dir / 'evaluation_report.md'),
-            accuracy=accuracy, per_class_acc=per_class_acc,
-            dist_ratio=dist_ratio, class_names=class_names,
-            emb_stats=emb_stats
+        test_dir = config.get("data", {}).get("test_dir")
+        logger.warning(
+            "Test post-training skipped: no test loader "
+            f"(test_dir={test_dir!r})"
         )
 
+    finalize_self_contained_checkpoint(run_dir)
+    dispose_data_engine(data_engine)
+    _free_step_memory("evaluation_complete")
+
     logger.info("=" * 70)
-    logger.info(f"Evaluation complete! Results in: {output_dir}")
+    logger.info(f"Post-training evaluation complete! Results in: {run_dir}")
     logger.info("=" * 70)
 
-    return {
-        'output_dir': str(output_dir),
-        'accuracy': accuracy,
-        'per_class_acc': per_class_acc.tolist() if per_class_acc is not None else [],
-        'dist_ratio': dist_ratio,
-        'class_names': class_names,
-    }
+    if val_results is None:
+        class_names = list(getattr(val_loader.dataset, 'classes', []))
+        return {
+            'output_dir': str(run_dir),
+            'accuracy': 0,
+            'per_class_acc': [],
+            'dist_ratio': 0,
+            'class_names': class_names,
+        }
+
+    val_results['output_dir'] = str(run_dir)
+    return val_results
+
