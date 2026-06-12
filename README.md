@@ -1,8 +1,10 @@
 # MeliVision
 
-Sistema de **microscopía automatizada** para clasificación de granos de polen mediante **Deep Metric Learning** con **DINOv2 Vision Transformer** y detección de objetos salientes con **U²-Net**.
+Sistema de **microscopía automatizada** para clasificación de granos de polen mediante **Deep Metric Learning (DML)** con **DINOv2 Vision Transformer**.
 
-Aprende una función de embedding $f_\theta: \mathbb{R}^{H \times W \times 3} \rightarrow \mathbb{S}^{127}$ que mapea crops microscópicos a una hiperesfera unitaria de 128 dimensiones, donde la distancia euclidiana refleja la disimilitud taxonómica entre especies poliníferas.
+- **Localización:** U²-Net (SOD) + filtros morfológicos de polen — preprocesamiento `.seg` e inferencia full-image.
+- **DML:** AnalogyNet (ViT entrenado) aprende embeddings 128D en $\mathbb{S}^{127}$ y clasifica por slice.
+- **Inferencia cámara:** `PollenGrainDetector` localiza → `FullImageClassifier` + best model clasifica.
 
 ---
 
@@ -65,7 +67,7 @@ El sistema soporta datasets con múltiples clases de polen. La partición estrat
 ║            │                                                      ║
 ║            ▼                                                      ║
 ║  ┌──────────────────────────────────────────┐                     ║
-║  │ ETAPA 2: U²-Net Salient Object Detection │                     ║
+║  ETAPA 2: U²-Net (SOLO preprocesamiento → .seg)                  ║
 ║  │  Imagen → U²-NETP (320×320) → Saliencia  │                     ║
 ║  │  → Umbral adaptativo → Morfología         │                     ║
 ║  │  → Contornos → Filtrado (área, circ.)     │                     ║
@@ -100,8 +102,8 @@ El sistema soporta datasets con múltiples clases de polen. La partición estrat
 ║            │                                                      ║
 ║            ▼                                                      ║
 ║  ┌──────────────────────────────────────────┐                     ║
-║  │ ETAPA 6-9: Sliced MS + slice-aware      │                     ║
-║  │  128D → 4×32D → ŷ por media cosenos    │                     ║
+║  │ ETAPA 6-8: Sliced MS + evaluación MLRC + post-training           ║
+║  │ ETAPA 9: Inferencia — U²-Net localiza → ViT clasifica            ║
 ║  └─────────┬────────────────────────────────┘                     ║
 ║            │                                                      ║
 ║            ▼                                                      ║
@@ -148,6 +150,9 @@ El sistema soporta datasets con múltiples clases de polen. La partición estrat
 ---
 
 ## Etapa 2 — Detección de Granos (U²-Net)
+
+> **Rol:** U²-Net localiza granos (SOD) en preprocesamiento (`.seg`) **y** en inferencia full-image.  
+> La **clasificación de especie** la hace el best model (AnalogyNet + slice-aware), no U²-Net.
 
 ### Arquitectura U²-Net
 
@@ -343,6 +348,8 @@ Distancia euclidiana y similitud coseno son monótonamente equivalentes.
 
 ## Etapa 6 — Entrenamiento (Sliced MS Loss)
 
+El entrenamiento prioriza pares morfológicamente difíciles mediante **soft mining integrado** en cada slice (véase [Hard Example Mining → Soft Mining integrado](#hard-example-mining--soft-mining-integrado-en-sliced-ms)); los mineros explícitos (OHEM / triplet) quedan como legacy para `arcface`/`triplet`.
+
 ### Función de Pérdida (default: `sliced_ms`)
 
 El pipeline actual usa **Sliced Multi-Similarity Loss con Learnable Dynamic Margins** (LDM-MS por subespacio). Particiona el embedding 128D en **S=4 subespacios disjuntos de 32D** y aplica MS Loss (Wang et al., CVPR 2019) de forma independiente en cada slice, con márgenes aprendibles por clase.
@@ -374,9 +381,45 @@ donde $S_{ik} = \langle f_\theta(x_i), f_\theta(x_k) \rangle$, $\mathcal{P}_i$ =
 | Aspecto | Triplet Loss | Multi-Similarity Loss |
 |---------|-------------|----------------------|
 | Relaciones/batch | $O(n^3)$ tripletas | Todas: $O(n^2)$ |
-| Mining | Externo (semi-hard) | Integrado |
+| Mining | Externo (semi-hard) | Integrado (soft mining) |
 | Gradientes | Sparse | Dense |
 | Convergencia | Lenta | Rápida |
+
+### Hard Example Mining → Soft Mining integrado en Sliced MS
+
+Una característica planificada desde el inicio del proyecto fue **enfocar el entrenamiento en las diferencias morfológicas más difíciles de separar** — pares positivo/negativo en el borde del margen, clases confusables en melisopalinología. Esa idea se implementó en dos fases:
+
+| Fase | Mecanismo | Loss compatible | Estado |
+|------|-----------|-----------------|--------|
+| **v1 (mar 2026)** | `HardNegativeMiner` (OHEM) + triplet miners opcionales | `arcface`, `triplet` | Legacy — código en `src/training/hard_mining.py` |
+| **v2 (actual)** | **Soft mining** vía LogSumExp de MS Loss + LDM por slice | `sliced_ms` (default) | **Activo** — sustituye al minero externo |
+
+#### v1 — Mineros explícitos (legacy)
+
+Dos bloques en `config.yaml`, ambos **desactivados** con `sliced_ms`:
+
+```yaml
+training:
+  mining:          # Triplet Mining — semihard / hard / distance_weighted (pytorch_metric_learning)
+    enabled: false
+  hard_mining:     # OHEM — top-k% muestras con mayor pérdida (Shrivastava et al., CVPR 2016)
+    enabled: false
+```
+
+- **`training.hard_mining`:** calcula pérdida por muestra, selecciona el top-k% más difícil y promedia solo sobre esos ejemplos. Funcionó en runs ArcFace (mar 2026, ratio 0.3).
+- **`training.mining`:** mineros de triplets (`TripletMarginMiner`). Útil con Triplet Loss; con ArcFace se omite automáticamente.
+
+#### v2 — Mining integrado en cada slice (pipeline actual)
+
+Con **`sliced_ms`**, el minero externo **no participa** (OHEM auto-desactivado; triplet mining incompatible con LDM). La detección de pares difíciles ocurre **dentro** de cada subespacio 32D:
+
+1. **Soft mining MS:** el término LogSumExp con $\beta=50$ pondera exponencialmente los **negativos cercanos** (hard negatives implícitos); $\alpha$ modula positivos lejanos. Todos los pares del batch contribuyen — gradientes densos, sin recortar el grafo.
+2. **LDM por clase y slice:** `pos_margin` / `neg_margin` aprendibles adaptan la dificultad **por especie** en cada subespacio.
+3. **S=4 slices:** la dificultad se distribuye en 4 geometrías independientes → rango espectral ≈ $S \times (C-1)$ vs. colapso a un simplex.
+
+> **Nota de diseño:** usar mineros duros (`indices_tuple`) con MS/LDM **distorsiona** el soft mining y favorece colapso dimensional (`src/losses/ldm_loss.py`). Por eso el mining explícito quedó fuera de ruta al adoptar `sliced_ms`.
+
+**En Methods del paper:** describir como *implicit hard-pair weighting via Multi-Similarity LogSumExp across S orthogonal subspaces with learnable dynamic margins* — no como OHEM ni triplet mining externo.
 
 **Losses adicionales soportadas:** Triplet Margin, Proxy Anchor (CVPR 2020), ArcFace (CVPR 2019), SG-Softmax (AAAI 2023).
 
@@ -400,18 +443,17 @@ Relaciones por batch:
 | **Warmup** | Linear ramp | 3 epochs desde 10⁻⁵ |
 | **Mixed Precision** | AMP (float16/32) | ~50% menos VRAM, ~30% más rápido |
 | **Gradient Clipping** | Max norm | 5.0 |
-| **Early Stopping** | R@1-based | Patience=10, restore best |
+| **Early Stopping** | `validation_metric` (default mAP@R) | Patience=20, restore best |
 
 ### Regularización SOTA (2022–2024)
 
-| Técnica | Paper | Efecto |
-|---------|-------|--------|
-| **NIR** | Roth et al., CVPR 2022 | Anti-colapso isotrópico per-class |
-| **HIER** | Kim et al., CVPR 2023 | Árbol jerárquico de proxies |
-| **DADA** | Ren et al., AAAI 2024 | MMD entre embeddings originales/augmentados |
-| **Self-Distillation** | Zeng et al., 2024 | EMA Teacher + KL sobre similitudes |
-
-Todas opcionales, activables desde `config.yaml` sección `sota:`.
+| Técnica | Paper | Estado en trainer |
+|---------|-------|-------------------|
+| **NIR** | Roth et al., CVPR 2022 | ✅ Opcional |
+| **HIER** | Kim et al., CVPR 2023 | ✅ Opcional |
+| **Anti-collapse** | Wang & Isola, ICML 2020 | ✅ Opcional (`sota.anti_collapse`) |
+| **Self-Distillation** | Zeng et al., 2024 | ✅ Opcional |
+| Uniformity / VICReg / disentanglement (GUI) | — | ❌ No implementado — validator rechaza si enabled |
 
 ### Artefactos de Entrenamiento
 
@@ -453,7 +495,9 @@ training:
     params:
       num_slices: 4       # S — controla rango espectral
 grain_detection:
-  masked_pooling: true    # máscara al collate + forward
+  localization_detector: u2net
+  discovery_mode: false
+  masked_pooling: true
 ```
 
 ### Roadmap de implementación (2026-06-11)
@@ -473,11 +517,15 @@ Plan completo con fórmulas, criterios de aceptación y referencias 2022–2026:
 
 Implementación (2026-06-11): **`docs/2026-06-11_IMPLEMENTACION_POOLING_SLICE_CHANGELOG.md`** — smoke test: `python scripts/smoke_test_pooling_slice.py --config test_config.yaml`
 
-### Brechas conocidas (pendientes de Fase 2)
+### Brechas resueltas (2026-06-12)
 
-- `extract_embeddings()` en post-training **no pasa máscara** → t-SNE/kNN plots no reflejan inferencia producción.
-- XAI usa mean de última capa, no el pooling de entrenamiento.
-- Slicing por índice mezcla ramas LF/HF en cada slice — se corrige con `slice_native`.
+- Checkpoint e informe alineados con `validation_metric` (mAP@R).
+- `val_loss` de validación usa `prenorm` en sliced_ms.
+- Post-training separa métricas slice-aware vs 1-NN LOO.
+- Inferencia full-image sin atención ViT como detector (`PollenGrainDetector` / U²-Net).
+- Validator rechaza regularizadores no implementados.
+
+Registro completo: [`docs/2026-06-12_17-44-00_REGISTRO_DML_PIPELINE_REFERENCIAS.md`](docs/2026-06-12_17-44-00_REGISTRO_DML_PIPELINE_REFERENCIAS.md)
 
 ---
 
@@ -485,13 +533,13 @@ Implementación (2026-06-11): **`docs/2026-06-11_IMPLEMENTACION_POOLING_SLICE_CH
 
 | Métrica | Definición | Rol |
 |---------|-----------|-----|
-| **slice_accuracy** | Clasificación slice-aware (media cosenos por slice) | **Primaria** — coherente con `sliced_ms` |
-| **Recall@K** | Fracción de queries con ≥1 vecino correcto en top-K (Wang et al., CVPR 2019) | Estándar DML |
-| **mAP@R** | Ranking completo (Musgrave et al., ECCV 2020) | Calidad topológica |
-| **NMI** | Concordancia K-Means vs. etiquetas | Clustering |
-| **Rango espectral efectivo** | Dimensión activa del espacio de embeddings | Objetivo >30 con S=4 |
-| **kNN accuracy** | 1-NN global 128D | **Secundaria** — puede divergir de slice_accuracy |
-| **Distance Ratio** | $\rho = \bar{d}_{inter} / \bar{d}_{intra}$ | Separación (objetivo $\rho > 2$) |
+| **Checkpoint** | `training.validation_metric` (default **mAP@R**) | Selección del best model (Musgrave et al., ECCV 2020) |
+| **R@1, mAP@R, NMI, F1-macro** | 1-NN LOO MLRC en embeddings | Métricas retrieval estándar |
+| **slice_accuracy** | Media coseno por slice vs representantes | Clasificador de despliegue (Sanakoyeu et al., CVPR 2019) |
+| **effective_rank** | Componentes para 95% varianza en espectro val | Anti-colapso dimensional |
+| **val_loss** | P×K auxiliar (alineado con prenorm en sliced_ms) | Curvas; no criterio de checkpoint |
+
+**No mezclar** slice_accuracy con R@1 en tablas del paper — son protocolos distintos.
 
 ---
 
@@ -515,23 +563,37 @@ Pipeline automatizado de **9 etapas** sobre el mejor modelo:
 
 ## Etapa 9 — Inferencia End-to-End
 
-`FullImageClassifier`: pipeline completo desde imagen de cámara hasta conteo por especie.
+Pipeline en **dos etapas** (localizar → identificar), estándar en microscopía automatizada:
 
 ```
 Imagen cámara (cualquier resolución)
   │
-  ├── PollenGrainDetector (U²-Net) → N granos {bbox, contorno, saliency}
+  ├── PollenGrainDetector (U²-Net SOD + morfología polen) → N granos
   │
   └── Para cada grano:
-        Crop + padding (20%) → Máscara contorno → Gray bg (128)
-        → Val transform → AnalogyNet(mask=…) → ê ∈ S^127
-        → SliceAwareClassifier: media cosenos por slice vs slice_representatives.pt
+        Crop + padding → Máscara contorno → fondo imagenet_neutral
+        → Val transform → AnalogyNet(mask si masked_pooling) → ê ∈ S^127
+        → SliceAwareClassifier vs slice_representatives.pt
   │
-  └── Resultado:
-        • Imagen anotada: bboxes coloreados por clase + labels
-        • Conteo: {especie → cantidad}
-        • Heatmaps de atención opcionales por grano
+  └── Resultado: imagen anotada + conteo por especie + heatmaps opcionales (Grad-CAM del ViT)
 ```
+
+| Etapa | Módulo | Tarea | ¿Entrena? |
+|-------|--------|-------|-----------|
+| Localización | `PollenGrainDetector` | Dónde está el grano | No (SOD fijo) |
+| Identificación | AnalogyNet + `SliceAwareClassifier` | Qué especie es | Sí (best checkpoint) |
+
+Config (`grain_detection`):
+
+```yaml
+localization_detector: u2net   # u2net (default) | vit (legacy: atención ViT)
+discovery_mode: false          # true = multi-umbral agresivo (más FP)
+adaptive_k: 0.3                # umbral adaptativo saliency
+min_area: 1000                 # área mínima grano (px²)
+min_circularity: 0.3           # filtro morfológico polen
+```
+
+`ModelGrainDetector` (atención ViT) queda como backend legacy (`localization_detector: vit`).
 
 ---
 
@@ -611,12 +673,11 @@ MeliVision/
 │   │
 │   ├── grain_detection/                # Pipeline de detección
 │   │   ├── salient_detector.py         # Wrapper U²-Net (SOD)
-│   │   ├── grain_detector.py           # PollenGrainDetector (end-to-end)
-│   │   ├── seg_format.py              # Parser/Writer formato .seg
-│   │   ├── annotator.py               # SegmentationAnnotator (batch)
-│   │   ├── detected_grain.py          # Dataclass DetectedGrain
-│   │   ├── contour_registry.py        # Registro de contornos
-│   │   └── full_image_classifier.py   # FullImageClassifier (inferencia E2E)
+│   │   ├── grain_detector.py           # PollenGrainDetector (localización)
+│   │   ├── model_grain_detector.py     # Backend legacy (atención ViT)
+│   │   ├── seg_format.py               # Parser/Writer formato .seg
+│   │   ├── annotator.py                # SegmentationAnnotator (batch)
+│   │   └── full_image_classifier.py    # Pipeline E2E cámara
 │   │
 │   ├── data/
 │   │   ├── grain_dataset.py            # SegmentedGrainDataset (on-the-fly)
@@ -703,6 +764,8 @@ MeliVision/
 15. **Macenko, M. et al.** (2009). A Method for Normalizing Histology Slides for Quantitative Analysis. *ISBI 2009*.
 16. **Reinhard, E., Ashikhmin, M., Gooch, B., & Shirley, P.** (2001). Color Transfer between Images. *IEEE CG&A*, 21(5).
 17. **Loshchilov, I., & Hutter, F.** (2017). SGDR: Stochastic Gradient Descent with Warm Restarts. *ICLR 2017*.
+18. **Shrivastava, A. et al.** (2016). Training Region-based Object Detectors with Online Hard Example Mining. *CVPR 2016* (OHEM legacy — `hard_mining`).
+19. **Schroff, F. et al.** (2015). FaceNet: A Unified Embedding for Face Recognition and Clustering. *CVPR 2015* (triplet mining).
 
 **Auditoría bibliográfica (correcciones Ashikhmin, Macenko, venues):** [`docs/20260207_172200_REVISION_REFERENCIAS_SOTA.md`](docs/20260207_172200_REVISION_REFERENCIAS_SOTA.md)
 
@@ -712,11 +775,7 @@ MeliVision/
 
 ---
 
-**Versión:** 5.0 (MLRC + ablaciones + zero activation ImageNet-neutral)  
-**Última actualización:** 2026-06-12  
-**Metodología completa:** [`docs/20260210_2135_METODOLOGIA_COMPLETA_SISTEMA.md`](docs/20260210_2135_METODOLOGIA_COMPLETA_SISTEMA.md)  
-**Mejoras atención + augmentations:** [`docs/20260210_1945_ANALISIS_MEJORAS_ATENCION_Y_AUGMENTATIONS.md`](docs/20260210_1945_ANALISIS_MEJORAS_ATENCION_Y_AUGMENTATIONS.md)  
-**Documentación técnica:** [`docs/20260207_155700_DESCRIPCION_TECNICA_SISTEMA.md`](docs/20260207_155700_DESCRIPCION_TECNICA_SISTEMA.md)  
-**Plan de mejoras SOTA:** [`docs/20260207_195500_PLAN_MEJORAS_SOTA.md`](docs/20260207_195500_PLAN_MEJORAS_SOTA.md)  
-**Implementación SOTA:** [`docs/20260207_201600_IMPLEMENTACION_MEJORAS_SOTA.md`](docs/20260207_201600_IMPLEMENTACION_MEJORAS_SOTA.md)  
-**Estudio SOTA detallado:** [`docs/20260207_202600_ESTUDIO_SOTA_DETALLADO.md`](docs/20260207_202600_ESTUDIO_SOTA_DETALLADO.md)
+**Versión:** 6.2 (inferencia two-stage: U²-Net localiza, ViT clasifica)  
+**Última actualización:** 2026-06-11  
+**Registro DML y referencias:** [`docs/2026-06-12_17-44-00_REGISTRO_DML_PIPELINE_REFERENCIAS.md`](docs/2026-06-12_17-44-00_REGISTRO_DML_PIPELINE_REFERENCIAS.md)  
+**Plan cumplimiento académico:** [`docs/2026-06-12_PLAN_CUMPLIMIENTO_ACADEMICO_SOTA.md`](docs/2026-06-12_PLAN_CUMPLIMIENTO_ACADEMICO_SOTA.md)

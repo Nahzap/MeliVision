@@ -326,6 +326,15 @@ def extract_embeddings(model, dataloader, device, grain_config=None):
     return embeddings, labels
 
 
+def _best_recall_running_max(df: pd.DataFrame) -> pd.Series:
+    """Cumulative best R@1 — legacy CSV had best_recall_at_1; new CSV uses best_selection_value."""
+    if "best_recall_at_1" in df.columns:
+        return pd.to_numeric(df["best_recall_at_1"], errors="coerce")
+    if "recall_at_1" in df.columns:
+        return pd.to_numeric(df["recall_at_1"], errors="coerce").cummax()
+    return pd.Series(dtype=float)
+
+
 def plot_training_curves(csv_path: str, output_dir: str):
     """
     Generate training curves from the metrics CSV.
@@ -333,6 +342,7 @@ def plot_training_curves(csv_path: str, output_dir: str):
     """
     df = pd.read_csv(csv_path)
     output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # Determine whether training stopped before configured max epoch.
     final_epoch = int(df['epoch'].iloc[-1]) if not df.empty else 0
@@ -368,21 +378,48 @@ def plot_training_curves(csv_path: str, output_dir: str):
     logger.info(f"Loss curves saved: {output_dir / 'loss_curves.png'}")
 
     # --- Recall Curves ---
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(df['epoch'], df['recall_at_1'], 'g-o', markersize=4, label='Recall@1', linewidth=2)
-    ax.plot(df['epoch'], df['recall_at_5'], 'm-o', markersize=4, label='Recall@5', linewidth=2)
-    ax.plot(df['epoch'], df['best_recall_at_1'], 'k--', alpha=0.5, label='Best R@1', linewidth=1)
+    if "recall_at_1" in df.columns:
+        best_r1 = _best_recall_running_max(df)
+        fig, ax = plt.subplots(figsize=(12, 6))
+        ax.plot(df["epoch"], df["recall_at_1"], "g-o", markersize=4, label="Recall@1", linewidth=2)
+        if "recall_at_5" in df.columns:
+            ax.plot(df["epoch"], df["recall_at_5"], "m-o", markersize=4, label="Recall@5", linewidth=2)
+        if not best_r1.empty:
+            ax.plot(df["epoch"], best_r1, "k--", alpha=0.5, label="Best R@1", linewidth=1)
+        if "best_selection_value" in df.columns and "selection_metric" in df.columns:
+            sel_metric = str(df["selection_metric"].iloc[0])
+            if sel_metric != "recall_at_1":
+                ax.plot(
+                    df["epoch"],
+                    pd.to_numeric(df["best_selection_value"], errors="coerce"),
+                    "b:",
+                    alpha=0.6,
+                    label=f"Best {sel_metric}",
+                    linewidth=1,
+                )
 
-    ax.set_xlabel('Epoch', fontsize=12)
-    ax.set_ylabel('Recall', fontsize=12)
-    ax.set_title('Recall@K over Training', fontsize=16, fontweight='bold')
-    ax.legend(fontsize=11)
-    ax.grid(True, alpha=0.3)
-    ax.set_ylim(0, 1.05)
-    plt.tight_layout()
-    save_plot_with_data(output_dir / 'recall_curves.png', df[['epoch', 'recall_at_1', 'recall_at_5', 'best_recall_at_1']], dpi=DEFAULT_FIG_DPI, bbox_inches='tight')
-    plt.close()
-    logger.info(f"Recall curves saved: {output_dir / 'recall_curves.png'}")
+        ax.set_xlabel("Epoch", fontsize=12)
+        ax.set_ylabel("Score", fontsize=12)
+        ax.set_title("Recall@K over Training", fontsize=16, fontweight="bold")
+        ax.legend(fontsize=11)
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim(0, 1.05)
+        plt.tight_layout()
+        recall_cols = ["epoch", "recall_at_1"]
+        if "recall_at_5" in df.columns:
+            recall_cols.append("recall_at_5")
+        recall_export = df[recall_cols].copy()
+        recall_export["best_recall_at_1"] = best_r1
+        if "best_selection_value" in df.columns:
+            recall_export["best_selection_value"] = df["best_selection_value"]
+        save_plot_with_data(
+            output_dir / "recall_curves.png",
+            recall_export,
+            dpi=DEFAULT_FIG_DPI,
+            bbox_inches="tight",
+        )
+        plt.close()
+        logger.info(f"Recall curves saved: {output_dir / 'recall_curves.png'}")
 
     # --- SOTA validation metrics (retrieval + clustering) ---
     sota_cols = [
@@ -749,17 +786,59 @@ def compute_slice_predictions(embeddings, slice_classifier: SliceAwareClassifier
     return preds.cpu().numpy()
 
 
-def compute_knn_predictions(embeddings, labels, n_classes, k=1):
-    """Compute leave-one-out k-NN predictions in embedding space."""
-    dists = euclidean_distances(embeddings)
-    np.fill_diagonal(dists, np.inf)
-    predictions = []
-    for i in range(len(labels)):
-        nearest_idx = np.argsort(dists[i])[:k]
-        nearest_labels = labels[nearest_idx]
-        pred = np.bincount(nearest_labels, minlength=n_classes).argmax()
-        predictions.append(pred)
-    return np.array(predictions)
+def compute_knn_predictions(embeddings, labels, n_classes, k=1, nn_metric='euclidean'):
+    """Compute leave-one-out k-NN predictions in embedding space (MLRC protocol)."""
+    from src.utils.metrics_utils import _compute_1nn_predictions
+
+    if k != 1:
+        logger.warning("compute_knn_predictions: only k=1 LOO supported; using k=1")
+    return _compute_1nn_predictions(embeddings, labels, metric=nn_metric)
+
+
+def _unpack_loader_batch(batch_data):
+    if len(batch_data) == 3:
+        return batch_data[0], batch_data[1], batch_data[2]
+    return batch_data[0], batch_data[1], None
+
+
+def _forward_embeddings(model, images, masks, grain_config, device):
+    images = images.to(device)
+    masked_pooling = bool((grain_config or {}).get("masked_pooling", False))
+    if masked_pooling and masks is not None:
+        return model(images, mask=masks.to(device))
+    return model(images)
+
+
+def _resolve_denorm_tensors(config):
+    from src.utils.dataset_norm import resolve_normalization_config
+
+    resolved = resolve_normalization_config(config)
+    mean = torch.tensor(resolved["mean"], dtype=torch.float32).view(1, 3, 1, 1)
+    std = torch.tensor(resolved["std"], dtype=torch.float32).view(1, 3, 1, 1)
+    return mean, std
+
+
+def _resolve_best_training_row(df, config):
+    """Select best epoch row using training.validation_metric (B-01)."""
+    validation_metric = (
+        config.get("training", {}).get("validation_metric", "mAP@R") or "mAP@R"
+    )
+    metric_aliases = {
+        "recall_at_1": "recall_at_1",
+        "mAP@R": "mAP@R",
+        "F1_macro": "F1_macro",
+        "val_loss": "val_loss",
+    }
+    col = metric_aliases.get(validation_metric, "selection_value")
+    if col in df.columns:
+        return df.loc[df[col].astype(float).idxmax()], validation_metric
+    if "is_best" in df.columns:
+        flagged = df[df["is_best"].astype(str).str.lower().isin(["true", "1", "yes"])]
+        if len(flagged):
+            return flagged.iloc[-1], validation_metric
+    if "selection_value" in df.columns:
+        return df.loc[df["selection_value"].astype(float).idxmax()], "selection_value"
+    return df.loc[df["recall_at_1"].astype(float).idxmax()], "recall_at_1"
 
 
 def compute_standard_metrics_from_predictions(labels, predictions, class_names):
@@ -785,14 +864,14 @@ def compute_standard_metrics_from_predictions(labels, predictions, class_names):
     return summary, per_class_df
 
 
-def plot_per_class_f1(per_class_df, output_path):
+def plot_per_class_f1(per_class_df, output_path, metric_label="Slice-aware LOO"):
     """Generate F1-by-class horizontal bar chart."""
     fig, ax = plt.subplots(figsize=(10, 6))
     sorted_df = per_class_df.sort_values('f1', ascending=True)
     bars = ax.barh(sorted_df['class'], sorted_df['f1'], color='#4ec9b0', edgecolor='#333', linewidth=0.6)
     ax.set_xlim(0, 1.05)
     ax.set_xlabel('F1-score', fontsize=12)
-    ax.set_title('F1-score por Clase (k-NN leave-one-out)', fontsize=14, fontweight='bold')
+    ax.set_title(f'F1-score por Clase ({metric_label})', fontsize=14, fontweight='bold')
     ax.grid(axis='x', alpha=0.3)
     for bar, value in zip(bars, sorted_df['f1']):
         ax.text(min(value + 0.01, 1.02), bar.get_y() + bar.get_height() / 2,
@@ -875,11 +954,13 @@ def generate_training_protocol(config, run_dir):
     return protocol_path, protocol_text
 
 
-def plot_confusion_matrix_knn(embeddings, labels, class_names, output_path, k=1):
-    """Generate confusion matrix using leave-one-out k-NN classification."""
-    logger.info(f"Generating confusion matrix (k-NN, k={k})...")
+def plot_confusion_matrix_knn(embeddings, labels, class_names, output_path, k=1, nn_metric='euclidean'):
+    """Generate confusion matrix using leave-one-out 1-NN (MLRC nn_metric)."""
+    logger.info(f"Generating confusion matrix (1-NN LOO, metric={nn_metric})...")
 
-    predictions = compute_knn_predictions(embeddings, labels, len(class_names), k=k)
+    predictions = compute_knn_predictions(
+        embeddings, labels, len(class_names), k=k, nn_metric=nn_metric
+    )
 
     # Compute confusion matrix
     cm = sk_confusion_matrix(labels, predictions, labels=list(range(len(class_names))))
@@ -898,7 +979,7 @@ def plot_confusion_matrix_knn(embeddings, labels, class_names, output_path, k=1)
     # Raw counts
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names,
                 yticklabels=class_names, ax=axes[0])
-    axes[0].set_title(f'Confusion Matrix (Counts) — Acc: {accuracy:.1%}', fontsize=14, fontweight='bold')
+    axes[0].set_title(f'Confusion Matrix (Counts) — 1-NN LOO ({nn_metric}) Acc: {accuracy:.1%}', fontsize=14, fontweight='bold')
     axes[0].set_xlabel('Predicted', fontsize=12)
     axes[0].set_ylabel('True', fontsize=12)
 
@@ -1022,7 +1103,7 @@ def _classify_embeddings(embeddings, slice_classifier: SliceAwareClassifier):
 
 
 def plot_inference_preview(model, slice_classifier, val_loader, device, output_path, class_names,
-                          n_samples=10):
+                          n_samples=10, grain_config=None, config=None):
     """
     Generate an inference preview grid: random val images with predictions,
     true labels, distances, and confidence color coding.
@@ -1043,14 +1124,18 @@ def plot_inference_preview(model, slice_classifier, val_loader, device, output_p
     # 1. Collect val images (we need raw tensors for display)
     all_images = []
     all_labels = []
+    all_masks = []
     for batch_data in val_loader:
-        images, labels = batch_data[0], batch_data[1]
+        images, labels, masks = _unpack_loader_batch(batch_data)
         all_images.append(images)
         all_labels.append(labels)
+        if masks is not None:
+            all_masks.append(masks)
         if sum(len(x) for x in all_images) >= max(n_samples * 5, 200):
             break
     all_images = torch.cat(all_images, dim=0)
     all_labels = torch.cat(all_labels, dim=0)
+    all_masks = torch.cat(all_masks, dim=0) if all_masks else None
 
     # 3. Sample n_samples random indices (balanced across classes)
     rng = np.random.RandomState(42)
@@ -1067,15 +1152,19 @@ def plot_inference_preview(model, slice_classifier, val_loader, device, output_p
 
     sel_images = all_images[selected_idx]
     sel_labels = all_labels[selected_idx]
+    sel_masks = all_masks[selected_idx] if all_masks is not None else None
 
-    # 4. Run inference
     with torch.no_grad():
-        sel_embs = model(sel_images.to(device))
+        sel_embs = _forward_embeddings(
+            model, sel_images, sel_masks, grain_config, device
+        )
         pred_classes, min_dists = _classify_embeddings(sel_embs, slice_classifier)
 
-    # 5. Denormalize images for display
-    mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+    if config is not None:
+        mean, std = _resolve_denorm_tensors(config)
+    else:
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
     sel_denorm = (sel_images * std + mean).clamp(0, 1)
 
     # 6. Create the visualization grid
@@ -1281,7 +1370,7 @@ def load_centroids(centroids_path, device):
 
 
 def generate_inference_gallery(model, slice_classifier, val_loader, device, output_dir, class_names,
-                               n_per_class=10):
+                               n_per_class=10, grain_config=None, config=None):
     """
     Generate a per-class inference gallery with n_per_class random images per class.
     Each class gets its own image grid saved in output_dir/inference_gallery/.
@@ -1308,13 +1397,16 @@ def generate_inference_gallery(model, slice_classifier, val_loader, device, outp
     all_dists = []
     all_all_dists = []
 
-    mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+    if config is not None:
+        mean, std = _resolve_denorm_tensors(config)
+    else:
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 
     with torch.no_grad():
         for batch_data in tqdm(val_loader, desc="Gallery inference", leave=False):
-            images, labels = batch_data[0], batch_data[1]
-            embs = model(images.to(device))
+            images, labels, masks = _unpack_loader_batch(batch_data)
+            embs = _forward_embeddings(model, images, masks, grain_config, device)
             preds, min_d = _classify_embeddings(embs, slice_classifier)
             _, _, class_scores = slice_classifier.predict(embs)
 
@@ -1502,16 +1594,20 @@ def generate_inference_gallery(model, slice_classifier, val_loader, device, outp
     return class_stats
 
 
-def generate_summary_report(csv_path, config, output_path, accuracy=0, per_class_acc=None,
-                            dist_ratio=0, class_names=None, emb_stats=None,
-                            std_metrics=None, per_class_df=None, training_protocol_path=None):
+def generate_summary_report(csv_path, config, output_path, slice_accuracy=0, knn_accuracy=0,
+                            per_class_acc=None, dist_ratio=0, class_names=None, emb_stats=None,
+                            std_metrics=None, per_class_df=None, training_protocol_path=None,
+                            accuracy=0):
     """Generate a markdown summary report of training results."""
     df = pd.read_csv(csv_path)
     output_path = Path(output_path)
 
-    best_row = df.loc[df['recall_at_1'].astype(float).idxmax()]
+    best_row, selection_metric = _resolve_best_training_row(df, config)
     final_row = df.iloc[-1]
     total_time = df['epoch_time_sec'].sum()
+    sel_value = float(
+        best_row.get('selection_value', best_row.get(selection_metric, 0.0))
+    )
 
     def fmt_time(s):
         m, sec = divmod(int(s), 60)
@@ -1530,14 +1626,19 @@ def generate_summary_report(csv_path, config, output_path, accuracy=0, per_class
         "",
         "## Best Model Performance",
         "",
+        f"Checkpoint seleccionado por **`{selection_metric}`** (protocolo MLRC).",
+        "",
         f"| Metric | Value |",
         f"|--------|-------|",
         f"| Best Epoch | {int(best_row['epoch'])} |",
-        f"| Recall@1 | {float(best_row['recall_at_1']):.4f} ({float(best_row['recall_at_1']):.1%}) |",
+        f"| Selection metric ({selection_metric}) | {sel_value:.4f} |",
+        f"| Recall@1 (val epoch) | {float(best_row['recall_at_1']):.4f} ({float(best_row['recall_at_1']):.1%}) |",
+        f"| mAP@R (val epoch) | {float(best_row.get('mAP@R', 0.0)):.4f} |",
         f"| Recall@5 | {float(best_row['recall_at_5']):.4f} ({float(best_row['recall_at_5']):.1%}) |",
-        f"| Val Loss | {float(best_row['val_loss']):.4f} |",
+        f"| Val Loss (aux. P×K) | {float(best_row['val_loss']):.4f} |",
         f"| Train Loss | {float(best_row['train_loss']):.4f} |",
-        f"| kNN Accuracy | {accuracy:.4f} ({accuracy:.1%}) |",
+        f"| Slice-aware accuracy (post-hoc LOO) | {slice_accuracy:.4f} ({slice_accuracy:.1%}) |",
+        f"| 1-NN LOO accuracy (MLRC) | {knn_accuracy:.4f} ({knn_accuracy:.1%}) |",
         f"| Distance Ratio (inter/intra) | {dist_ratio:.2f} |",
         "",
         "## Final Epoch Metrics",
@@ -1571,7 +1672,7 @@ def generate_summary_report(csv_path, config, output_path, accuracy=0, per_class
 
     # Per-class accuracy table
     if per_class_acc is not None and class_names is not None:
-        lines.append("## Per-Class Accuracy (kNN)")
+        lines.append("## Per-Class Accuracy (Slice-aware LOO)")
         lines.append("")
         lines.append("| Class | Accuracy |")
         lines.append("|-------|----------|")
@@ -1700,7 +1801,7 @@ def generate_summary_report(csv_path, config, output_path, accuracy=0, per_class
 
 
 def generate_gradcam_gallery(model, slice_classifier, val_loader, device, output_dir, class_names,
-                              n_per_class=4):
+                              n_per_class=4, grain_config=None, config=None):
     """
     Generate per-class Grad-CAM heatmap gallery.
     For each class, shows n_per_class images with 3 panels:
@@ -1727,10 +1828,12 @@ def generate_gradcam_gallery(model, slice_classifier, val_loader, device, output
     model.eval()
     explainer = create_explainer(model, device)  # created once, reused for all images
 
-    mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+    if config is not None:
+        mean, std = _resolve_denorm_tensors(config)
+    else:
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 
-    # Pass 1: collect labels/predictions only (avoid storing all images in RAM/VRAM)
     logger.info("  Collecting validation predictions for Grad-CAM...")
     all_labels = []
     all_preds = []
@@ -1738,8 +1841,8 @@ def generate_gradcam_gallery(model, slice_classifier, val_loader, device, output
 
     with torch.no_grad():
         for batch_data in tqdm(val_loader, desc="Grad-CAM inference", leave=False):
-            images, labels = batch_data[0], batch_data[1]
-            embs = model(images.to(device))
+            images, labels, masks = _unpack_loader_batch(batch_data)
+            embs = _forward_embeddings(model, images, masks, grain_config, device)
             preds, min_d = _classify_embeddings(embs, slice_classifier)
 
             all_labels.append(labels.cpu())
@@ -1770,14 +1873,17 @@ def generate_gradcam_gallery(model, slice_classifier, val_loader, device, output
     # Pass 2: fetch only the images required for visualization
     logger.info(f"  Fetching {len(needed_indices)} images for Grad-CAM (2-pass, memory-safe)...")
     image_cache = {}
+    mask_cache = {}
     global_idx = 0
     with torch.no_grad():
         for batch_data in tqdm(val_loader, desc="Grad-CAM image fetch", leave=False):
-            images, _ = batch_data[0], batch_data[1]
+            images, _, masks = _unpack_loader_batch(batch_data)
             batch_size = images.shape[0]
             for i in range(batch_size):
                 if global_idx in needed_indices or global_idx in summary_indices.values():
                     image_cache[global_idx] = images[i].cpu()
+                    if masks is not None:
+                        mask_cache[global_idx] = masks[i].cpu()
                 global_idx += 1
 
     _free_step_memory("gradcam_pass1")
@@ -1808,8 +1914,12 @@ def generate_gradcam_gallery(model, slice_classifier, val_loader, device, output
             img_np = img_denorm.permute(1, 2, 0).numpy()
 
             pred_target = slice_classifier.get_target_for_gradcam(pred_lbl, device)
+            mask_t = mask_cache.get(int(idx))
             heatmap = explainer.generate_heatmap(
-                img_tensor.unsqueeze(0), centroid=pred_target
+                img_tensor.unsqueeze(0),
+                centroid=pred_target,
+                mask=mask_t.unsqueeze(0) if mask_t is not None else None,
+                grain_config=grain_config,
             )
 
             # Overlay
@@ -1873,8 +1983,12 @@ def generate_gradcam_gallery(model, slice_classifier, val_loader, device, output
         img_np = img_denorm.permute(1, 2, 0).numpy()
 
         pred_target = slice_classifier.get_target_for_gradcam(pred_lbl, device)
+        mask_t = mask_cache.get(int(idx))
         heatmap = explainer.generate_heatmap(
-            img_tensor.unsqueeze(0), centroid=pred_target
+            img_tensor.unsqueeze(0),
+            centroid=pred_target,
+            mask=mask_t.unsqueeze(0) if mask_t is not None else None,
+            grain_config=grain_config,
         )
         overlay = overlay_gradcam_on_image(
             (img_np * 255).astype(np.uint8), heatmap, alpha=0.5
@@ -1916,16 +2030,79 @@ def generate_gradcam_gallery(model, slice_classifier, val_loader, device, output
     _free_step_memory("gradcam_complete")
 
 
+def _fullimage_bbox_iou(a, b, iou_threshold: float = 0.3) -> float:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    x1 = max(ax, bx)
+    y1 = max(ay, by)
+    x2 = min(ax + aw, bx + bw)
+    y2 = min(ay + ah, by + bh)
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    if inter <= 0:
+        return 0.0
+    union = aw * ah + bw * bh - inter
+    return inter / max(union, 1e-6)
+
+
+def _draw_fullimage_grain_labels(
+    display_img,
+    grains,
+    *,
+    expected_cls_idx: int,
+    class_names,
+    h_img: int,
+    w_img: int,
+):
+    """Dibuja bbox + clase + confianza sobre la imagen (después del Grad-CAM)."""
+    import cv2
+
+    font_scale = max(0.45, min(h_img, w_img) / 1800)
+    thickness = max(1, int(min(h_img, w_img) / 700))
+
+    for grain in grains:
+        bx, by, bw, bh = grain["bbox"]
+        pred_cls_name = grain["predicted_class"]
+        pred_cls = class_names.index(pred_cls_name) if pred_cls_name in class_names else -1
+        confidence = float(grain.get("confidence", 0.0))
+        correct = pred_cls == expected_cls_idx
+
+        box_color = (0, 200, 0) if correct else (0, 0, 220)
+        cv2.rectangle(display_img, (bx, by), (bx + bw, by + bh), box_color, max(2, thickness))
+
+        label = f"{pred_cls_name} {confidence:.0%}"
+        (tw, th), baseline = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
+        )
+        ty = by - 6 if by - th - 8 > 0 else by + bh + th + 6
+        cv2.rectangle(
+            display_img,
+            (bx, ty - th - baseline - 2),
+            (bx + tw + 6, ty + baseline + 2),
+            box_color,
+            -1,
+        )
+        cv2.putText(
+            display_img,
+            label,
+            (bx + 3, ty),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (255, 255, 255),
+            thickness,
+            cv2.LINE_AA,
+        )
+
+
 def generate_fullimage_inference(model, slice_classifier, device, config, output_dir, class_names,
                                   n_images_per_class=3, with_gradcam=True):
     """
     Run inference on FULL-RESOLUTION original images using FullImageClassifier.
     
     Pipeline per image:
-      1. Detect grains with U2-Net (FullImageClassifier)
+      1. Localize grains with PollenGrainDetector (U²-Net SOD + pollen morphology)
       2. Crop each grain from the original image
-      3. Transform + embed each crop with the trained model
-      4. Classify each crop by nearest centroid
+      3. Transform + embed each crop with the trained AnalogyNet (ViT)
+      4. Classify each crop via slice-aware classifier
       5. Draw annotated bounding boxes + labels on the full image
       6. Optionally overlay Grad-CAM heatmaps per grain
     
@@ -1981,7 +2158,8 @@ def generate_fullimage_inference(model, slice_classifier, device, config, output
         class_names=class_names,
         device=device,
         grain_config=grain_config,
-        k=5
+        k=5,
+        slice_classifier=slice_classifier,
     )
 
     # Normalization constants for denormalization
@@ -2059,98 +2237,149 @@ def generate_fullimage_inference(model, slice_classifier, device, config, output
                     logger.warning(f"  Image not found for {seg_path.name}: {img_name}")
                     continue
                 
-                # Usar FullImageClassifier para detección + clasificación automática
-                results = full_classifier.classify_full_image(str(img_path), return_crops=True)
-                grains = results.get('grains', [])
-                
-                if len(grains) == 0:
-                    logger.warning(f"  No grains detected in {img_path.name}")
-                    continue
-                
-                # Load image for visualization
+                seg_data = SegFileReader.read(str(seg_path))
+                annotated_grains = seg_data.get("grains", [])
+                n_annotated = len(annotated_grains)
+
+                discovery_mode = bool(
+                    (config.get("grain_detection") or {}).get("discovery_mode", False)
+                )
+                results = full_classifier.classify_full_image(
+                    str(img_path),
+                    return_crops=True,
+                    discovery_mode=discovery_mode,
+                )
+                grains = results.get("grains", [])
+
                 full_img = cv2.imread(str(img_path))
                 if full_img is None:
                     continue
                 h_img, w_img = full_img.shape[:2]
                 display_img = full_img.copy()
-                
+
             except Exception as e:
                 logger.warning(f"  Error processing {seg_path.name}: {e}")
+                continue
+
+            if len(grains) == 0:
+                logger.warning(f"  No grains detected in {img_path.name}")
                 continue
 
             img_grains_correct = 0
             img_grains_total = len(grains)
             heatmaps_and_bboxes = []
-            
-            # FullImageClassifier ya hizo la detección y clasificación
-            # Solo necesitamos visualizar los resultados
+            font_scale = max(0.4, min(h_img, w_img) / 2000)
+            thickness = max(1, int(min(h_img, w_img) / 800))
+
+            matched_ann = set()
             for g_idx, grain in enumerate(grains):
-                bx, by, bw, bh = grain['bbox']
-                pred_cls_name = grain['predicted_class']
-                pred_cls = class_names.index(pred_cls_name) if pred_cls_name in class_names else -1
-                confidence = grain['confidence']
-                
-                correct = (pred_cls == cls_idx)
-                if correct:
+                pred_cls_name = grain["predicted_class"]
+                pred_cls = (
+                    class_names.index(pred_cls_name) if pred_cls_name in class_names else -1
+                )
+                if pred_cls == cls_idx:
                     img_grains_correct += 1
 
-                # Draw bounding box on full image
-                box_color = (0, 200, 0) if correct else (0, 0, 220)
-                cv2.rectangle(display_img, (bx, by), (bx + bw, by + bh), box_color, 2)
+                for ann_i, ann in enumerate(annotated_grains):
+                    if _fullimage_bbox_iou(grain["bbox"], ann["bbox"]) >= 0.3:
+                        matched_ann.add(ann_i)
 
-                # Label
-                label = f"{pred_cls_name} ({confidence:.2f})"
-                font_scale = max(0.4, min(h_img, w_img) / 2000)
-                thickness = max(1, int(min(h_img, w_img) / 800))
-                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-                cv2.rectangle(display_img, (bx, by - th - 6), (bx + tw + 4, by), box_color, -1)
-                cv2.putText(display_img, label, (bx + 2, by - 4),
-                            cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
-
-                # Save crop and prepare Grad-CAM
-                if 'crop' in grain and grain['crop'] is not None:
-                    crops_dir = gallery_dir / 'crops'
+                if grain.get("crop") is not None:
+                    crops_dir = gallery_dir / "crops"
                     crops_dir.mkdir(parents=True, exist_ok=True)
-                    crop_bgr = grain['crop']
-                    
-                    safe_cls_name = cls_name.replace(' ', '_').replace('/', '_')
-                    safe_pred_cls_name = pred_cls_name.replace(' ', '_').replace('/', '_')
-                    base_name = f"{safe_cls_name}_{img_path.stem}_grain_{g_idx}_{safe_pred_cls_name}"
-                    
-                    # Opcionalmente seguimos guardando el crop para debug sin Grad-CAM
-                    crop_save_path = crops_dir / f"{base_name}.png"
-                    cv2.imwrite(str(crop_save_path), crop_bgr)
-                    
-                    if with_gradcam and explainer is not None and 'tensor' in grain:
-                        tensor = grain['tensor']
-                        target_cls = pred_cls if pred_cls != -1 else 0
-                        pred_target = slice_classifier.get_target_for_gradcam(target_cls, device)
-                        heatmap = explainer.generate_heatmap(tensor.unsqueeze(0), centroid=pred_target)
-                        heatmaps_and_bboxes.append((heatmap, grain['bbox']))
+                    safe_cls_name = cls_name.replace(" ", "_").replace("/", "_")
+                    safe_pred = pred_cls_name.replace(" ", "_").replace("/", "_")
+                    crop_save_path = crops_dir / (
+                        f"{safe_cls_name}_{img_path.stem}_grain_{g_idx}_{safe_pred}.png"
+                    )
+                    cv2.imwrite(str(crop_save_path), grain["crop"])
 
-            # Overlay ALL heatmaps on the full image
-            if with_gradcam and explainer is not None and len(heatmaps_and_bboxes) > 0:
+                if with_gradcam and explainer is not None and grain.get("tensor") is not None:
+                    target_cls = pred_cls if pred_cls != -1 else 0
+                    pred_target = slice_classifier.get_target_for_gradcam(target_cls, device)
+                    heatmap = explainer.generate_heatmap(
+                        grain["tensor"].unsqueeze(0), centroid=pred_target
+                    )
+                    heatmaps_and_bboxes.append((heatmap, grain["bbox"]))
+
+            # 1) Grad-CAM primero (no debe borrar etiquetas)
+            if with_gradcam and explainer is not None and heatmaps_and_bboxes:
                 from src.utils.inference_utils import overlay_full_image_gradcam
-                full_img_rgb = cv2.cvtColor(full_img, cv2.COLOR_BGR2RGB)
-                full_gradcam_overlay = overlay_full_image_gradcam(
-                    full_image=full_img_rgb,
-                    heatmaps_and_bboxes=heatmaps_and_bboxes,
-                    crop_padding=full_classifier.crop_padding,
-                    alpha=0.5
-                )
-                display_img = cv2.cvtColor(full_gradcam_overlay, cv2.COLOR_RGB2BGR)
 
+                full_img_rgb = cv2.cvtColor(full_img, cv2.COLOR_BGR2RGB)
+                gradcam_bgr = cv2.cvtColor(
+                    overlay_full_image_gradcam(
+                        full_image=full_img_rgb,
+                        heatmaps_and_bboxes=heatmaps_and_bboxes,
+                        crop_padding=full_classifier.crop_padding,
+                        alpha=0.45,
+                    ),
+                    cv2.COLOR_RGB2BGR,
+                )
+                display_img = cv2.addWeighted(gradcam_bgr, 0.85, full_img, 0.15, 0)
+
+            # 2) Granos anotados en .seg no detectados (referencia visual)
+            for ann_i, ann in enumerate(annotated_grains):
+                if ann_i in matched_ann:
+                    continue
+                bx, by, bw, bh = ann["bbox"]
+                cv2.rectangle(
+                    display_img, (bx, by), (bx + bw, by + bh), (255, 200, 0), 2, cv2.LINE_AA
+                )
+                cv2.putText(
+                    display_img,
+                    "anotado (no detectado)",
+                    (bx, max(12, by - 4)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    font_scale * 0.85,
+                    (255, 200, 0),
+                    thickness,
+                    cv2.LINE_AA,
+                )
+
+            # 3) Etiquetas de clase + confianza encima de todo
+            _draw_fullimage_grain_labels(
+                display_img,
+                grains,
+                expected_cls_idx=cls_idx,
+                class_names=class_names,
+                h_img=h_img,
+                w_img=w_img,
+            )
+
+            n_extra_discovered = sum(
+                1
+                for grain in grains
+                if not any(
+                    _fullimage_bbox_iou(grain["bbox"], ann["bbox"]) >= 0.3
+                    for ann in annotated_grains
+                )
+            )
+            n_missed_annotated = n_annotated - len(matched_ann)
             total_grains += img_grains_total
             total_correct += img_grains_correct
             acc = img_grains_correct / img_grains_total if img_grains_total > 0 else 0
 
-            # Add title bar at top
-            title = f"{cls_name} | {img_path.name} | {img_grains_correct}/{img_grains_total} grains correct ({acc:.0%})"
-            bar_h = max(30, int(h_img * 0.04))
+            title = (
+                f"{cls_name} | {img_path.name} | "
+                f"Detectados: {img_grains_total} | Anotados .seg: {n_annotated} | "
+                f"Correctos: {img_grains_correct}/{img_grains_total} ({acc:.0%}) | "
+                f"Extra descubiertos: {n_extra_discovered} | "
+                f"Anotados perdidos: {n_missed_annotated}"
+            )
+            bar_h = max(36, int(h_img * 0.045))
             title_bar = np.zeros((bar_h, w_img, 3), dtype=np.uint8)
             title_bar[:] = (40, 40, 40)
-            cv2.putText(title_bar, title, (10, bar_h - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, font_scale * 1.2, (255, 255, 255), thickness)
+            cv2.putText(
+                title_bar,
+                title,
+                (10, bar_h - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale * 1.1,
+                (255, 255, 255),
+                thickness,
+                cv2.LINE_AA,
+            )
             display_img = np.vstack([title_bar, display_img])
 
             # Save
@@ -2159,10 +2388,13 @@ def generate_fullimage_inference(model, slice_classifier, device, config, output
             cv2.imwrite(str(save_path), display_img)
 
             all_results.setdefault(cls_name, []).append({
-                'image': img_path.name,
-                'grains': img_grains_total,
-                'correct': img_grains_correct,
-                'accuracy': acc,
+                "image": img_path.name,
+                "grains": img_grains_total,
+                "annotated": n_annotated,
+                "correct": img_grains_correct,
+                "accuracy": acc,
+                "discovered_extra": n_extra_discovered,
+                "missed_annotated": n_missed_annotated,
             })
 
     # Generate summary figure
@@ -2281,8 +2513,20 @@ def run_post_training_analysis(
         logger.error(f"Embedding space analysis failed: {e}")
         emb_stats = None
 
-    knn_accuracy, per_class_acc, std_metrics, per_class_df, _knn_predictions = plot_confusion_matrix_knn(
-        embeddings, labels, class_names, str(post_dir / 'confusion_matrix.png')
+    from src.utils.mlrc_protocol import resolve_nn_metric
+
+    nn_metric = resolve_nn_metric(config)
+    grain_config = config.get("grain_detection", {})
+    gallery_cfg = (config.get("evaluation") or {}).get("gallery") or {}
+
+    knn_accuracy, knn_per_class_acc, knn_std_metrics, knn_per_class_df, _knn_predictions = (
+        plot_confusion_matrix_knn(
+            embeddings,
+            labels,
+            class_names,
+            str(post_dir / 'confusion_matrix.png'),
+            nn_metric=nn_metric,
+        )
     )
 
     slice_predictions = compute_slice_predictions(embeddings, slice_classifier)
@@ -2291,22 +2535,31 @@ def run_post_training_analysis(
         labels, slice_predictions, class_names
     )
     logger.info(
-        "Slice-aware accuracy: %.4f | kNN accuracy: %.4f",
+        "Slice-aware accuracy: %.4f | 1-NN LOO accuracy (%s): %.4f",
         slice_accuracy,
+        nn_metric,
         knn_accuracy,
     )
-    accuracy = slice_accuracy
-    std_metrics = slice_std_metrics
-    per_class_df = slice_per_class_df
 
     mean_intra, mean_inter, dist_ratio = plot_distance_distribution(
         embeddings, labels, class_names, str(post_dir / 'distance_distribution.png')
     )
 
-    class_report_path = post_dir / 'classification_report.csv'
-    per_class_df.to_csv(class_report_path, index=False, encoding='utf-8')
-    logger.info(f"Classification report CSV saved: {class_report_path}")
-    plot_per_class_f1(per_class_df, str(post_dir / 'per_class_f1.png'))
+    class_report_path = post_dir / 'classification_report_slice_aware.csv'
+    slice_per_class_df.to_csv(class_report_path, index=False, encoding='utf-8')
+    knn_report_path = post_dir / 'classification_report_1nn_loo.csv'
+    knn_per_class_df.to_csv(knn_report_path, index=False, encoding='utf-8')
+    logger.info(f"Classification reports saved: {class_report_path}, {knn_report_path}")
+    plot_per_class_f1(
+        slice_per_class_df,
+        str(post_dir / 'per_class_f1.png'),
+        metric_label="Slice-aware LOO",
+    )
+    plot_per_class_f1(
+        knn_per_class_df,
+        str(post_dir / 'per_class_f1_1nn_loo.png'),
+        metric_label=f"1-NN LOO ({nn_metric})",
+    )
     _free_step_memory("step3_plots")
 
     # 7. Inference preview
@@ -2314,7 +2567,10 @@ def run_post_training_analysis(
     plot_inference_preview(
         model, slice_classifier, loader, device,
         str(post_dir / 'inference_preview.png'),
-        class_names, n_samples=10
+        class_names,
+        n_samples=int(gallery_cfg.get("inference_preview", 10)),
+        grain_config=grain_config,
+        config=config,
     )
     _free_step_memory("inference_preview")
 
@@ -2323,7 +2579,10 @@ def run_post_training_analysis(
     try:
         generate_gradcam_gallery(
             model, slice_classifier, loader, device,
-            str(post_dir), class_names, n_per_class=4
+            str(post_dir), class_names,
+            n_per_class=int(gallery_cfg.get("gradcam_per_class", 4)),
+            grain_config=grain_config,
+            config=config,
         )
     except Exception as e:
         logger.error(f"Attention/Grad-CAM generation FAILED: {e}")
@@ -2336,7 +2595,10 @@ def run_post_training_analysis(
     try:
         generate_inference_gallery(
             model, slice_classifier, loader, device,
-            str(post_dir), class_names, n_per_class=10
+            str(post_dir), class_names,
+            n_per_class=int(gallery_cfg.get("inference_per_class", 10)),
+            grain_config=grain_config,
+            config=config,
         )
     except Exception as e:
         logger.error(f"Inference gallery generation FAILED: {e}")
@@ -2350,7 +2612,8 @@ def run_post_training_analysis(
         generate_fullimage_inference(
             model, slice_classifier, device, config,
             str(post_dir), class_names,
-            n_images_per_class=3, with_gradcam=True
+            n_images_per_class=int(gallery_cfg.get("fullimage_per_class", 3)),
+            with_gradcam=True
         )
     except Exception as e:
         logger.warning(f"Full-image inference failed (non-critical): {e}")
@@ -2425,8 +2688,14 @@ def run_post_training_analysis(
             'nn_metric': nn_metric,
             'map_at_r_exact': map_exact,
         },
-        'classification_standard': std_metrics,
-        'per_class': per_class_df.to_dict(orient='records')
+        'classification_standard': {
+            'slice_aware': slice_std_metrics,
+            'knn_loo': knn_std_metrics,
+        },
+        'per_class': {
+            'slice_aware': slice_per_class_df.to_dict(orient='records'),
+            'knn_loo': knn_per_class_df.to_dict(orient='records'),
+        },
     }
     with open(summary_json_path, 'w', encoding='utf-8') as f:
         json.dump(eval_summary, f, indent=2, ensure_ascii=False)
@@ -2439,14 +2708,15 @@ def run_post_training_analysis(
         csv_path=str(csv_path),
         config=config,
         output_path=str(report_path),
-        accuracy=accuracy,
-        per_class_acc=per_class_acc,
+        slice_accuracy=float(slice_accuracy),
+        knn_accuracy=float(knn_accuracy),
+        per_class_acc=knn_per_class_acc,
         dist_ratio=dist_ratio,
         class_names=class_names,
         emb_stats=emb_stats,
-        std_metrics=std_metrics,
-        per_class_df=per_class_df,
-        training_protocol_path=protocol_path.name if protocol_path.exists() else None
+        std_metrics=slice_std_metrics,
+        per_class_df=slice_per_class_df,
+        training_protocol_path=protocol_path.name if protocol_path.exists() else None,
     )
 
     # Spectral analysis
@@ -2519,10 +2789,9 @@ def run_post_training_analysis(
 
     return {
         'output_dir': str(post_dir),
-        'accuracy': accuracy,
         'slice_accuracy': float(slice_accuracy),
         'knn_accuracy': float(knn_accuracy),
-        'per_class_acc': per_class_acc.tolist() if per_class_acc is not None else [],
+        'per_class_acc': knn_per_class_acc.tolist() if knn_per_class_acc is not None else [],
         'dist_ratio': dist_ratio,
         'class_names': class_names,
     }

@@ -124,11 +124,17 @@ class TrainingTab(QWidget):
         config_layout.addRow("Archivo Config:", config_file_layout)
 
         self.ablation_summary_label = QLabel("")
+        self.ablation_summary_label.setToolTip(
+            "El informe post-entrenamiento (métricas, espectral, full-image) "
+            "siempre se genera tras 1 entrenamiento.\n\n"
+            "El estudio de ablación F-01…F-07 es OPCIONAL: re-entrena variantes "
+            "para una tabla comparativa académica (no sustituye al informe)."
+        )
         self.ablation_summary_label.setWordWrap(True)
         self.ablation_summary_label.setStyleSheet(
             "color: #0e639c; font-size: 11px; padding: 4px; background: #e8f4f8; border-radius: 4px;"
         )
-        config_layout.addRow("Ablaciones:", self.ablation_summary_label)
+        config_layout.addRow("Estudio ablación:", self.ablation_summary_label)
         
         # Checkpoint (opcional)
         checkpoint_layout = QHBoxLayout()
@@ -237,9 +243,9 @@ class TrainingTab(QWidget):
         style_on = "color: #0e639c; font-size: 11px; padding: 4px; background: #e8f4f8; border-radius: 4px;"
         style_warn = "color: #d9480f; font-size: 11px; padding: 4px; background: #fff4e6; border-radius: 4px;"
         style_off = "color: #666; font-size: 11px; padding: 4px; background: #f5f5f5; border-radius: 4px;"
-        if "ON" in summary:
+        if "re-entrenamiento" in summary:
             self.ablation_summary_label.setStyleSheet(style_on)
-        elif "seleccione" in summary or "sin matrices" in summary:
+        elif "seleccione" in summary:
             self.ablation_summary_label.setStyleSheet(style_warn)
         else:
             self.ablation_summary_label.setStyleSheet(style_off)

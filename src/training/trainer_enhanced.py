@@ -1,4 +1,4 @@
-﻿"""
+"""
 Enhanced Metric Learning Trainer with SOTA Techniques (2024)
 Supports Multi-Similarity Loss, ArcFace, Triplet Loss, and advanced training strategies
 
@@ -956,6 +956,7 @@ class MetricLearningTrainer:
         embeddings: torch.Tensor,
         labels: torch.Tensor,
         *,
+        prenorm_embeddings: Optional[torch.Tensor] = None,
         num_batches: int = 16,
     ) -> float:
         """
@@ -991,7 +992,12 @@ class MetricLearningTrainer:
                     idxs.extend(rng.sample(by_class[cls_id], k))
                 batch_emb = embeddings[idxs].to(self.device)
                 batch_lab = labels_cpu[idxs].to(self.device)
-                loss = self._compute_base_metric_loss(batch_emb, batch_lab, batch_emb)
+                batch_prenorm = (
+                    prenorm_embeddings[idxs].to(self.device)
+                    if prenorm_embeddings is not None
+                    else batch_emb
+                )
+                loss = self._compute_base_metric_loss(batch_emb, batch_lab, batch_prenorm)
                 losses.append(float(loss.item()))
 
         return float(sum(losses) / max(1, len(losses)))
@@ -1315,6 +1321,7 @@ class MetricLearningTrainer:
         )
         self.model.eval()
         emb_chunks = []
+        prenorm_chunks = []
         label_chunks = []
         val_data_time = 0.0
         val_gpu_time = 0.0
@@ -1363,6 +1370,7 @@ class MetricLearningTrainer:
                         )
 
                     emb_chunks.append(embeddings.detach())
+                    prenorm_chunks.append(_prenorm.detach())
                     label_chunks.append(labels.detach())
 
                     val_gpu_time += time.time() - t_gpu_start
@@ -1381,10 +1389,13 @@ class MetricLearningTrainer:
             return 0.0, {'val_loss': 0.0, 'recall_at_1': 0.0, 'recall_at_5': 0.0}
 
         all_embeddings = torch.cat(emb_chunks, dim=0)
+        all_prenorm = torch.cat(prenorm_chunks, dim=0) if prenorm_chunks else None
         all_labels = torch.cat(label_chunks, dim=0)
-        del emb_chunks, label_chunks
+        del emb_chunks, prenorm_chunks, label_chunks
 
-        avg_loss = self._estimate_pk_val_loss(all_embeddings, all_labels)
+        avg_loss = self._estimate_pk_val_loss(
+            all_embeddings, all_labels, prenorm_embeddings=all_prenorm
+        )
         if not np.isfinite(avg_loss):
             self.logger.warning(
                 "val_loss P×K no disponible (pocas muestras/clase en val); "
@@ -1504,6 +1515,8 @@ class MetricLearningTrainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
             'val_loss': val_loss,
+            'selection_metric': self.validation_metric,
+            'selection_value': float(self.best_selection_value),
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
             'config': self.config,
@@ -1764,7 +1777,8 @@ class MetricLearningTrainer:
 
         self.logger.info(f"\n{'='*70}")
         self.logger.info("Training completed!")
-        self.logger.info(f"Best validation loss: {self.best_val_loss:.4f}")
+        self.logger.info(f"Best {self.validation_metric}: {self.best_selection_value:.4f}")
+        self.logger.info(f"Best val_loss (auxiliary P×K): {self.best_val_loss:.4f}")
         self.logger.info(f"{'='*70}\n")
         
         return self.train_losses, self.val_losses

@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import torch
-import torch
 import torch.nn.functional as F
 import cv2
 from pytorch_metric_learning.samplers import MPerClassSampler

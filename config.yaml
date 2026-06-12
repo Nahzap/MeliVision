@@ -81,7 +81,7 @@ data:
     - 0.229
     - 0.224
     - 0.225
-    stain_method: null
+    stain_method: 'null'
 augmentation:
   performance_mode: true
   random_horizontal_flip: 0.5
@@ -110,6 +110,21 @@ augmentation:
       - 10.0
       - 50.0
       p: 0.5
+    blur:
+      enabled: true
+      p: 0.3
+      blur_limit: 3
+    optical_distortion:
+      enabled: true
+      p: 0.3
+      distort_limit: 0.1
+    clahe:
+      enabled: true
+      p: 0.5
+      clip_limit: 2.0
+      tile_grid_size:
+      - 8
+      - 8
   sensor_noise_model:
     enabled: false
     stats_path: data/stats/sensor_noise.json
@@ -157,10 +172,6 @@ training:
       alpha: 1.0
       beta: 50.0
       base_margin: 0.5
-      margin: 28.6
-      scale: 64.0
-      proxy_scale: 30.0
-      proxy_margin: 0.2
   validation_metric: mAP@R
   mining:
     enabled: false
@@ -233,13 +244,15 @@ sota:
     lambda: 0.5
   embedding_space: euclidean
   hyperbolic_curvature: 1.0
-  augmentation_mode: deit3_simple
+  augmentation_mode: full
   anti_collapse:
-    enabled: false
+    enabled: true
     lambda: 0.1
     t: 2.0
 grain_detection:
   enabled: true
+  localization_detector: u2net
+  discovery_mode: false
   model_type: u2netp
   input_size: 320
   saliency_threshold: 0.3
@@ -298,6 +311,12 @@ evaluation:
   select_checkpoint_on: val
   report_final_on: test
   progressive_plot_every_epochs: 2
+  gallery:
+    gradcam_per_class: 4
+    inference_per_class: 10
+    inference_preview: 10
+    fullimage_per_class: 3
+    tsne_max_samples: 3000
   ablation:
     enabled: false
     when: after_training

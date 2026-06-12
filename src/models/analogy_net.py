@@ -17,34 +17,6 @@ from src.models.pooling_config import (
 logger = logging.getLogger(__name__)
 
 
-def batched_1d_kmeans(x, k=3, max_iter=10):
-    """
-    1D K-means for a batch of tensors to approximate Multi-level Otsu thresholds.
-    x shape: (B, N)
-    """
-    B, N = x.shape
-    # Initialize centroids using quantiles
-    quantiles = torch.linspace(0.1, 0.9, k, device=x.device)
-    centroids = torch.quantile(x, quantiles, dim=1).t()  # (B, k)
-    
-    for _ in range(max_iter):
-        dists = torch.abs(x.unsqueeze(-1) - centroids.unsqueeze(1))  # (B, N, k)
-        assignments = torch.argmin(dists, dim=-1)
-        
-        new_centroids = torch.zeros_like(centroids)
-        for c in range(k):
-            mask = (assignments == c).float()
-            sums = (x * mask).sum(dim=1)
-            counts = mask.sum(dim=1).clamp(min=1e-8)
-            new_centroids[:, c] = sums / counts
-            
-        centroids = new_centroids
-        
-    centroids, _ = torch.sort(centroids, dim=-1)
-    thresholds = (centroids[:, :-1] + centroids[:, 1:]) / 2.0
-    return thresholds  # (B, k-1)
-
-
 class ChannelAttention(nn.Module):
     """Channel Attention Module (parte de CBAM). Ref: [R5] Zolfaghari & Sajedi 2024."""
     

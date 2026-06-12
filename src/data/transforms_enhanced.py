@@ -633,9 +633,8 @@ class DeiT3Augmentation:
             }
         
         image_size = config.get('image_size', 224)
-        norm = config.get('normalize', {})
-        mean = norm.get('mean', [0.485, 0.456, 0.406])
-        std = norm.get('std', [0.229, 0.224, 0.225])
+        is_grayscale = config.get("grayscale", {}).get("enabled", False)
+        norm_mean, norm_std = _resolve_normalize_stats(config, is_grayscale)
         
         self.transform = A.Compose(
             [
@@ -654,7 +653,7 @@ class DeiT3Augmentation:
                     ],
                     p=0.3,
                 ),
-                A.Normalize(mean=mean, std=std),
+                A.Normalize(mean=norm_mean, std=norm_std),
                 ToTensorV2(),
             ],
             additional_targets={"mask": "mask"},

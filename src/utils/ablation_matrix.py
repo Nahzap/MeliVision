@@ -276,15 +276,25 @@ def format_ablation_startup_summary(config: dict) -> str:
     """One-line summary for GUI status bar / training tab."""
     abl = resolve_ablation_settings(config)
     if not abl.get("enabled", False):
-        return "Ablaciones: desactivadas"
+        return (
+            "Sin estudio de ablación. El informe post-entrenamiento "
+            "(métricas MLRC, espectral, full-image) se genera siempre "
+            "tras el entrenamiento principal."
+        )
     matrices = resolve_enabled_matrices(abl)
     if not matrices:
-        return "Ablaciones: habilitadas — seleccione al menos una matriz F-01…F-07"
+        return (
+            "Estudio de ablación activado — seleccione al menos una matriz "
+            "F-01…F-07 en Evaluación (cada variante re-entrena; no es el informe)."
+        )
     n = count_planned_variants(config)
     labels = ", ".join(matrices)
     ep = abl.get("epochs")
-    ep_note = f", {int(ep)} ép/variante" if ep is not None else ""
-    return f"Ablaciones: ON — {n} entrenamiento(s) extra ({labels}){ep_note}"
+    ep_note = f", {int(ep)} ép/variante" if ep is not None else ", mismas épocas que el principal"
+    return (
+        f"Estudio de ablación ON — {n} re-entrenamiento(s) extra ({labels}){ep_note}. "
+        "Genera tabla F-01…F-07; el informe del best model corre aparte."
+    )
 
 
 def count_planned_variants(config: dict) -> int:

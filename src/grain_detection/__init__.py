@@ -1,16 +1,17 @@
 """
-grain_detection — Módulo de detección y segmentación de granos de polen.
+grain_detection — Detección y segmentación de granos de polen.
 
-Pipeline: U²-Net (SOD) → Contornos → Anotaciones .seg → Crops on-the-fly
+Preprocesamiento e inferencia full-image (localización): PollenGrainDetector (U²-Net SOD).
+Clasificación: AnalogyNet + SliceAwareClassifier (best model entrenado).
 
 Componentes:
-- salient_detector: Wrapper U²-Net para mapas de saliencia
-- grain_detector: PollenGrainDetector (multi-grano con filtrado)
-- seg_format: Parser/Writer del formato de anotación .seg
-- detected_grain: Dataclasses DetectedGrain y GrainCountResult
-- annotator: SegmentationAnnotator (generación batch de .seg)
+- salient_detector / grain_detector: U²-Net (localización + .seg)
+- model_grain_detector: backend legacy (atención ViT) — opcional
+- seg_format, annotator, full_image_classifier
 """
 
 from .detected_grain import DetectedGrain, GrainCountResult
 from .seg_format import SegFileWriter, SegFileReader
-from .full_image_classifier import FullImageClassifier
+from .full_image_classifier import FullImageClassifier, resolve_localization_detector
+from .grain_detector import PollenGrainDetector
+from .model_grain_detector import ModelGrainDetector

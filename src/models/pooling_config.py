@@ -12,7 +12,7 @@ DEFAULT_POOLING_CONFIG: Dict[str, Any] = {
     "layers": [3, 11],
     "statistics": ["mean", "max", "std"],
     "gem": {"p": 3.0, "learnable": False, "eps": 1e-6},
-    "masked": {"enabled": True, "threshold": 0.01, "weighting": "soft"},
+    "masked": {"enabled": True, "threshold": 0.3, "weighting": "soft"},
     "drop_token": {"enabled": True, "prob": 0.3, "eval_mode": "off"},
     "norm_intermediate": True,
     "layer_fusion": "per_layer",  # per_layer | concat

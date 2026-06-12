@@ -2,25 +2,20 @@
 FullImageClassifier — Pipeline completo para clasificar granos en imagen de cámara.
 
 Flujo:
-    1. Detecta granos con PollenGrainDetector (U²-Net saliency)
+    1. Localiza granos con PollenGrainDetector (U²-Net SOD + morfología de polen)
     2. Recorta cada grano detectado
-    3. Extrae embedding con AnalogyNet (modelo entrenado con metric learning)
-    4. Clasifica via slice-aware classifier o k-NN de referencia
-    5. Genera visualización con bboxes, labels, y heatmap de confianza
+    3. Extrae embedding con AnalogyNet (best model entrenado con metric learning)
+    4. Clasifica vía slice-aware classifier o k-NN de referencia
+    5. Genera visualización con bboxes, labels y heatmap de confianza
 
-Uso:
-    classifier = FullImageClassifier.from_checkpoint(
-        checkpoint_path="models/final_model.pth",
-        config_path="config.yaml",
-    )
-    results = classifier.classify_full_image("foto_camara.jpg")
-    annotated = classifier.draw_results(image, results)
+El ViT entrenado gobierna identidad taxonómica; U²-Net gobierna localización (tarea distinta).
+ModelGrainDetector (atención ViT) queda como backend legacy opcional.
 """
 
 import logging
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
@@ -30,16 +25,74 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
+LOCALIZATION_DETECTORS = ("u2net", "vit")
+
+
+def resolve_localization_detector(grain_config: Optional[Dict]) -> str:
+    """Return active full-image localization backend: ``u2net`` (default) or ``vit``."""
+    cfg = grain_config or {}
+    backend = str(cfg.get("localization_detector", "u2net")).strip().lower()
+    aliases = {
+        "pollen": "u2net",
+        "u2-net": "u2net",
+        "u²-net": "u2net",
+        "model": "vit",
+        "analogynet": "vit",
+        "vit_attention": "vit",
+    }
+    backend = aliases.get(backend, backend)
+    if backend not in LOCALIZATION_DETECTORS:
+        raise ValueError(
+            f"grain_detection.localization_detector must be one of {LOCALIZATION_DETECTORS}, "
+            f"got {backend!r}"
+        )
+    return backend
+
 
 class FullImageClassifier:
     """
     Pipeline end-to-end: imagen completa de cámara → clasificación por grano.
 
     Combina:
-    - PollenGrainDetector (U²-Net) para localizar granos
-    - AnalogyNet (metric learning) para extraer embeddings
-    - Slice-aware classifier (primario) o k-NN contra embeddings de referencia
+    - PollenGrainDetector (U²-Net + filtros morfológicos de polen) para localizar
+    - AnalogyNet (metric learning) para extraer embeddings y clasificar
     """
+
+    @staticmethod
+    def _create_localization_detector(
+        grain_config: Dict,
+        *,
+        model: nn.Module,
+        transforms,
+        device: torch.device,
+        slice_classifier=None,
+    ):
+        backend = resolve_localization_detector(grain_config)
+        if backend == "vit":
+            from src.grain_detection.model_grain_detector import ModelGrainDetector
+
+            logger.info(
+                "[FullImageClassifier] Localización: ModelGrainDetector (ViT attention, legacy)"
+            )
+            return ModelGrainDetector(
+                model=model,
+                transforms=transforms,
+                device=device,
+                config=grain_config,
+                slice_classifier=slice_classifier,
+            )
+
+        from src.grain_detection.grain_detector import PollenGrainDetector
+
+        det_config = dict(grain_config)
+        det_config["device"] = str(device)
+        logger.info(
+            "[FullImageClassifier] Localización: PollenGrainDetector (U²-Net SOD + morfología polen) "
+            f"[adaptive_k={det_config.get('adaptive_k', 0.3)}, "
+            f"min_area={det_config.get('min_area', 1000)}, "
+            f"min_circularity={det_config.get('min_circularity', 0.3)}]"
+        )
+        return PollenGrainDetector(config=det_config)
 
     def __init__(
         self,
@@ -62,7 +115,7 @@ class FullImageClassifier:
             reference_labels: Labels de referencia (N,)
             class_names: Nombres de clases
             device: torch device
-            grain_config: Config para PollenGrainDetector (opcional, usa defaults)
+            grain_config: Config de detección (parámetros morfológicos; sin U²-Net)
             k: Vecinos para k-NN
         """
         self.model = model
@@ -88,27 +141,38 @@ class FullImageClassifier:
         # Detector de granos (lazy-loaded)
         self._grain_config = grain_config or {}
         self.max_load_side = int(self._grain_config.get("max_load_side", 1536))
-        self._detector = None
+        self._localization_backend = resolve_localization_detector(self._grain_config)
+
+        self._detector = self._create_localization_detector(
+            self._grain_config,
+            model=self.model,
+            transforms=self.transforms,
+            device=self.device,
+            slice_classifier=slice_classifier,
+        )
 
         # Parámetros de crop (deben coincidir con el entrenamiento)
         self.crop_padding = self._grain_config.get("crop_padding", 0.2)
         self.crop_size = self._grain_config.get("crop_size", 256)
         self.use_mask = self._grain_config.get("use_mask", True)
+        self.masked_pooling = bool(self._grain_config.get("masked_pooling", True))
 
         mode = "slice-aware" if slice_classifier is not None else f"kNN (k={k})"
         logger.info(
             f"[FullImageClassifier] Inicializado — "
             f"{len(class_names)} clases, {mode}, "
+            f"localización={self._localization_backend}, "
             f"{len(reference_embeddings)} embeddings de referencia"
         )
 
     @property
     def detector(self):
-        """Lazy-load del detector para no cargar U²-Net hasta que se necesite."""
-        if self._detector is None:
-            from src.grain_detection.grain_detector import PollenGrainDetector
-            self._detector = PollenGrainDetector(config=self._grain_config)
+        """Detector de localización (U²-Net por defecto)."""
         return self._detector
+
+    @property
+    def localization_backend(self) -> str:
+        return self._localization_backend
 
     @classmethod
     def from_checkpoint(
@@ -278,6 +342,7 @@ class FullImageClassifier:
         self,
         image_or_path,
         return_crops: bool = False,
+        discovery_mode: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """
         Pipeline completo: detectar granos → clasificar cada uno.
@@ -285,6 +350,8 @@ class FullImageClassifier:
         Args:
             image_or_path: np.ndarray BGR o ruta a imagen
             return_crops: Si True, incluye los crops en los resultados
+            discovery_mode: Multi-umbral + NMS (más recall, más FP). Si None, usa
+                            ``grain_detection.discovery_mode`` (default False).
 
         Returns:
             Dict con:
@@ -295,6 +362,9 @@ class FullImageClassifier:
                 - image_shape: (H, W)
         """
         t0 = time.perf_counter()
+
+        if discovery_mode is None:
+            discovery_mode = bool(self._grain_config.get("discovery_mode", False))
 
         # Cargar imagen
         if isinstance(image_or_path, (str, Path)):
@@ -328,9 +398,12 @@ class FullImageClassifier:
             )
             logger.info(f"[FullImage] Resized for detection from {h}x{w} to {image.shape[0]}x{image.shape[1]}")
 
-        # 1. Detectar granos con U²-Net
+        # 1. Localizar granos (U²-Net por defecto; discovery_mode = multi-umbral opcional)
         t1 = time.perf_counter()
-        saliency_map, detected_grains = self.detector.detect(image)
+        if discovery_mode and hasattr(self.detector, "detect_exhaustive"):
+            saliency_map, detected_grains = self.detector.detect_exhaustive(image)
+        else:
+            saliency_map, detected_grains = self.detector.detect(image)
         t_detect = (time.perf_counter() - t1) * 1000
 
         # Escalar coordenadas detectadas de vuelta a la resolución original
@@ -372,12 +445,14 @@ class FullImageClassifier:
         tensor_list = []
         mask_tensor_list = []
         crop_bgr_list = []
+        valid_grains = []
 
-        # 2.1. Preparar lista de tensores
+        # 2.1. Preparar lista de tensores (solo granos con crop válido)
         for grain in detected_grains:
             crop_bgr = self._extract_crop(image, grain)
             if crop_bgr is None:
                 continue
+            valid_grains.append(grain)
             if self.use_mask and grain.contour is not None:
                 crop_bgr, mask_crop = self._apply_contour_mask(crop_bgr, image, grain)
                 mask_float = torch.from_numpy(mask_crop.astype(np.float32) / 255.0)
@@ -416,13 +491,23 @@ class FullImageClassifier:
             batch_chunk = torch.stack(tensor_list[i:i+batch_size]).to(self.device)
             mask_chunk = torch.stack(mask_tensor_list[i:i+batch_size]).to(self.device)
             with torch.no_grad():
-                emb_chunk = self.model(batch_chunk, mask=mask_chunk).cpu().numpy()
+                emb_chunk = self.model(
+                    batch_chunk,
+                    mask=mask_chunk if self.masked_pooling else None,
+                ).cpu().numpy()
                 embeddings_list.append(emb_chunk)
         
         batch_embeddings = np.vstack(embeddings_list)
 
+        if len(valid_grains) != batch_embeddings.shape[0]:
+            logger.warning(
+                "[FullImage] Desalineación crops/embeddings: %d vs %d",
+                len(valid_grains),
+                batch_embeddings.shape[0],
+            )
+
         # 2.3. Clasificación e interconexión diccionarios (O(N) CPU)
-        for i, grain in enumerate(detected_grains):
+        for i, grain in enumerate(valid_grains):
             emb_1d = batch_embeddings[i]
             emb_2d = np.expand_dims(emb_1d, axis=0)
 

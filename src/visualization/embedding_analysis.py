@@ -15,10 +15,11 @@ Protocolo de validación (de la investigación):
 3. Computar SVD (Singular Value Decomposition)
 4. Analizar distribución de varianza en componentes principales
 
-Criterios de éxito:
-- λ₁ < 0.60 (antes: >0.90) → varianza distribuida
-- Effective Rank > 30 (antes: ~5) → explotación del hiperespacio
-- Cumulative Variance suave → no hay componente dominante único
+Criterios de colapso (implementación):
+- collapse_severity = λ₁ / Σλ (varianza total en covarianza de embeddings)
+- is_collapsed si collapse_severity > 0.80
+- effective_rank = mínimo de componentes para ≥95% varianza explicada acumulada
+  (participation rank; no confundir con stable rank de Roy–Neill)
 
 Referencias:
 - Investigación ViTs (docs/20260305_173615_Research_ViTs.md)

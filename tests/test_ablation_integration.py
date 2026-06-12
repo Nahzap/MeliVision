@@ -107,12 +107,13 @@ class TestDefaultsAndSummary:
 
     def test_format_summary_disabled(self):
         cfg = _config_with_ablation(enabled=False)
-        assert "desactivadas" in format_ablation_startup_summary(cfg)
+        text = format_ablation_startup_summary(cfg)
+        assert "informe post-entrenamiento" in text
 
     def test_format_summary_enabled(self):
         cfg = _config_with_ablation(matrices={"pooling": True})
         text = format_ablation_startup_summary(cfg)
-        assert "ON" in text
+        assert "re-entrenamiento" in text
         assert "pooling" in text
 
 

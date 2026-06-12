@@ -197,14 +197,36 @@ def validate_config(
     if config_path and not Path(config_path).exists():
         errors.append(f"Archivo de configuración no encontrado: {config_path}")
 
-    # Parámetros huérfanos bajo sliced_ms (no bloquean, solo avisan)
+    # Parámetros huérfanos bajo sliced_ms — error (no deben figurar en el paper)
     if loss_type == "sliced_ms":
         orphan_keys = {"proxy_scale", "proxy_margin", "margin", "scale", "base", "use_ldm"}
         present = orphan_keys.intersection(loss_params.keys())
         if present:
-            warnings.append(
-                f"Parámetros no usados por sliced_ms en loss.params: {sorted(present)}"
+            errors.append(
+                f"Parámetros no usados por sliced_ms en training.loss.params: "
+                f"{sorted(present)} — elimínelos del config"
             )
+
+    sota = config.get("sota") or {}
+    for ghost_key in ("uniformity", "decorrelation", "disentanglement", "amplitude_penalty"):
+        block = sota.get(ghost_key) or {}
+        if block.get("enabled", False):
+            errors.append(
+                f"sota.{ghost_key}.enabled=true no está implementado en el trainer; "
+                "desactívelo o use NIR/HIER/anti_collapse"
+            )
+
+    if config.get("augmentation", {}).get("performance_mode") and (
+        config.get("augmentation", {}).get("domain_augmentation", {}).get("enabled")
+        or config.get("augmentation", {})
+        .get("microscopy_specific", {})
+        .get("optical_distortion", {})
+        .get("enabled")
+    ):
+        warnings.append(
+            "augmentation.performance_mode=true desactiva domain_augmentation y "
+            "optical_distortion aunque aparezcan enabled en YAML"
+        )
 
     projection_layout = resolve_projection_config(model_cfg)["layout"]
     projection_cfg = resolve_projection_config(model_cfg)
@@ -228,6 +250,12 @@ def validate_config(
     raw_pooling = model_cfg.get("pooling") or {}
     explicit_threshold = raw_pooling.get("masked", {}).get("threshold")
     saliency = grain_cfg.get("saliency_threshold")
+    loc_detector = str(grain_cfg.get("localization_detector", "u2net")).strip().lower()
+    if loc_detector not in ("u2net", "pollen", "vit", "model", "analogynet", "vit_attention", "u2-net"):
+        errors.append(
+            f"grain_detection.localization_detector inválido: {loc_detector!r} "
+            "(use u2net o vit)"
+        )
     resolved_threshold = pooling_cfg.get("masked", {}).get("threshold")
     if (
         explicit_threshold is not None
