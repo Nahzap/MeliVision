@@ -41,7 +41,12 @@ class TestConfigValidator:
             "training": {
                 "loss": {
                     "type": "sliced_ms",
-                    "params": {"num_slices": 4, "alpha": 2.0, "beta": 50.0},
+                    "params": {
+                        "num_slices": 4,
+                        "alpha": 2.0,
+                        "beta": 50.0,
+                        "base_margin": 0.5,
+                    },
                 }
             },
             "data": {"classes_per_batch": 8},
@@ -70,3 +75,12 @@ class TestConfigValidator:
         summary = build_pipeline_summary(self._base_config())
         assert "4×32D" in summary
         assert "self-distill off" in summary
+
+    def test_resolution_mismatch_warning(self):
+        cfg = self._base_config()
+        cfg["data"] = {"image_size": 252, "resize_size": 504, "classes_per_batch": 8}
+        cfg["grain_detection"] = {"crop_size": 504}
+        result = validate_config(cfg, check_data_dirs=False)
+        assert result["valid"] is True
+        assert any("crop_size" in w for w in result["warnings"])
+        assert "252px" in build_pipeline_summary(cfg)

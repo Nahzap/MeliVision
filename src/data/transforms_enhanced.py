@@ -16,6 +16,59 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _resolve_normalize_stats(config: dict, is_grayscale: bool) -> tuple:
+    """Return (mean, std) from data.normalize.mode (E-01) and grayscale override (C-11)."""
+    from src.utils.dataset_norm import resolve_normalization_config
+
+    resolved = resolve_normalization_config(config)
+    norm_mean = list(resolved["mean"])
+    norm_std = list(resolved["std"])
+    gs = config.get("grayscale", {}) or {}
+    if is_grayscale and gs.get("override_norm", False):
+        logger.warning(
+            "augmentation.grayscale.override_norm=true: usando [0.5,0.5,0.5] "
+            "en lugar de data.normalize (ImageNet/dataset stats)"
+        )
+        return [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]
+    return norm_mean, norm_std
+
+
+def _stain_normalize_step(config: dict):
+    """Optional stain normalization before Albumentations Normalize (E-02)."""
+    from src.data.stain_normalization import build_stain_normalizer
+    from src.utils.dataset_norm import resolve_normalization_config
+
+    resolved = resolve_normalization_config(config)
+    method = resolved.get("stain_method")
+    if resolved.get("mode") == "macenko" and not method:
+        method = "macenko"
+    stain_cfg = (config.get("data") or {}).get("normalize") or config.get("normalize") or {}
+    normalizer = build_stain_normalizer(method, stain_cfg)
+    if normalizer is None:
+        return None
+
+    def _apply(image, **kwargs):
+        return normalizer(image)
+
+    return A.Lambda(image=_apply, p=1.0)
+
+
+def _coarse_dropout_transform(domain_aug: dict) -> A.CoarseDropout:
+    """Build CoarseDropout from domain_augmentation config (C-02)."""
+    holes = int(domain_aug.get("coarse_dropout_holes", 4))
+    hole_min = int(domain_aug.get("coarse_dropout_hole_min", 20))
+    hole_max = int(domain_aug.get("coarse_dropout_hole_max", 80))
+    fill = int(domain_aug.get("coarse_dropout_fill", 128))
+    p = float(domain_aug.get("coarse_dropout_p", 0.7))
+    return A.CoarseDropout(
+        num_holes_range=(max(1, holes), max(1, holes)),
+        hole_height_range=(hole_min, hole_max),
+        hole_width_range=(hole_min, hole_max),
+        fill=fill,
+        p=p,
+    )
+
+
 def get_input_size_for_backbone(backbone_name):
     """
     Obtiene la resolución de entrada óptima para cada backbone.
@@ -197,9 +250,12 @@ class MicroscopyAugmentation:
             )
         
         if micro.get('gaussian_noise', {}).get('enabled', False):
+            from src.utils.sensor_noise import resolve_gauss_noise_var_limit
+
+            v_lo, v_hi = resolve_gauss_noise_var_limit(self.config)
             transform_list.append(
                 A.GaussNoise(
-                    std_range=tuple(v / 255.0 for v in micro['gaussian_noise']['var_limit']),
+                    std_range=(v_lo / 255.0, v_hi / 255.0),
                     p=micro['gaussian_noise']['p']
                 )
             )
@@ -236,8 +292,6 @@ class MicroscopyAugmentation:
             rgb_shift = domain_aug.get('rgb_shift_limit', 20)
             tone_scale = domain_aug.get('tone_curve_scale', 0.15)
             ds_min = domain_aug.get('downscale_min', 0.6)
-            cd_holes = domain_aug.get('coarse_dropout_holes', 3)
-            
             # Avoid destructive resolution/color drops on grayscale/low-res
             if not is_grayscale:
                 transform_list.extend([
@@ -254,12 +308,7 @@ class MicroscopyAugmentation:
                     A.Downscale(
                         scale_range=(ds_min, 0.8), p=0.5
                     ),
-                    A.CoarseDropout(
-                        num_holes_range=(1, 5), 
-                        hole_height_range=(20, 80), 
-                        hole_width_range=(20, 80), 
-                        fill_value=128, p=0.7
-                    )
+                    _coarse_dropout_transform(domain_aug),
                 ])
             
         # RGB → grayscale: aplicado DESPUÉS de alteraciones de color para no re-colorear
@@ -267,15 +316,12 @@ class MicroscopyAugmentation:
         if gs.get('enabled', False):
             transform_list.append(A.ToGray(p=float(gs.get('p', 0.5))))
         
-        # Normalization and tensor conversion
-        norm_mean = self.config['normalize']['mean']
-        norm_std = self.config['normalize']['std']
-        
-        # Symmetrical normalization for Grayscale to prevent artificial purple/green colorization
-        if is_grayscale:
-            norm_mean = [0.5, 0.5, 0.5]
-            norm_std = [0.5, 0.5, 0.5]
-            
+        stain_step = _stain_normalize_step(self.config)
+        if stain_step is not None:
+            transform_list.append(stain_step)
+
+        norm_mean, norm_std = _resolve_normalize_stats(self.config, is_grayscale)
+
         transform_list.extend([
             A.Normalize(
                 mean=norm_mean,
@@ -408,16 +454,13 @@ def get_augmentation_preview_columns(config: dict):
         rgb_shift = domain.get('rgb_shift_limit', 20)
         tone_scale = domain.get('tone_curve_scale', 0.15)
         ds_min = domain.get('downscale_min', 0.6)
-        cd_holes = domain.get('coarse_dropout_holes', 3)
         domain_steps = [
             ('RGBShift', [A.RGBShift(
                 r_shift_limit=rgb_shift, g_shift_limit=rgb_shift,
                 b_shift_limit=rgb_shift, p=1.0)]),
             ('ToneCurve', [A.RandomToneCurve(scale=tone_scale, p=1.0)]),
             ('Downscale', [A.Downscale(scale_range=(ds_min, 0.8), p=1.0)]),
-            ('CoarseDropout', [A.CoarseDropout(
-                num_holes_range=(1, 5), hole_height_range=(20, 80),
-                hole_width_range=(20, 80), fill_value=128, p=1.0)]),
+            ('CoarseDropout', [_coarse_dropout_transform({**domain, "coarse_dropout_p": 1.0})]),
         ]
         for label, steps in domain_steps:
             columns.append((
@@ -462,7 +505,7 @@ def get_train_transforms(config=None, mode='full', backbone_name=None):
             else:
                 config['resize_size'] = int(resolved_size * 1.14)  # ~256 para 224
     
-    if mode == 'deit3':
+    if mode in ('deit3', 'deit3_simple'):
         return DeiT3Augmentation(config)
     
     # Usar directamente MicroscopyAugmentation sin ramas ocultas ni fallbacks
@@ -494,14 +537,12 @@ class ValidationTransform:
         if grayscale_p > 0:
             transforms_list.append(A.ToGray(p=grayscale_p))
             
-        norm_mean = config["normalize"]["mean"]
-        norm_std = config["normalize"]["std"]
-        
-        # Symmetrical normalization for Grayscale to prevent artificial purple/green colorization
-        if is_grayscale:
-            norm_mean = [0.5, 0.5, 0.5]
-            norm_std = [0.5, 0.5, 0.5]
-        
+        stain_step = _stain_normalize_step(config)
+        if stain_step is not None:
+            transforms_list.append(stain_step)
+
+        norm_mean, norm_std = _resolve_normalize_stats(config, is_grayscale)
+
         transforms_list.extend([
             A.Normalize(
                 mean=norm_mean,
@@ -608,7 +649,7 @@ class DeiT3Augmentation:
                 A.OneOf(
                     [
                         A.ToGray(p=1.0),
-                        A.Solarize(threshold_range=(128, 128), p=1.0),
+                        A.Solarize(threshold_range=(0.5, 0.5), p=1.0),
                         A.GaussianBlur(blur_limit=(3, 7), p=1.0),
                     ],
                     p=0.3,
@@ -636,52 +677,13 @@ class DeiT3Augmentation:
         return augmented["image"]
 
 
-class ReinhardStainNormalization:
-    """
-    Reinhard color normalization for microscopy images.
-    Normalizes color distribution to match a reference image's statistics.
-    Ref: Sevillano et al. 2020 [R6].
-    
-    Args:
-        target_mean: Target mean per channel (L, a, b). Default: empirical microscopy values.
-        target_std: Target std per channel (L, a, b). Default: empirical microscopy values.
-    """
-    
-    def __init__(self, target_mean=None, target_std=None):
-        self.target_mean = target_mean or [70.0, 0.0, 0.0]
-        self.target_std = target_std or [15.0, 5.0, 5.0]
-    
-    def __call__(self, image):
-        """
-        Apply Reinhard normalization.
-        
-        Args:
-            image: numpy array (H, W, 3) RGB uint8
-            
-        Returns:
-            Normalized image (H, W, 3) RGB uint8
-        """
-        import cv2
-        
-        if not isinstance(image, np.ndarray):
-            image = np.array(image)
-        
-        if image.dtype != np.uint8:
-            image = (image * 255).astype(np.uint8) if image.max() <= 1.0 else image.astype(np.uint8)
-        
-        lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB).astype(np.float32)
-        
-        for i in range(3):
-            channel = lab[:, :, i]
-            src_mean = channel.mean()
-            src_std = channel.std() + 1e-6
-            
-            channel = (channel - src_mean) * (self.target_std[i] / src_std) + self.target_mean[i]
-            lab[:, :, i] = np.clip(channel, 0, 255)
-        
-        result = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2RGB)
-        return result
-    
+# Backward-compatible re-export (implementación en stain_normalization.py, E-02)
+from src.data.stain_normalization import ReinhardStainNormalization as _ReinhardImpl
+
+
+class ReinhardStainNormalization(_ReinhardImpl):
+    """Alias de stain_normalization.ReinhardStainNormalization (Reinhard et al., 2001)."""
+
     @staticmethod
     def compute_dataset_stats(image_paths, max_images=100):
         """

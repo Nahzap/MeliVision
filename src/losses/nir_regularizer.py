@@ -17,27 +17,41 @@ logger = logging.getLogger(__name__)
 class NIRRegularizer(nn.Module):
     """
     Non-Isotropy Regularization.
-    
-    Computes per-class covariance of embeddings and penalizes low
-    log-determinant (which indicates isotropy / spherical collapse).
-    
+
     L_NIR = -lambda * mean_c[ log det(Sigma_c + eps*I) ]
-    
-    Added to the main loss: L_total = L_metric + L_NIR
-    
-    Args:
-        lambda_nir (float): Weight of the NIR term. Default 0.5.
-        eps (float): Regularization for covariance matrix. Default 1e-4.
+
+    Skips classes with fewer than ``min_samples_per_class`` points in the
+    current batch to avoid rank-deficient covariance crashes.
     """
-    
-    def __init__(self, lambda_nir=0.5, eps=1e-4):
+
+    def __init__(self, lambda_nir=0.5, eps=1e-4, min_samples_per_class: int = 2):
         super().__init__()
         self.lambda_nir = lambda_nir
         self.eps = eps
-    
+        self.min_samples_per_class = max(2, int(min_samples_per_class))
+
     def forward(self, embeddings, labels):
-        """
-        Compute NIR loss.
-        DISABLED due to rank-deficiency crashes in small batches.
-        """
-        return torch.tensor(0.0, device=embeddings.device, requires_grad=True)
+        device = embeddings.device
+        log_dets = []
+
+        for class_id in labels.unique():
+            mask = labels == class_id
+            count = int(mask.sum().item())
+            if count < self.min_samples_per_class:
+                continue
+
+            class_emb = embeddings[mask]
+            centered = class_emb - class_emb.mean(dim=0, keepdim=True)
+            n = centered.shape[0]
+            cov = (centered.t() @ centered) / max(1, n - 1)
+            dim = cov.shape[0]
+            cov = cov + self.eps * torch.eye(dim, device=device, dtype=cov.dtype)
+
+            sign, logdet = torch.linalg.slogdet(cov)
+            if sign > 0 and torch.isfinite(logdet):
+                log_dets.append(logdet)
+
+        if not log_dets:
+            return torch.zeros((), device=device, requires_grad=True)
+
+        return -self.lambda_nir * torch.stack(log_dets).mean()

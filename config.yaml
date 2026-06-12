@@ -7,11 +7,43 @@ model:
   pretrained: true
   use_attention: false
   freeze_backbone: false
+  num_unfrozen_blocks: 2
+  pooling:
+    strategy: multi_spectral
+    layers:
+    - 3
+    - 11
+    statistics:
+    - mean
+    - max
+    - std
+    gem:
+      p: 3.0
+      learnable: false
+      eps: 1.0e-06
+    masked:
+      enabled: true
+      threshold: 0.3
+      weighting: soft
+    drop_token:
+      enabled: true
+      prob: 0.3
+      eval_mode: 'off'
+    norm_intermediate: true
+    layer_fusion: per_layer
+  projection:
+    layout: multi_tower
+    slice_layer_map:
+    - 11
+    - 11
+    - 3
+    - 3
   projection_head:
     hidden_dims:
     - 256
     - 256
-    use_batch_norm: true
+    use_batch_norm: false
+    use_layer_norm: true
     dropout: 0.15
     normalize_embeddings_ln: true
     use_hardtanh: false
@@ -26,7 +58,7 @@ data:
   samples_per_class: 2
   batch_size: 16
   val_batch_size: 2
-  auto_tune_resources: true
+  auto_tune_resources: false
   num_workers: 10
   prefetch_factor: 4
   val_num_workers: 2
@@ -36,8 +68,20 @@ data:
     exclusive_train_workers_during_val: false
     persistent_workers: true
   drop_last: true
-  image_size: 504
-  resize_size: 504
+  image_size: 252
+  resize_size: 252
+  normalize:
+    mode: imagenet
+    stats_path: data/stats/train_norm.json
+    mean:
+    - 0.485
+    - 0.456
+    - 0.406
+    std:
+    - 0.229
+    - 0.224
+    - 0.225
+    stain_method: null
 augmentation:
   performance_mode: true
   random_horizontal_flip: 0.5
@@ -52,6 +96,7 @@ augmentation:
   grayscale:
     enabled: false
     p: 1.0
+    override_norm: false
   microscopy_specific:
     random_gamma:
       enabled: true
@@ -65,6 +110,10 @@ augmentation:
       - 10.0
       - 50.0
       p: 0.5
+  sensor_noise_model:
+    enabled: false
+    stats_path: data/stats/sensor_noise.json
+    scale_factor: 1.0
     blur:
       enabled: true
       blur_limit: 3
@@ -102,6 +151,7 @@ training:
   gradient_accumulation_steps: 4
   loss:
     type: sliced_ms
+    distance: euclidean
     params:
       num_slices: 4
       alpha: 1.0
@@ -111,7 +161,7 @@ training:
       scale: 64.0
       proxy_scale: 30.0
       proxy_margin: 0.2
-  validation_metric: recall_at_1
+  validation_metric: mAP@R
   mining:
     enabled: false
     type: semihard
@@ -130,6 +180,7 @@ training:
   scheduler_params:
     T_max: 10
     eta_min: 1.0e-06
+    pct_start: 0.3
   gradient_clip_norm: 5.0
   early_stopping:
     enabled: true
@@ -138,6 +189,7 @@ training:
     restore_best_weights: true
   save_every_n_epochs: 9
   save_best_only: true
+  finetune_phases: []
 sota:
   uniformity:
     enabled: false
@@ -162,13 +214,16 @@ sota:
     enabled: false
     lambda: 0.5
     eps: 0.0001
+    min_samples_per_class: 2
   hier:
     enabled: false
     lambda: 0.1
     num_levels: 3
     temperature: 0.1
+    taxonomy_path: null
   dada:
     enabled: false
+    dual_view_implemented: false
     lambda: 0.1
     kernel_bandwidth: 1.0
   self_distillation:
@@ -178,7 +233,11 @@ sota:
     lambda: 0.5
   embedding_space: euclidean
   hyperbolic_curvature: 1.0
-  augmentation_mode: full
+  augmentation_mode: deit3_simple
+  anti_collapse:
+    enabled: false
+    lambda: 0.1
+    t: 2.0
 grain_detection:
   enabled: true
   model_type: u2netp
@@ -190,7 +249,7 @@ grain_detection:
   morph_kernel_size: 3
   min_circularity: 0.3
   crop_padding: 0.2
-  crop_size: 504
+  crop_size: 252
   use_mask: true
   masked_pooling: true
   image_cache_size: 32
@@ -198,8 +257,8 @@ grain_detection:
   max_cached_image_mb: 32
   max_load_side: 512
   distance_threshold: 0.7
-  train_mask_bg_mode: gray
-  val_mask_bg_mode: gray
+  train_mask_bg_mode: imagenet_neutral
+  val_mask_bg_mode: imagenet_neutral
 logging:
   tensorboard:
     enabled: true
@@ -216,6 +275,7 @@ paths:
   log_dir: logs
   experiment_dir: experiments
 hardware:
+  vram_warn_fraction: 0.9
   use_gpu: true
   gpu_ids:
   - 0
@@ -224,7 +284,34 @@ hardware:
   world_size: 1
   faiss_gpu: true
 evaluation:
+  protocol: mlrc
+  n_runs: 10
+  nn_metric: null
+  map_at_r:
+    exact: true
+    candidate_multiplier: 12
+  nmi:
+    n_init: 10
+    n_seeds: 5
+  calibration:
+    enabled: true
+  select_checkpoint_on: val
+  report_final_on: test
   progressive_plot_every_epochs: 2
+  ablation:
+    enabled: false
+    when: after_training
+    skip_baseline_variant: true
+    on_failure: continue
+    epochs: null
+    matrices:
+      pooling: false
+      slices: false
+      layout: false
+      masked: false
+      augment: false
+      freeze: false
+      validation_metric: false
   compute_precision_at_k:
   - 1
   - 5

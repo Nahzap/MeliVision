@@ -122,6 +122,13 @@ class TrainingTab(QWidget):
         config_file_layout.addWidget(self.config_path)
         config_file_layout.addWidget(config_browse)
         config_layout.addRow("Archivo Config:", config_file_layout)
+
+        self.ablation_summary_label = QLabel("")
+        self.ablation_summary_label.setWordWrap(True)
+        self.ablation_summary_label.setStyleSheet(
+            "color: #0e639c; font-size: 11px; padding: 4px; background: #e8f4f8; border-radius: 4px;"
+        )
+        config_layout.addRow("Ablaciones:", self.ablation_summary_label)
         
         # Checkpoint (opcional)
         checkpoint_layout = QHBoxLayout()
@@ -202,6 +209,40 @@ class TrainingTab(QWidget):
         """Sincroniza la ruta de config desde la pestaña Configuración."""
         if path:
             self.config_path.setText(path)
+            self.refresh_ablation_summary(path)
+
+    def refresh_ablation_summary(self, config_path: str = None):
+        """Lee evaluation.ablation del YAML y actualiza el resumen en la pestaña Entrenamiento."""
+        import yaml
+        from src.utils.ablation_matrix import format_ablation_startup_summary
+
+        path = config_path or self.config_path.text()
+        summary = "Ablaciones: (config no encontrada)"
+        try:
+            p = Path(path)
+            if not p.is_absolute():
+                root = Path(__file__).resolve().parent.parent
+                if (root / p).exists():
+                    p = root / p
+            if p.exists():
+                with open(p, encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+                from src.utils.ablation_matrix import ensure_ablation_defaults
+                ensure_ablation_defaults(cfg)
+                summary = format_ablation_startup_summary(cfg)
+        except Exception:
+            summary = "Ablaciones: error leyendo config"
+
+        self.ablation_summary_label.setText(summary)
+        style_on = "color: #0e639c; font-size: 11px; padding: 4px; background: #e8f4f8; border-radius: 4px;"
+        style_warn = "color: #d9480f; font-size: 11px; padding: 4px; background: #fff4e6; border-radius: 4px;"
+        style_off = "color: #666; font-size: 11px; padding: 4px; background: #f5f5f5; border-radius: 4px;"
+        if "ON" in summary:
+            self.ablation_summary_label.setStyleSheet(style_on)
+        elif "seleccione" in summary or "sin matrices" in summary:
+            self.ablation_summary_label.setStyleSheet(style_warn)
+        else:
+            self.ablation_summary_label.setStyleSheet(style_off)
     
     def _warn_if_config_unsaved(self) -> bool:
         """
@@ -424,6 +465,16 @@ class TrainingTab(QWidget):
                 '<br>', sep,
             ]
 
+            abl_note = estimate.get("ablation_note")
+            if abl_note:
+                html_parts += [
+                    '<span style="color: #ffa94d; font-weight: bold;">'
+                    f'  ABLACIONES: {abl_note}</span><br>',
+                    '<span style="color: #888;">'
+                    '  (se ejecutan automaticamente al pulsar Entrenar, tras el run principal)</span><br>',
+                    '<br>', sep,
+                ]
+
             chart_titles = {
                 'class_distribution': 'Distribucion de Clases',
                 'train_val_balance': 'Balance Train vs Validacion',
@@ -516,8 +567,43 @@ class TrainingTab(QWidget):
         self.progress_bar.setVisible(False)
         self.status_label.setText("✅ Entrenamiento completado")
         self.parent_window.log_widget.append_log("Entrenamiento finalizado", "SUCCESS")
-        
-        QMessageBox.information(self, "Éxito", "Entrenamiento completado exitosamente")
+
+        abl_msg = ""
+        if isinstance(result, dict):
+            abl = result.get("ablation") or {}
+            if abl.get("enabled") is not False and abl.get("status") not in (None, "skipped"):
+                completed = abl.get("completed", 0)
+                failed = abl.get("failed", 0)
+                skipped = abl.get("skipped", 0)
+                csv_path = abl.get("csv_path")
+                if abl.get("status") == "failed" and abl.get("error"):
+                    self.parent_window.log_widget.append_log(
+                        f"Ablaciones: error — {abl['error']}", "WARNING"
+                    )
+                    abl_msg = f"\n\nAblaciones: error (run principal OK).\n{abl['error']}"
+                elif csv_path:
+                    self.parent_window.log_widget.append_log(
+                        f"Ablaciones: {completed} OK, {failed} fallos, {skipped} omitidas → {csv_path}",
+                        "SUCCESS" if failed == 0 else "WARNING",
+                    )
+                    abl_msg = (
+                        f"\n\nAblaciones: {completed} variantes OK"
+                        f"{f', {failed} fallos' if failed else ''}"
+                        f"{f', {skipped} omitidas' if skipped else ''}.\n"
+                        f"CSV: {csv_path}"
+                    )
+            elif (
+                abl.get("enabled")
+                and abl.get("status") == "skipped"
+                and abl.get("reason") == "no matrices selected"
+            ):
+                self.parent_window.log_widget.append_log(
+                    "Ablaciones habilitadas pero sin matrices seleccionadas", "WARNING"
+                )
+
+        QMessageBox.information(
+            self, "Éxito", f"Entrenamiento completado exitosamente.{abl_msg}"
+        )
     
     def training_error(self, error_msg):
         """Callback cuando hay error"""
@@ -827,6 +913,8 @@ class MainWindow(QMainWindow):
 
         if result["valid"]:
             self.log_widget.append_log(f"Validación arranque OK — {summary}", "INFO")
+
+        self.training_tab.refresh_ablation_summary(path)
     
     def log_widget_clear(self):
         """Limpia el widget de logs"""
@@ -837,6 +925,7 @@ class MainWindow(QMainWindow):
         """Propaga la ruta YAML guardada a la pestaña de entrenamiento."""
         self.training_tab.sync_config_path(config_path)
         self._run_startup_validation()
+        self.training_tab.refresh_ablation_summary(config_path)
         self.log_widget.append_log(
             f"Config sincronizada con Entrenamiento: {config_path}", "INFO"
         )

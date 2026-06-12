@@ -17,10 +17,11 @@ from pathlib import Path
 import logging
 import csv
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 # SOTA losses and regularizers (2022-2024)
+from src.losses.anti_collapse_loss import AntiCollapseLoss
 from src.losses.nir_regularizer import NIRRegularizer
 from src.losses.hier_regularizer import HIERRegularizer
 from src.losses.sg_softmax import SGSoftmaxLoss
@@ -28,6 +29,15 @@ from src.losses.dada_wrapper import DADAWrapper
 from src.training.ema_teacher import EMATeacher, SelfDistillationLoss
 from src.training.hard_mining import HardNegativeMiner
 from src.utils.training_alarms import TrainingAlarmManager
+from src.data.dataloader_utils import free_training_memory
+from src.utils.mlrc_protocol import (
+    is_improvement,
+    metric_value_from_dict,
+    normalize_validation_metric,
+    resolve_map_at_r_config,
+    resolve_nmi_config,
+    resolve_nn_metric,
+)
 
 
 class MetricLearningTrainer:
@@ -94,7 +104,10 @@ class MetricLearningTrainer:
         # SOTA Regularizers (active)
         self.nir_reg = self._setup_nir()
         self.hier_reg = self._setup_hier()
+        self.anti_collapse = self._setup_anti_collapse()
         self.dada_wrapper = self._setup_dada()
+        self.finetune_phases = list(self.config.get("finetune_phases") or [])
+        self._finetune_phase_boundaries = self._build_finetune_phase_boundaries()
         # Dimensional Slicing (SlicedMSLoss) reemplaza amplitude/uniformity/
         # decorrelation/disentanglement — ver docs/2026-06-09_INFORME_MODIFICACIONES_PIPELINE_MULTI_SLICE.md
         
@@ -126,11 +139,20 @@ class MetricLearningTrainer:
         if self.gradient_accumulation_steps > 1:
             self.logger.info(f"Gradient Accumulation: {self.gradient_accumulation_steps} steps (effective batch = {self.gradient_accumulation_steps}x)")
         self.best_recall_at_1 = 0.0
+        self.best_selection_value = float("-inf")
         self.val_metrics_history = []
         self.epochs_without_improvement = 0
         
-        # Validation metric for best model selection
-        self.validation_metric = config.get('validation_metric', 'recall_at_1')
+        # Validation metric for best model selection (MLRC: mAP@R default)
+        self.validation_metric = normalize_validation_metric(
+            config.get("validation_metric", "mAP@R")
+        )
+        if self.validation_metric == "val_loss":
+            self.best_selection_value = float("inf")
+        self.logger.info(
+            f"Checkpoint selection metric: {self.validation_metric} "
+            f"(MLRC protocol)"
+        )
         
         # Gradient clipping
         self.gradient_clip_norm = config.get('gradient_clip_norm', 5.0)
@@ -175,6 +197,30 @@ class MetricLearningTrainer:
         logger.addHandler(handler)
         return logger
     
+    @staticmethod
+    def _require_loss_param(params: dict, key: str, loss_type: str):
+        if key not in params:
+            raise ValueError(
+                f"training.loss.params.{key} es obligatorio para loss.type={loss_type} "
+                f"(sin defaults silenciosos — ver config_validator)"
+            )
+        return params[key]
+
+    def _resolve_distance(self):
+        """Distance for metric-learning losses (C-09)."""
+        loss_cfg = self.config.get("loss", {})
+        dist_name = str(loss_cfg.get("distance", "")).lower()
+        if not dist_name:
+            space = str(self.config.get("sota", {}).get("embedding_space", "euclidean")).lower()
+            dist_name = "euclidean" if space == "euclidean" else "cosine"
+        if dist_name == "cosine":
+            return distances.CosineSimilarity()
+        if dist_name in ("euclidean", "lp"):
+            return distances.LpDistance(p=2)
+        raise ValueError(
+            f"training.loss.distance debe ser cosine|euclidean|lp, recibido: {dist_name!r}"
+        )
+
     def _setup_loss_function(self) -> nn.Module:
         """
         Setup loss function based on configuration.
@@ -184,16 +230,15 @@ class MetricLearningTrainer:
         loss_type = loss_config.get('type', 'multi_similarity')
         params = loss_config.get('params', {})
         
-        # Use cosine similarity for all losses (SOTA recommendation)
-        distance = distances.CosineSimilarity()
+        distance = self._resolve_distance()
         
         if loss_type == 'multi_similarity':
             # Multi-Similarity Loss (SOTA 2024)
             self.logger.info("Using Multi-Similarity Loss (SOTA 2024)")
             return losses.MultiSimilarityLoss(
-                alpha=params.get('alpha', 2.0),
-                beta=params.get('beta', 50.0),
-                base=params.get('base', 0.5),
+                alpha=float(self._require_loss_param(params, "alpha", loss_type)),
+                beta=float(self._require_loss_param(params, "beta", loss_type)),
+                base=float(self._require_loss_param(params, "base", loss_type)),
                 distance=distance
             )
         
@@ -265,8 +310,9 @@ class MetricLearningTrainer:
             self._sg_softmax_loss = SGSoftmaxLoss(
                 embedding_dim=self.config.get('embedding_dim', 128),
                 num_classes=num_classes,
-                scale=params.get('scale', 30.0),
-                margin=params.get('margin', 0.4)
+                scale=float(params.get('scale', 30.0)),
+                margin=float(params.get('margin', 0.4)),
+                ortho_penalty_weight=float(params.get('ortho_penalty_weight', 1.0)),
             )
             return self._sg_softmax_loss
         
@@ -277,11 +323,14 @@ class MetricLearningTrainer:
             if num_classes is None:
                 raise ValueError("num_classes required for LDM-MS loss")
             self.logger.info(f"Using LDM-MS Loss with {num_classes} classes")
+            base_margin = params.get("base_margin", params.get("base"))
+            if base_margin is None:
+                base_margin = self._require_loss_param(params, "base_margin", loss_type)
             self._ldm_ms_loss = LearnableDynamicMarginMSLoss(
                 num_classes=num_classes,
-                alpha=params.get('alpha', 2.0),
-                beta=params.get('beta', 50.0),
-                base_margin=params.get('base', 0.5)
+                alpha=float(self._require_loss_param(params, "alpha", loss_type)),
+                beta=float(self._require_loss_param(params, "beta", loss_type)),
+                base_margin=float(base_margin),
             )
             return self._ldm_ms_loss
 
@@ -297,9 +346,13 @@ class MetricLearningTrainer:
                 num_classes=num_classes,
                 proxy_scale=params.get('proxy_scale', 30.0),
                 proxy_margin=params.get('proxy_margin', 0.4),
-                ms_alpha=params.get('alpha', 2.0),
-                ms_beta=params.get('beta', 50.0),
-                ms_base_margin=params.get('base', 0.5),
+                ms_alpha=float(self._require_loss_param(params, "alpha", loss_type)),
+                ms_beta=float(self._require_loss_param(params, "beta", loss_type)),
+                ms_base_margin=float(
+                    params.get("base_margin", params.get("base"))
+                    if params.get("base_margin", params.get("base")) is not None
+                    else self._require_loss_param(params, "base_margin", loss_type)
+                ),
                 w_global=params.get('w_global', 1.0),
                 w_local=params.get('w_local', 1.0),
                 use_ldm=params.get('use_ldm', True)
@@ -315,11 +368,11 @@ class MetricLearningTrainer:
             self.logger.info(f"Using Sliced MS Loss with {num_classes} classes")
             self._sliced_ms_loss = SlicedMSLoss(
                 num_classes=num_classes,
-                num_slices=params.get('num_slices', 4),
+                num_slices=int(self._require_loss_param(params, "num_slices", loss_type)),
                 embedding_dim=self.config.get('embedding_dim', 128),
-                alpha=params.get('alpha', 2.0),
-                beta=params.get('beta', 50.0),
-                base_margin=params.get('base_margin', 0.5)
+                alpha=float(self._require_loss_param(params, "alpha", loss_type)),
+                beta=float(self._require_loss_param(params, "beta", loss_type)),
+                base_margin=float(self._require_loss_param(params, "base_margin", loss_type)),
             )
             return self._sliced_ms_loss
         
@@ -332,10 +385,10 @@ class MetricLearningTrainer:
             self.logger.info(f"Using Sliced Proxy Loss with {num_classes} classes")
             self._sliced_proxy_loss = SlicedProxyLoss(
                 num_classes=num_classes,
-                num_slices=params.get('num_slices', 4),
+                num_slices=int(self._require_loss_param(params, "num_slices", loss_type)),
                 embedding_dim=self.config.get('embedding_dim', 128),
-                scale=params.get('proxy_scale', 30.0),
-                margin=params.get('proxy_margin', 0.2)
+                scale=float(self._require_loss_param(params, "proxy_scale", loss_type)),
+                margin=float(self._require_loss_param(params, "proxy_margin", loss_type)),
             )
             return self._sliced_proxy_loss
         
@@ -345,6 +398,21 @@ class MetricLearningTrainer:
     def _get_loss_type(self) -> str:
         """Loss type from flattened trainer config (train.py merges training.*)."""
         return self.config.get('loss', {}).get('type', 'multi_similarity')
+
+    def _loss_forward_embeddings(
+        self,
+        embeddings: torch.Tensor,
+        prenorm_embeddings: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Embeddings fed to the primary loss.
+
+        Sliced losses operate on per-slice unit vectors (prenorm concat for multi_tower).
+        """
+        loss_type = self._get_loss_type()
+        if loss_type in ("sliced_ms", "sliced_proxy") and prenorm_embeddings is not None:
+            return prenorm_embeddings
+        return embeddings
 
     def _setup_miner(self) -> Optional[nn.Module]:
         """
@@ -383,8 +451,8 @@ class MetricLearningTrainer:
             )
         elif mining_type == 'distance_weighted':
             return miners.DistanceWeightedMiner(
-                cutoff=0.5,
-                nonzero_loss_cutoff=1.4
+                cutoff=float(mining_config.get("cutoff", 0.5)),
+                nonzero_loss_cutoff=float(mining_config.get("nonzero_loss_cutoff", 1.4)),
             )
         else:
             return None
@@ -397,11 +465,63 @@ class MetricLearningTrainer:
         
         reg = NIRRegularizer(
             lambda_nir=nir_config.get('lambda', 0.5),
-            eps=nir_config.get('eps', 1e-4)
+            eps=nir_config.get('eps', 1e-4),
+            min_samples_per_class=int(nir_config.get('min_samples_per_class', 2)),
         )
         self.logger.info(f"NIR regularization enabled (lambda={nir_config.get('lambda', 0.5)})")
         return reg
     
+    def _build_finetune_phase_boundaries(self) -> List[int]:
+        """Cumulative epoch indices where finetune phases switch (D-05)."""
+        boundaries = []
+        total = 0
+        for phase in self.finetune_phases:
+            total += int(phase.get("epochs", 0))
+            if total > 0:
+                boundaries.append(total)
+        return boundaries
+
+    def _apply_finetune_phase(self, phase_index: int):
+        """Apply freeze/LR settings for finetune phase *phase_index*."""
+        if not self.finetune_phases or phase_index >= len(self.finetune_phases):
+            return
+        phase = self.finetune_phases[phase_index]
+        freeze = bool(phase.get("freeze_backbone", True))
+        num_unfrozen = int(phase.get("num_unfrozen_blocks", 2))
+        lr_factor = float(phase.get("lr_factor", 1.0))
+        base_lr = float(self.config.get("learning_rate", 1e-4))
+        backbone_factor = float(self.config.get("backbone_lr_factor", 1.0))
+
+        if hasattr(self.model, "set_backbone_frozen"):
+            self.model.set_backbone_frozen(freeze, num_unfrozen_blocks=num_unfrozen)
+
+        for group in self.optimizer.param_groups:
+            init_lr = group.get("initial_lr", group["lr"])
+            name = group.get("name", "")
+            if name == "backbone":
+                group["lr"] = init_lr * lr_factor
+            else:
+                group["lr"] = base_lr * lr_factor if init_lr <= base_lr * 1.01 else init_lr * lr_factor
+
+        self.logger.info(
+            f"Finetune phase {phase_index + 1}/{len(self.finetune_phases)}: "
+            f"freeze_backbone={freeze}, lr_factor={lr_factor}"
+        )
+
+    def _setup_anti_collapse(self) -> Optional[AntiCollapseLoss]:
+        """Anti-collapse regularization (IEEE Trans. Multimedia 2024, D-04)."""
+        ac_cfg = self.config.get("anti_collapse", {}) or {}
+        if not ac_cfg.get("enabled", False):
+            return None
+        reg = AntiCollapseLoss(
+            lambda_ac=float(ac_cfg.get("lambda", 0.1)),
+            t=float(ac_cfg.get("t", 2.0)),
+        )
+        self.logger.info(
+            f"Anti-Collapse regularization enabled (lambda={ac_cfg.get('lambda', 0.1)})"
+        )
+        return reg
+
     def _setup_hier(self) -> Optional[HIERRegularizer]:
         """Setup Hierarchical Regularization (Kim et al., CVPR 2023)."""
         hier_config = self.config.get('hier', {})
@@ -418,7 +538,8 @@ class MetricLearningTrainer:
             num_classes=num_classes,
             num_levels=hier_config.get('num_levels', 3),
             lambda_hier=hier_config.get('lambda', 0.1),
-            temperature=hier_config.get('temperature', 0.1)
+            temperature=hier_config.get('temperature', 0.1),
+            taxonomy_path=hier_config.get('taxonomy_path'),
         ).to(self.device)
         self.logger.info(f"HIER regularization enabled (lambda={hier_config.get('lambda', 0.1)}, levels={hier_config.get('num_levels', 3)})")
         return reg
@@ -601,49 +722,49 @@ class MetricLearningTrainer:
         else:
             param_groups = [{'params': self.model.parameters(), 'lr': lr}]
         
+        proxy_lr_factor = float(self.config.get("proxy_lr_factor", 100.0))
+        margin_lr_factor = float(self.config.get("margin_lr_factor", 10.0))
+
         if hasattr(self, '_proxy_anchor_loss'):
-            proxy_lr = lr * 100
+            proxy_lr = lr * proxy_lr_factor
             param_groups.append({'params': self._proxy_anchor_loss.proxies, 'lr': proxy_lr})
             self.logger.info(f"Proxy Anchor: model lr={lr:.2e}, proxy lr={proxy_lr:.2e}")
         
         if hasattr(self, '_sg_softmax_loss'):
-            proxy_lr = lr * 100
+            proxy_lr = lr * proxy_lr_factor
             param_groups.append({'params': self._sg_softmax_loss.proxies, 'lr': proxy_lr})
             self.logger.info(f"SG-Softmax: model lr={lr:.2e}, proxy lr={proxy_lr:.2e}")
             
         if hasattr(self, '_ldm_ms_loss'):
-            # LDM margin learning rate (often higher than model lr)
-            margin_lr = lr * 10
+            margin_lr = lr * margin_lr_factor
             param_groups.append({'params': [self._ldm_ms_loss.pos_margin, self._ldm_ms_loss.neg_margin], 'lr': margin_lr, 'weight_decay': 0.0})
             self.logger.info(f"LDM-MS: added learnable margins to optimizer (lr={margin_lr:.2e})")
 
         if hasattr(self, '_hybrid_loss'):
-            # Proxies
-            proxy_lr = lr * 100
+            proxy_lr = lr * proxy_lr_factor
             param_groups.append({'params': self._hybrid_loss.proxy_loss.proxies, 'lr': proxy_lr})
             self.logger.info(f"Hybrid: added proxies to optimizer (lr={proxy_lr:.2e})")
-            # Margins (if using LDM)
             if self._hybrid_loss.use_ldm:
-                margin_lr = lr * 10
+                margin_lr = lr * margin_lr_factor
                 param_groups.append({'params': [self._hybrid_loss.ms_loss.pos_margin, self._hybrid_loss.ms_loss.neg_margin], 'lr': margin_lr, 'weight_decay': 0.0})
                 self.logger.info(f"Hybrid: added learnable margins to optimizer (lr={margin_lr:.2e})")
         
         if hasattr(self, '_sliced_ms_loss'):
-            margin_lr = lr * 10
+            margin_lr = lr * margin_lr_factor
             margin_params = self._sliced_ms_loss.get_learnable_margins()
             param_groups.append({'params': margin_params, 'lr': margin_lr, 'weight_decay': 0.0})
             self.logger.info(f"SlicedMS: added {len(margin_params)} learnable margins to optimizer (lr={margin_lr:.2e})")
             
         if hasattr(self, '_sliced_proxy_loss'):
-            proxy_lr = lr * 100
+            proxy_lr = lr * proxy_lr_factor
             proxy_params = self._sliced_proxy_loss.get_proxies()
             param_groups.append({'params': proxy_params, 'lr': proxy_lr, 'weight_decay': 0.0})
             self.logger.info(f"SlicedProxy: added {len(proxy_params)} learnable proxy matrices to optimizer (lr={proxy_lr:.2e})")
         
-        # HIER proxies
         if self.hier_reg is not None:
-            param_groups.append({'params': self.hier_reg.parameters(), 'lr': lr * 10})
-            self.logger.info(f"HIER proxies added to optimizer (lr={lr*10:.2e})")
+            hier_lr = lr * margin_lr_factor
+            param_groups.append({'params': self.hier_reg.parameters(), 'lr': hier_lr})
+            self.logger.info(f"HIER proxies added to optimizer (lr={hier_lr:.2e})")
 
         # ArcFace / large-margin losses: trainable class weight matrix W
         if self._get_loss_type() == 'arcface' and hasattr(self.loss_func, 'parameters'):
@@ -667,9 +788,11 @@ class MetricLearningTrainer:
                 weight_decay=weight_decay
             )
         elif optimizer_type == 'sgd':
+            opt_params = self.config.get("optimizer_params", {}) or {}
             optimizer = torch.optim.SGD(
                 param_groups,
-                momentum=0.9,
+                momentum=float(opt_params.get("momentum", 0.9)),
+                nesterov=bool(opt_params.get("nesterov", False)),
                 weight_decay=weight_decay
             )
         else:
@@ -687,14 +810,44 @@ class MetricLearningTrainer:
         params = self.config.get('scheduler_params', {})
         
         if scheduler_type == 'cosine':
-            # Cosine Annealing (SOTA recommendation)
-            epochs = self.config.get('epochs', 50)
-            warmup = self.config.get('warmup_epochs', 0)
-            t_max = max(1, epochs - warmup)
+            epochs = int(self.config.get('epochs', 50))
+            warmup = int(self.config.get('warmup_epochs', 0) or 0)
+            eta_min = float(params.get('eta_min', 1e-6))
+            t_max_raw = params.get('T_max')
+            if t_max_raw is not None:
+                t_max = max(1, int(t_max_raw))
+            else:
+                t_max = max(1, epochs - warmup)
+
+            if warmup > 0:
+                lr = float(self.config.get('learning_rate', 1e-4))
+                warmup_start_lr = self.config.get('warmup_start_lr')
+                if warmup_start_lr is None:
+                    warmup_start_lr = lr / max(1.0, 10.0 * warmup)
+                warmup_start_factor = max(1e-8, float(warmup_start_lr) / max(lr, 1e-12))
+                if 'warmup_start_factor' in params:
+                    warmup_start_factor = float(params['warmup_start_factor'])
+                warmup_sched = torch.optim.lr_scheduler.LinearLR(
+                    self.optimizer,
+                    start_factor=warmup_start_factor,
+                    end_factor=1.0,
+                    total_iters=warmup,
+                )
+                cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    self.optimizer,
+                    T_max=t_max,
+                    eta_min=eta_min,
+                )
+                return torch.optim.lr_scheduler.SequentialLR(
+                    self.optimizer,
+                    schedulers=[warmup_sched, cosine_sched],
+                    milestones=[warmup],
+                )
+
             return torch.optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer,
                 T_max=t_max,
-                eta_min=params.get('eta_min', 1e-6)
+                eta_min=eta_min,
             )
         elif scheduler_type == 'reduce_on_plateau':
             return torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -709,7 +862,8 @@ class MetricLearningTrainer:
                 self.optimizer,
                 max_lr=self.config.get('learning_rate', 1e-4),
                 epochs=self.config.get('epochs', 50),
-                steps_per_epoch=len(self.train_loader)
+                steps_per_epoch=len(self.train_loader),
+                pct_start=float(params.get('pct_start', 0.3)),
             )
         else:
             return None
@@ -729,13 +883,18 @@ class MetricLearningTrainer:
             f"  VRAM [{stage}]: active={alloc_mb:.0f} MB | reserved={reserved_mb:.0f} MB | "
             f"peak_active={peak_alloc_mb:.0f} MB | peak_reserved={peak_reserved_mb:.0f} MB"
         )
-        if peak_reserved_mb > 7200:
+        vram_warn_fraction = float(self.config.get("vram_warn_fraction", 0.9))
+        total_mb = torch.cuda.get_device_properties(self.device).total_memory / 1e6
+        warn_threshold_mb = total_mb * vram_warn_fraction
+        if peak_reserved_mb > warn_threshold_mb:
             self.alarm_manager.warning(
                 "VRAM_PEAK_HIGH",
-                "GPU reserved memory near 8GB limit.",
+                "GPU reserved memory above configured fraction of device VRAM.",
                 stage=stage,
                 peak_reserved_mb=round(peak_reserved_mb, 1),
                 peak_allocated_mb=round(peak_alloc_mb, 1),
+                warn_threshold_mb=round(warn_threshold_mb, 1),
+                vram_warn_fraction=vram_warn_fraction,
             )
 
     def _iter_optimized_parameters(self):
@@ -758,9 +917,14 @@ class MetricLearningTrainer:
         if epoch < warmup_epochs:
             progress = (epoch + 1) / warmup_epochs  # reach full LR on last warmup epoch
             lr_strs = []
+            global_lr = float(self.config.get('learning_rate', 1e-4))
+            warmup_start_lr_cfg = self.config.get('warmup_start_lr')
+            if warmup_start_lr_cfg is None:
+                warmup_start_lr_cfg = global_lr / max(1.0, 10.0 * warmup_epochs)
             for param_group in self.optimizer.param_groups:
                 base_lr = param_group.get('initial_lr', param_group['lr'])
-                warmup_lr = 1e-6 + (base_lr - 1e-6) * progress
+                start_lr = float(warmup_start_lr_cfg) * (base_lr / max(global_lr, 1e-12))
+                warmup_lr = start_lr + (base_lr - start_lr) * progress
                 param_group['lr'] = warmup_lr
                 name = param_group.get('name', 'default')
                 lr_strs.append(f"{name}={warmup_lr:.2e}")
@@ -774,6 +938,64 @@ class MetricLearningTrainer:
                 lr_strs.append(f"{name}={base_lr:.2e}")
             self.logger.info(f"Warmup complete â€” restored LR: {', '.join(lr_strs)}")
     
+    def _compute_base_metric_loss(
+        self,
+        embeddings: torch.Tensor,
+        labels: torch.Tensor,
+        prenorm_embeddings: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Loss métrica sin regularizadores SOTA (comparable train vs val P×K)."""
+        loss_embeddings = self._loss_forward_embeddings(embeddings, prenorm_embeddings)
+        if self.miner is not None:
+            hard_pairs = self.miner(loss_embeddings, labels)
+            return self.loss_func(loss_embeddings, labels, hard_pairs)
+        return self.loss_func(loss_embeddings, labels)
+
+    def _estimate_pk_val_loss(
+        self,
+        embeddings: torch.Tensor,
+        labels: torch.Tensor,
+        *,
+        num_batches: int = 16,
+    ) -> float:
+        """
+        Estima val_loss en mini-batches P×K muestreados del set val.
+
+        El DataLoader de val no usa MPerClassSampler; el promedio por batch
+        secuencial no es comparable con train_loss (sliced_ms / multi-similarity).
+        """
+        import random
+
+        data_cfg = self.config.get("data", {}) or {}
+        p = int(data_cfg.get("classes_per_batch", 8))
+        k = int(data_cfg.get("samples_per_class", 2))
+        labels_cpu = labels.detach().cpu()
+        by_class: Dict[int, List[int]] = {}
+        for idx, lab in enumerate(labels_cpu.tolist()):
+            by_class.setdefault(int(lab), []).append(idx)
+
+        eligible = [c for c, ids in by_class.items() if len(ids) >= k]
+        if len(eligible) < 2:
+            return float("nan")
+
+        p_eff = min(p, len(eligible))
+        seed = int(self.config.get("reproducibility", {}).get("seed", 42))
+        rng = random.Random(seed + int(self.current_epoch))
+        losses: List[float] = []
+
+        with torch.inference_mode():
+            for _ in range(num_batches):
+                chosen = rng.sample(eligible, p_eff)
+                idxs: List[int] = []
+                for cls_id in chosen:
+                    idxs.extend(rng.sample(by_class[cls_id], k))
+                batch_emb = embeddings[idxs].to(self.device)
+                batch_lab = labels_cpu[idxs].to(self.device)
+                loss = self._compute_base_metric_loss(batch_emb, batch_lab, batch_emb)
+                losses.append(float(loss.item()))
+
+        return float(sum(losses) / max(1, len(losses)))
+
     def _compute_total_loss(self, embeddings, labels, images, masks=None, base_loss=None, prenorm_embeddings=None):
         """
         Compute total loss = base loss + SOTA regularizers.
@@ -782,19 +1004,19 @@ class MetricLearningTrainer:
         if base_loss is not None:
             loss = base_loss
         else:
+            loss_embeddings = self._loss_forward_embeddings(embeddings, prenorm_embeddings)
             if self.miner is not None:
-                hard_pairs = self.miner(embeddings, labels)
-                loss = self.loss_func(embeddings, labels, hard_pairs)
+                hard_pairs = self.miner(loss_embeddings, labels)
+                loss = self.loss_func(loss_embeddings, labels, hard_pairs)
             else:
-                loss = self.loss_func(embeddings, labels)
+                loss = self.loss_func(loss_embeddings, labels)
         
-        # DADA Alignment
         if self.dada_wrapper is not None:
-            # We don't have augmented_embeddings currently. If we did:
-            # mmd_loss = self.dada_wrapper._compute_mmd(embeddings, augmented_embeddings)
-            # loss += self.dada_wrapper.lambda_dada * mmd_loss
-            pass
-        
+            raise RuntimeError(
+                "DADA está habilitado pero no debe alcanzar el loop de entrenamiento "
+                "sin dual_view_implemented (validar con validate_sota_integrity)."
+            )
+
         # NIR: Non-Isotropy Regularization
         if self.nir_reg is not None:
             nir_loss = self.nir_reg(embeddings, labels)
@@ -804,7 +1026,10 @@ class MetricLearningTrainer:
         if self.hier_reg is not None:
             hier_loss = self.hier_reg(embeddings, labels)
             loss += hier_loss
-        
+
+        if self.anti_collapse is not None:
+            loss += self.anti_collapse(embeddings, labels)
+
         # Self-distillation with EMA Teacher
         if self.ema_teacher is not None and self.sd_loss is not None:
             teacher_embeddings = self.ema_teacher.get_teacher_embeddings(images, masks=masks)
@@ -1052,12 +1277,17 @@ class MetricLearningTrainer:
                 f"  Throughput: {num_batches} batches, ~{batches_per_sec:.2f} train-steps/s (GPU-bound if >1.5)"
             )
             self._log_cuda_memory(stage="train_epoch_end")
-            if self.expected_train_workers >= 8 and gpu_pct < 45:
+            loader_policy = self.config.get("loader_policy", {}) or {}
+            alarm_min_workers = int(loader_policy.get("alarm_min_workers", 8))
+            alarm_gpu_util_pct = float(loader_policy.get("alarm_gpu_util_pct", 45.0))
+            if self.expected_train_workers >= alarm_min_workers and gpu_pct < alarm_gpu_util_pct:
                 self.alarm_manager.warning(
                     "LOW_GPU_UTIL_WITH_HIGH_WORKERS",
                     "GPU utilization is low despite high worker regime.",
                     gpu_util_pct=round(gpu_pct, 2),
                     expected_train_workers=self.expected_train_workers,
+                    alarm_min_workers=alarm_min_workers,
+                    alarm_gpu_util_pct=alarm_gpu_util_pct,
                     data_time_sec=round(data_time_total, 2),
                     gpu_time_sec=round(gpu_time_total, 2),
                 )
@@ -1084,8 +1314,6 @@ class MetricLearningTrainer:
             stage="validation_start",
         )
         self.model.eval()
-        total_loss = 0.0
-        num_batches = 0
         emb_chunks = []
         label_chunks = []
         val_data_time = 0.0
@@ -1126,20 +1354,18 @@ class MetricLearningTrainer:
                     t_gpu_start = time.time()
                     if self.use_amp and self.device.type == "cuda":
                         with autocast("cuda"):
-                            embeddings = self.model(images, mask=masks)
-                            loss = self.loss_func(embeddings, labels)
+                            embeddings, _prenorm = self.model(
+                                images, mask=masks, return_prenorm=True
+                            )
                     else:
-                        embeddings = self.model(images, mask=masks)
-                        loss = self.loss_func(embeddings, labels)
+                        embeddings, _prenorm = self.model(
+                            images, mask=masks, return_prenorm=True
+                        )
 
-                    # Keep on GPU to prevent CPU-GPU sync bottlenecks (do NOT L2-normalize before metric losses)
                     emb_chunks.append(embeddings.detach())
                     label_chunks.append(labels.detach())
 
-                    total_loss += loss.item()
                     val_gpu_time += time.time() - t_gpu_start
-                    pbar.set_postfix({"loss": f"{loss.item():.4f}"})
-                    num_batches += 1
                     t_batch_wait = time.time()
             except torch.cuda.OutOfMemoryError as e:
                 self.alarm_manager.error("CUDA_OOM", "Out of memory during validation.", stage="validation", error=str(e))
@@ -1150,23 +1376,39 @@ class MetricLearningTrainer:
 
         embed_sec = time.time() - t_embed_start
 
-        if num_batches == 0:
+        if not emb_chunks:
             self.logger.warning("Validation set is empty (0 batches). Skipping validation metrics.")
             return 0.0, {'val_loss': 0.0, 'recall_at_1': 0.0, 'recall_at_5': 0.0}
 
-        avg_loss = total_loss / num_batches
-
-        embeddings_np = torch.cat(emb_chunks, dim=0).cpu().numpy()
-        labels_np = torch.cat(label_chunks, dim=0).cpu().numpy()
+        all_embeddings = torch.cat(emb_chunks, dim=0)
+        all_labels = torch.cat(label_chunks, dim=0)
         del emb_chunks, label_chunks
+
+        avg_loss = self._estimate_pk_val_loss(all_embeddings, all_labels)
+        if not np.isfinite(avg_loss):
+            self.logger.warning(
+                "val_loss P×K no disponible (pocas muestras/clase en val); "
+                "use mAP@R / R@1 como métrica principal."
+            )
+            avg_loss = 0.0
+        elif self.current_epoch == 0:
+            self.logger.info(
+                "val_loss se estima con mini-batches P×K en val "
+                "(misma estructura que train). El checkpoint se selecciona por %s.",
+                self.validation_metric,
+            )
+
+        embeddings_np = all_embeddings.cpu().numpy()
+        labels_np = all_labels.cpu().numpy()
+        del all_embeddings, all_labels
 
         class_names = getattr(self.val_loader.dataset, 'classes', None)
         t_metrics_start = time.time()
-        loss_type = self.config.get('loss', {}).get('type', 'arcface')
-        # For standard retrieval, use cosine distance (or hyperbolic if explicitly enabled)
-        embedding_space = self.config.get('sota', {}).get('embedding_space', 'euclidean')
-        nn_metric = 'hyperbolic' if (loss_type == 'arcface' and embedding_space == 'hyperbolic') else 'cosine'
-        
+        eval_cfg = self.config.get("evaluation", {}) or {}
+        nn_metric = resolve_nn_metric(self.config)
+        map_exact, map_multiplier = resolve_map_at_r_config(self.config)
+        nmi_n_init, nmi_n_seeds, nmi_base_seed = resolve_nmi_config(self.config)
+
         sota_metrics = compute_all_metrics(
             embeddings_np,
             labels_np,
@@ -1174,7 +1416,11 @@ class MetricLearningTrainer:
             k_list=[1, 5, 10],
             class_names=class_names,
             include_per_class=False,
-            nmi_n_init=3,
+            nmi_n_init=nmi_n_init,
+            nmi_n_seeds=nmi_n_seeds,
+            nmi_base_seed=nmi_base_seed,
+            map_at_r_exact=map_exact,
+            map_at_r_candidate_multiplier=map_multiplier,
         )
         metrics_sec = time.time() - t_metrics_start
         compute_sec = max(0.0, embed_sec - val_data_time)
@@ -1197,6 +1443,7 @@ class MetricLearningTrainer:
             'R@10': sota_metrics.get('R@10', 0.0),
             'mAP@R': sota_metrics.get('mAP@R', 0.0),
             'NMI': sota_metrics.get('NMI', 0.0),
+            'NMI_std': sota_metrics.get('NMI_std', 0.0),
             'F1_macro': sota_metrics.get('F1_macro', 0.0),
             'Accuracy': sota_metrics.get('Accuracy', 0.0),
             'Balanced_Accuracy': sota_metrics.get('Balanced_Accuracy', 0.0),
@@ -1333,17 +1580,25 @@ class MetricLearningTrainer:
         with open(self.metrics_csv_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow([
-                'epoch', 'train_loss', 'val_loss', 
+                'epoch', 'train_loss', 'val_loss',
+                'selection_metric', 'selection_value',
                 'recall_at_1', 'recall_at_5', 'recall_at_10',
                 'mAP@R', 'NMI', 'F1_macro',
                 'accuracy', 'balanced_accuracy',
                 'precision_macro', 'precision_weighted', 'F1_weighted',
-                'learning_rate', 'is_best', 'best_recall_at_1', 'epoch_time_sec'
+                'learning_rate', 'is_best', 'best_selection_value', 'epoch_time_sec'
             ])
         self.logger.info(f"Metrics CSV: {self.metrics_csv_path}")
         
+        if self.finetune_phases and start_epoch == 0:
+            self._apply_finetune_phase(0)
+
         for epoch in range(start_epoch, epochs):
             self.current_epoch = epoch
+            if self.finetune_phases:
+                for phase_idx, boundary in enumerate(self._finetune_phase_boundaries):
+                    if epoch == boundary and phase_idx + 1 < len(self.finetune_phases):
+                        self._apply_finetune_phase(phase_idx + 1)
             epoch_start_time = time.time()
             self.alarm_manager.info(
                 "EPOCH_HEARTBEAT",
@@ -1358,9 +1613,6 @@ class MetricLearningTrainer:
             self.logger.info(f"Epoch {epoch+1}/{epochs}")
             self.logger.info(f"{'='*70}")
             
-            # Learning rate warmup
-            self._warmup_lr(epoch)
-
             if self.hard_miner is not None:
                 self.hard_miner.set_epoch(epoch)
 
@@ -1382,12 +1634,13 @@ class MetricLearningTrainer:
             self.val_losses.append(val_loss)
             self.val_metrics_history.append(val_metrics)
             
-            # Update scheduler (skip during warmup to avoid conflict)
-            warmup_epochs = self.config.get('warmup_epochs', 5)
-            if self.scheduler and epoch >= warmup_epochs:
+            if self.data_engine is not None:
+                self.data_engine.release_val_workers()
+
+            if self.scheduler:
                 if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                     self.scheduler.step(val_loss)
-                else:
+                elif self.config.get('scheduler') != 'onecycle':
                     self.scheduler.step()
             
             # Get current learning rate
@@ -1404,11 +1657,13 @@ class MetricLearningTrainer:
             precision_macro = val_metrics.get('Precision_macro', 0.0)
             precision_weighted = val_metrics.get('Precision_weighted', 0.0)
             f1_weighted = val_metrics.get('F1_weighted', 0.0)
+            selection_value = metric_value_from_dict(self.validation_metric, val_metrics)
             
             # Log SOTA metrics
             self.logger.info(f"\n--- SOTA Metrics (CVPR 2016-2024) ---")
             self.logger.info(f"  Train Loss: {train_loss:.4f}")
-            self.logger.info(f"  Val Loss:   {val_loss:.4f}")
+            self.logger.info(f"  Val Loss:   {val_loss:.4f}  (P×K, auxiliar)")
+            self.logger.info(f"  Sel. metric: {self.validation_metric}={selection_value:.4f}")
             self.logger.info(f"  R@1:        {recall_at_1:.4f}")
             self.logger.info(f"  R@5:        {recall_at_5:.4f}")
             self.logger.info(f"  R@10:       {recall_at_10:.4f}")
@@ -1421,22 +1676,26 @@ class MetricLearningTrainer:
             self.logger.info(f"  Prec-Wght:  {precision_weighted:.4f}")
             self.logger.info(f"  F1-Wght:    {f1_weighted:.4f}")
             self.logger.info(f"  LR:         {current_lr:.2e}")
-            
-            # Determine if this is the best model
-            is_best = False
-            if self.validation_metric == 'recall_at_1':
-                if recall_at_1 > self.best_recall_at_1 + self.early_stopping_min_delta:
-                    self.best_recall_at_1 = recall_at_1
-                    is_best = True
-            else:
-                if val_loss < self.best_val_loss - self.early_stopping_min_delta:
-                    is_best = True
-            
+
+            # Determine if this is the best model (MLRC validation_metric)
+            is_best = is_improvement(
+                self.validation_metric,
+                selection_value,
+                self.best_selection_value,
+                self.early_stopping_min_delta,
+            )
+
             if is_best:
+                self.best_selection_value = selection_value
                 self.best_val_loss = val_loss
+                if recall_at_1 > self.best_recall_at_1:
+                    self.best_recall_at_1 = recall_at_1
                 self.epochs_without_improvement = 0
                 self.save_checkpoint(epoch, val_loss, str(Path(self.checkpoint_dir) / 'best_model.pth'), save_reference=False)
-                self.logger.info(f"  >> New best model saved! (R@1={recall_at_1:.4f})")
+                self.logger.info(
+                    f"  >> New best model saved! "
+                    f"({self.validation_metric}={selection_value:.4f}, R@1={recall_at_1:.4f})"
+                )
             else:
                 self.epochs_without_improvement += 1
                 self.logger.info(f"  -- No improvement for {self.epochs_without_improvement} epochs")
@@ -1447,11 +1706,12 @@ class MetricLearningTrainer:
                 writer = csv.writer(f)
                 writer.writerow([
                     epoch + 1, f'{train_loss:.6f}', f'{val_loss:.6f}',
+                    self.validation_metric, f'{selection_value:.6f}',
                     f'{recall_at_1:.6f}', f'{recall_at_5:.6f}', f'{recall_at_10:.6f}',
                     f'{map_at_r:.6f}', f'{nmi:.6f}', f'{f1_macro:.6f}',
                     f'{accuracy:.6f}', f'{balanced_accuracy:.6f}',
                     f'{precision_macro:.6f}', f'{precision_weighted:.6f}', f'{f1_weighted:.6f}',
-                    f'{current_lr:.2e}', is_best, f'{self.best_recall_at_1:.6f}',
+                    f'{current_lr:.2e}', is_best, f'{self.best_selection_value:.6f}',
                     f'{epoch_time:.1f}'
                 ])
             self.alarm_manager.info(
@@ -1467,6 +1727,7 @@ class MetricLearningTrainer:
                 f1_macro=round(float(f1_macro), 6),
                 val_loss=round(float(val_loss), 6),
             )
+            free_training_memory(f"epoch_{epoch + 1}_end")
 
             # Progressive charts (CSV always updated; plots less often to save RAM/time).
             plot_every = int(self.config.get("progressive_plot_every_epochs", 2))
@@ -1481,7 +1742,7 @@ class MetricLearningTrainer:
                     free_training_memory("post_plot_curves")
                 except Exception as curve_err:
                     self.logger.warning(f"  Could not update training curves: {curve_err}")
-            
+
             # Periodic checkpoint (no reference embeddings â€” only on final save)
             if (epoch + 1) % self.config.get('save_every_n_epochs', 10) == 0:
                 self.save_checkpoint(epoch, val_loss, str(Path(self.checkpoint_dir) / f'checkpoint_epoch_{epoch+1}.pth'), save_reference=False)
@@ -1498,6 +1759,9 @@ class MetricLearningTrainer:
                 
                 break
         
+        if self.data_engine is not None:
+            self.data_engine.release_all_workers(close_datasets=True)
+
         self.logger.info(f"\n{'='*70}")
         self.logger.info("Training completed!")
         self.logger.info(f"Best validation loss: {self.best_val_loss:.4f}")

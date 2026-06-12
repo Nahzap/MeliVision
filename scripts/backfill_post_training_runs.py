@@ -52,19 +52,8 @@ def setup_logging() -> None:
 
 
 def create_model_from_config(config: dict) -> AnalogyNet:
-    model_cfg = config["model"]
-    sota_cfg = config.get("sota", {})
-    model = AnalogyNet(
-        backbone=get_backbone_name(config),
-        embedding_dim=model_cfg["embedding_dim"],
-        pretrained=model_cfg.get("pretrained", True),
-        projection_head_config=model_cfg.get("projection_head"),
-        use_attention=model_cfg.get("use_attention", False),
-        freeze_backbone=model_cfg.get("freeze_backbone", False),
-        embedding_space=sota_cfg.get("embedding_space", "euclidean"),
-        hyperbolic_curvature=sota_cfg.get("hyperbolic_curvature", 1.0),
-    )
-    return model
+    from src.utils.model_factory import create_analogy_net_from_config
+    return create_analogy_net_from_config(config)
 
 
 def create_val_loader_from_config(config: dict):
@@ -118,7 +107,7 @@ def backfill_run(run_dir: Path) -> None:
     with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
-    val_loader, test_loader, data_engine = create_eval_dataloaders(config)
+    _, val_loader, test_loader, data_engine = create_eval_dataloaders(config)
     model = create_model_from_config(config)
 
     device = torch.device(

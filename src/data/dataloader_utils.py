@@ -10,34 +10,68 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
-def dispose_dataloader_workers(loader) -> None:
-    """Shut down a DataLoader's worker pool and drop any active iterator."""
-    if loader is None:
+def _shutdown_loader_iterator(iterator) -> None:
+    if iterator is None:
         return
+    if hasattr(iterator, "_shutdown_workers"):
+        try:
+            iterator._shutdown_workers()
+        except Exception as exc:
+            logger.debug("DataLoader worker shutdown: %s", exc)
+
+
+def dispose_dataloader_workers(loader) -> None:
+    """Shut down an active DataLoader iterator without disturbing the next epoch.
+
+    When ``persistent_workers=True`` and the epoch iterator has finished,
+    ``_iterator`` is already ``None`` while workers stay warm for the next
+    ``for batch in loader``. Do **not** call ``iter(loader)`` just to shut
+    workers down — that spawns prefetch, advances sampler state, and breaks
+    epoch-to-epoch continuity.
+    """
+    if loader is None or int(getattr(loader, "num_workers", 0) or 0) <= 0:
+        return
+
     iterator = getattr(loader, "_iterator", None)
     if iterator is not None:
-        if hasattr(iterator, "_shutdown_workers"):
-            try:
-                iterator._shutdown_workers()
-            except Exception as exc:
-                logger.debug("DataLoader worker shutdown: %s", exc)
+        _shutdown_loader_iterator(iterator)
         loader._iterator = None
 
 
+def close_dataset_resources(dataset) -> None:
+    """Close per-worker dataset handles (e.g. HDF5) opened during prefetch."""
+    if dataset is None:
+        return
+    close_fn = getattr(dataset, "close", None)
+    if callable(close_fn):
+        try:
+            close_fn()
+        except Exception as exc:
+            logger.debug("Dataset close: %s", exc)
+
+
 def dispose_data_engine(data_engine) -> None:
-    """Release train and val worker pools held by GrainDataEngine."""
+    """Release all DataLoader worker pools and dataset handles held by GrainDataEngine."""
     if data_engine is None:
         return
-    dispose_dataloader_workers(getattr(data_engine, "train_loader", None))
-    dispose_dataloader_workers(getattr(data_engine, "val_loader", None))
-    if hasattr(data_engine, "release_train_workers"):
-        data_engine.release_train_workers()
-    if hasattr(data_engine, "release_val_workers"):
-        data_engine.release_val_workers()
+    if hasattr(data_engine, "release_all_workers"):
+        data_engine.release_all_workers(close_datasets=True)
+        return
+    for attr in ("train_loader", "val_loader", "test_loader"):
+        dispose_dataloader_workers(getattr(data_engine, attr, None))
+    for attr in ("train_dataset", "val_dataset", "test_dataset"):
+        close_dataset_resources(getattr(data_engine, attr, None))
+    gc.collect()
 
 
 def free_training_memory(stage: str = "") -> None:
     """Best-effort release of cached RAM / VRAM between estimate and train phases."""
+    try:
+        import matplotlib.pyplot as plt
+
+        plt.close("all")
+    except Exception:
+        pass
     gc.collect()
     try:
         import torch

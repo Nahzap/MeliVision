@@ -30,10 +30,18 @@ class SGSoftmaxLoss(nn.Module):
         margin (float): Additive angular margin. Default 0.4.
     """
     
-    def __init__(self, embedding_dim, num_classes, scale=30.0, margin=0.4):
+    def __init__(
+        self,
+        embedding_dim,
+        num_classes,
+        scale=30.0,
+        margin=0.4,
+        ortho_penalty_weight=1.0,
+    ):
         super().__init__()
         self.scale = scale
         self.margin = margin
+        self.ortho_penalty_weight = float(ortho_penalty_weight)
         self.num_classes = num_classes
         
         # Learnable class proxies
@@ -103,5 +111,5 @@ class SGSoftmaxLoss(nn.Module):
         ortho_penalty = torch.relu(proxy_sim[proxy_mask]).mean()
         
         # Sumar la penalización para forzar activamente que los centroides se repelan a >90°
-        loss = loss_ce + self.scale * ortho_penalty
+        loss = loss_ce + self.ortho_penalty_weight * ortho_penalty
         return loss

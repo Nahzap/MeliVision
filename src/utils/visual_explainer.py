@@ -77,6 +77,8 @@ class BaseVisualExplainer(ABC):
         self,
         image_tensor: torch.Tensor,
         centroid: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+        grain_config: Optional[dict] = None,
     ) -> np.ndarray:
         """
         Return a heatmap of shape (H_img, W_img) with values in [0, 1].
@@ -130,7 +132,7 @@ class CNNExplainer(BaseVisualExplainer):
         raise RuntimeError("Could not auto-detect a valid 4-D convolutional target layer.")
 
     # ── heatmap ───────────────────────────────────────────────────────
-    def generate_heatmap(self, image_tensor, centroid=None):
+    def generate_heatmap(self, image_tensor, centroid=None, mask=None, grain_config=None, **_kwargs):
         from pytorch_grad_cam import HiResCAM  # HiResCAM prevents negative*negative=positive inversion with LayerNorm
         from src.utils.inference_utils import EmbeddingSimilarityTarget
 
@@ -183,7 +185,7 @@ class ConvNeXtExplainer(BaseVisualExplainer):
                 return tensor.transpose(1, 2).reshape(B, C, h, w)
         return tensor
 
-    def generate_heatmap(self, image_tensor, centroid=None):
+    def generate_heatmap(self, image_tensor, centroid=None, mask=None, grain_config=None, **_kwargs):
         from pytorch_grad_cam import HiResCAM
         from src.utils.inference_utils import EmbeddingSimilarityTarget
 
@@ -319,60 +321,88 @@ class TransformerExplainer(BaseVisualExplainer):
             self._cache["qkv_ref"] = None
 
     # ── main entry point ──────────────────────────────────────────────
-    def generate_heatmap(self, image_tensor, centroid=None):
+    def generate_heatmap(
+        self,
+        image_tensor,
+        centroid=None,
+        mask=None,
+        grain_config=None,
+        **_kwargs,
+    ):
         image_tensor = image_tensor.to(self.device)
         self._model.eval()
         self._detach_all()
-        
+
         image_tensor = image_tensor.detach().requires_grad_(False)
-        
+        grain_config = grain_config or {}
+        effective_mask = None
+        if mask is not None and grain_config.get("masked_pooling", False):
+            effective_mask = mask.to(self.device)
+
+        token_capture: dict = {}
+        hook_handle = None
+        if hasattr(self._raw_vit, "blocks") and len(self._raw_vit.blocks) > 0:
+
+            def _capture_tokens(_module, _inp, out):
+                if isinstance(out, torch.Tensor) and out.dim() == 3:
+                    out.retain_grad()
+                    token_capture["tokens"] = out
+
+            hook_handle = self._raw_vit.blocks[-1].register_forward_hook(_capture_tokens)
+
+        features = None
+        patch_features = None
         try:
             with torch.enable_grad():
-                features = self._forward_bypass(image_tensor)
-                
-                # Rebuild the embedding to compute metric-learning gradient
-                if features.dim() == 3:
-                    patch_features = features[:, self.patch_start:]
-                    patch_features.retain_grad()
-                    pooled = patch_features.mean(dim=1)
-                else:
-                    pooled = features
-                    pooled.retain_grad()
-                    patch_features = pooled
-                
-                if hasattr(self._model, "attention") and self._model.attention is not None:
-                    pooled = self._model.attention(pooled)
-
-                if hasattr(self._model, "projection"):
-                    emb = self._model.projection(pooled)
-                    emb = F.normalize(emb, p=2, dim=1)
-                else:
-                    emb = pooled
-
                 if centroid is not None:
+                    # D-07: gradient target via canonical training forward (pooling + projection)
+                    from src.models.embedding_extractor import extract_embeddings_from_batch
+
+                    emb = extract_embeddings_from_batch(
+                        self._model,
+                        image_tensor,
+                        masks=effective_mask,
+                        grain_config=grain_config,
+                    )
                     c = centroid.to(self.device).detach()
                     sim = F.cosine_similarity(emb, c.unsqueeze(0), dim=1).sum()
                     sim.backward()
-                    
+                    captured = token_capture.get("tokens")
+                    if captured is not None:
+                        patch_features = captured[:, self.patch_start:]
+                else:
+                    features = self._forward_bypass(image_tensor)
+                    if features.dim() == 3:
+                        patch_features = features[:, self.patch_start:]
+                        patch_features.retain_grad()
+                    else:
+                        patch_features = features
+                        patch_features.retain_grad()
+                    pooled = patch_features.mean(dim=1) if features.dim() == 3 else patch_features
+                    pooled.sum().backward()
+
         finally:
+            if hook_handle is not None:
+                hook_handle.remove()
             self._detach_all()
 
         # ── compute heatmap from feature gradients ───────────────────
-        # Bypasses the Attention Sink completely by using the actual gradients 
-        # evaluated at the patch features output
-        if features.dim() == 3:
+        if patch_features is None or patch_features.grad is None:
+            with torch.enable_grad():
+                features = self._forward_bypass(image_tensor)
+                if features.dim() == 3:
+                    patch_features = features[:, self.patch_start:]
+                    patch_features.retain_grad()
+                    patch_features.mean(dim=1).sum().backward()
+
+        if patch_features is not None and patch_features.dim() == 3 and patch_features.grad is not None:
             grads = patch_features.grad  # [B, P, C]
-            
-            # Fix inversion: Element-wise multiplication (HiResCAM math) instead of spatial pooling.
-            # This prevents negative background features from multiplying with negative global gradients.
             cam = (patch_features * grads).sum(dim=2)  # [B, P]
             cam = F.relu(cam).squeeze(0)  # [P]
-            
             P = cam.shape[0]
             h_p = w_p = int(P ** 0.5)
             spatial = cam.reshape(1, 1, h_p, w_p).float()
         else:
-            # Fallback for non-ViT (should not happen in TransformerExplainer)
             spatial = torch.zeros((1, 1, 1, 1))
 
         H_img, W_img = image_tensor.shape[2], image_tensor.shape[3]
@@ -476,9 +506,12 @@ def create_explainer(model: nn.Module, device: torch.device) -> BaseVisualExplai
         target_layer = raw_vit.blocks[-1].norm1
         reshape_fn = _make_vit_reshape_transform(raw_vit)
 
+        # D-08: Grad-CAM on ViT is approximate; Chefer et al. (CVPR 2021) attention rollout
+        # is preferred for interpretability papers. Full training-path XAI (multi_tower +
+        # masked pooling) requires gradients through PoolingModule — partial in D-07.
         logger.info(
-            "[XAI-Factory] ViT/DINOv2/DeiT detected -> CNNExplainer + reshape_transform "
-            "(target=blocks[-1].norm1, propagates gradients through FFT and spatial pooling)"
+            "[XAI-Factory] ViT/DINOv2/DeiT -> Activation Grad-CAM (blocks[-1].norm1). "
+            "For publication-grade ViT attribution prefer attention rollout over Grad-CAM."
         )
         return CNNExplainer(model, device, target_layer=target_layer,
                             reshape_transform=reshape_fn)

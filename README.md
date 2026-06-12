@@ -16,6 +16,7 @@ Aprende una función de embedding $f_\theta: \mathbb{R}^{H \times W \times 3} \r
 - [Etapa 4 — Preprocesamiento y Augmentaciones](#etapa-4--preprocesamiento-y-augmentaciones)
 - [Etapa 5 — Modelo de Embedding (AnalogyNet + DINOv2)](#etapa-5--modelo-de-embedding-analogynet--dinov2)
 - [Etapa 6 — Entrenamiento (Sliced MS Loss)](#etapa-6--entrenamiento-sliced-ms-loss)
+- [Configuración declarativa y plan de alineación](#configuración-declarativa-y-plan-de-alineación)
 - [Etapa 7 — Evaluación y Métricas](#etapa-7--evaluación-y-métricas)
 - [Etapa 8 — Análisis Post-Entrenamiento](#etapa-8--análisis-post-entrenamiento)
 - [Etapa 9 — Inferencia End-to-End](#etapa-9--inferencia-end-to-end)
@@ -88,21 +89,19 @@ El sistema soporta datasets con múltiples clases de polen. La partición estrat
 ║  │                                           │                     ║
 ║  │  ┌─────────────────────────────────────┐  │                     ║
 ║  │  │ DINOv2 ViT-S/14 (21M params)       │  │                     ║
-║  │  │  14×14 patches → 324 tokens         │  │                     ║
-║  │  │  12 transformer blocks, dim=384     │  │                     ║
-║  │  │  Mean pooling → ℝ^384              │  │                     ║
+║  │  │  Capas 3+11 → masked multi-spec    │  │                     ║
+║  │  │  (mean+max+std) → ℝ^1152 × 2       │  │                     ║
 ║  │  ├─────────────────────────────────────┤  │                     ║
-║  │  │ Projection Head (MLP)               │  │                     ║
-║  │  │  384→256→256→128 + BN + ReLU        │  │                     ║
+║  │  │ Projection LF/HF → 64+64 + L2-Cat  │  │                     ║
 ║  │  ├─────────────────────────────────────┤  │                     ║
-║  │  │ L2 Norm → ê ∈ S^127               │  │                     ║
+║  │  │ Embedding ê ∈ S^127 (128D)         │  │                     ║
 ║  │  └─────────────────────────────────────┘  │                     ║
 ║  └─────────┬────────────────────────────────┘                     ║
 ║            │                                                      ║
 ║            ▼                                                      ║
 ║  ┌──────────────────────────────────────────┐                     ║
-║  │ ETAPA 9: Clasificación por centroides    │                     ║
-║  │  ŷ = argmin_c ‖ê − μ_c‖₂                │                     ║
+║  │ ETAPA 6-9: Sliced MS + slice-aware      │                     ║
+║  │  128D → 4×32D → ŷ por media cosenos    │                     ║
 ║  └─────────┬────────────────────────────────┘                     ║
 ║            │                                                      ║
 ║            ▼                                                      ║
@@ -263,59 +262,50 @@ Los patches de fondo gris producen activaciones **~cero** en DINOv2 → contribu
 
 ## Etapa 5 — Modelo de Embedding (AnalogyNet + DINOv2)
 
-### DINOv2 ViT-S/14 Backbone
+### DINOv2 ViT-S/14 Backbone + pooling enmascarado
 
-**DINOv2** (Oquab et al., 2023): foundation model entrenado con self-supervised learning sobre 142M de imágenes curadas automáticamente (LVD-142M).
+**DINOv2** (Oquab et al., 2023): foundation model SSL sobre LVD-142M. El proyecto **no usa el token CLS** para metric learning; agrega **patch tokens** de capas intermedias con estadísticas multi-espectrales y máscara del contorno.
 
 ```
-Imagen (3 × 252 × 252)
+Imagen (3 × H × W)  +  máscara alineada con augmentations
     │
     ▼
 ┌────────────────────────────────────────┐
-│ Patch Embedding                        │
-│  Conv2d(3, 384, kernel=14, stride=14)  │
-│  252/14 = 18 patches por lado          │
-│  18×18 = 324 patch tokens + 1 CLS      │
-│  → (B, 325, 384)                       │
+│ Patch Embedding (14×14) + 12 bloques   │
+│  Self-attention GLOBAL en cada capa    │
+│  (fondo gris ≈ 0 tras norm ImageNet)   │
 ├────────────────────────────────────────┤
-│ Positional Encoding (learnable)        │
+│ get_intermediate_layers(n=[3, 11])     │
+│  capa 3  → textura / baja semántica    │
+│  capa 11 → semántica / pre-final      │
 ├────────────────────────────────────────┤
-│ 12 Transformer Encoder Blocks          │
-│                                        │
-│  Cada bloque:                          │
-│  ┌──────────────────────────────────┐  │
-│  │ LayerNorm                        │  │
-│  │ Multi-Head Self-Attention        │  │
-│  │   6 heads, dim=384, head_dim=64  │  │
-│  │   Attn = softmax(QK^T/√64)·V    │  │
-│  │ + Residual                       │  │
-│  ├──────────────────────────────────┤  │
-│  │ LayerNorm                        │  │
-│  │ MLP (SwiGLU: 384→1536→384)      │  │
-│  │ + Residual                       │  │
-│  └──────────────────────────────────┘  │
-│                                        │
-│  Atención GLOBAL: cada patch atiende   │
-│  a todos los demás en cada capa        │
+│ Masked multi-spectral pooling          │
+│  por capa: mean + max + std            │
+│  solo patches con máscara > umbral       │
+│  DropToken (train, p configurable)      │
+│  → feat_lf, feat_hf ∈ ℝ^(3×384)=ℝ^1152 │
 ├────────────────────────────────────────┤
-│ Mean Pooling (excluir CLS)             │
-│  (B, 324, 384) → mean → (B, 384)      │
+│ projection_lf / projection_hf (MLP)    │
+│  1152 → 256 → 256 → 64 cada rama       │
+├────────────────────────────────────────┤
+│ L2-Cat-L2 → ê ∈ S^127 (128D)          │
 └────────────────────────────────────────┘
     │
     ▼
-┌────────────────────────────────────────┐
-│ Projection Head (MLP)                  │
-│  Linear(384, 256) + BN + ReLU + Drop   │
-│  Linear(256, 256) + BN + ReLU + Drop   │
-│  Linear(256, 128)                      │
-├────────────────────────────────────────┤
-│ L2 Normalization                       │
-│  ê = e / ‖e‖₂  →  ê ∈ S^127          │
-└────────────────────────────────────────┘
-    │
-    ▼
-Embedding en hiperesfera unitaria (128-dim)
+Sliced MS Loss particiona 128D en S slices (default 4×32D)
 ```
+
+**Nota:** la imagen **no** se multiplica por la máscara antes del ViT (artefactos posicionales). El filtrado es **post-atención**, en el pooling. Ver auditoría en `docs/20260210_1750_AUDITORIA_REGRESION_MASKED_POOLING.md`.
+
+### Relación pooling ↔ slices espectrales
+
+| Etapa | Qué hace | Efecto en capacidad discriminativa |
+|-------|----------|-----------------------------------|
+| **Pooling** | Comprime N patches → vector rico (mean/max/std, 2 capas) | Preserva morfología intra-grano (textura, heterogeneidad) |
+| **Proyección** | Comprime 1152D → 128D | Aprende qué features entran al espacio métrico |
+| **S slices** | Particiona 128D; MS+LDM independiente por slice | Eleva rango espectral efectivo ≈ S×(C−1) vs. colapso C−1 |
+
+Los slices N **no sustituyen** un buen pooling: amplifican la geometría métrica **si** las dimensiones de cada slice corresponden a fuentes de señal coherentes. El [plan de implementación](docs/2026-06-11_PLAN_IMPLEMENTACION_POOLING_SLICE_ALIGNED.md) define el layout `slice_native` para alinear capas, pooling y partición S.
 
 ### ¿Por qué DINOv2 y no CNN?
 
@@ -342,7 +332,7 @@ Distancia euclidiana y similitud coseno son monótonamente equivalentes.
 | ResNet-18 | 512 | 11.7M | torchvision |
 | ResNet-50 | 2048 | 23.5M | torchvision |
 | ConvNeXt V2 Tiny | 768 | 28.6M | timm (FCMAE+IN22k) |
-| **DINOv2 ViT-S/14** | **384** | **21M** | **torch.hub (default)** |
+| **DINOv2 ViT-S/14** | **1152** (post-pool) / 384 (token) | **21M** | **torch.hub (default)** |
 | DINOv2 ViT-B/14 | 768 | 86M | torch.hub |
 | DINOv2 ViT-S/14 + Reg | 384 | 21M | torch.hub (registers) |
 | DINOv2 ViT-B/14 + Reg | 768 | 86M | torch.hub (registers) |
@@ -371,7 +361,7 @@ donde $\mathbf{z}^{(s)}$ es el slice $s$ del embedding y cada slice se L2-normal
 
 **Pérdidas alternativas:** `sliced_proxy` (SG-Softmax por slice), `hybrid_proxy_ms`, Triplet, ArcFace, Proxy Anchor.
 
-Documentación completa: `docs/2026-06-09_INFORME_MODIFICACIONES_PIPELINE_MULTI_SLICE.md`.
+Documentación: `docs/2026-06-09_INFORME_MODIFICACIONES_PIPELINE_MULTI_SLICE.md` (slices + inferencia) y `docs/2026-06-11_PLAN_IMPLEMENTACION_POOLING_SLICE_ALIGNED.md` (pooling configurable + alineación slice-native).
 
 ### Multi-Similarity Loss (base por slice)
 
@@ -427,8 +417,9 @@ Todas opcionales, activables desde `config.yaml` sección `sota:`.
 
 | Artefacto | Descripción |
 |-----------|-------------|
-| `class_centroids.pt` | Centroides de clase (media de embeddings del train set) |
-| `reference_embeddings.pt` | Todos los embeddings del train set + labels |
+| `slice_representatives.pt` | **Primario inferencia** — representantes por slice `(S, C, D_s)` |
+| `class_centroids.pt` | Centroides globales (referencia / legacy) |
+| `reference_embeddings.pt` | Embeddings del train set + labels |
 | `training_metrics.csv` | Métricas epoch-a-epoch |
 | `best_model.pth` | Checkpoint con configuración de entrenamiento incorporada |
 
@@ -436,15 +427,71 @@ Todas opcionales, activables desde `config.yaml` sección `sota:`.
 
 ---
 
+## Configuración declarativa y plan de alineación
+
+### Principio: nada hardcodeado
+
+Toda decisión arquitectónica debe vivir en `config.yaml` y validarse al arranque (`src/utils/config_validator.py`). Valores que **hoy están fijos en código** y pasarán a config:
+
+| Parámetro | Código actual | Destino config |
+|-----------|---------------|----------------|
+| Capas ViT | `[3, 11]` | `model.pooling.layers` |
+| Estadísticas | mean+max+std | `model.pooling.statistics` |
+| DropToken | `p=0.3` | `model.pooling.drop_token` |
+| Umbral máscara patch | `0.01` | `model.pooling.masked.threshold` |
+| Layout proyección | LF/HF dual | `model.projection.layout: slice_native` |
+| S slices | `num_slices: 4` | ya en `training.loss.params` |
+
+### Parámetros centrales (hoy)
+
+```yaml
+model:
+  embedding_dim: 128      # divisible por num_slices
+training:
+  loss:
+    type: sliced_ms
+    params:
+      num_slices: 4       # S — controla rango espectral
+grain_detection:
+  masked_pooling: true    # máscara al collate + forward
+```
+
+### Roadmap de implementación (2026-06-11)
+
+| Fase | Entregable | Prioridad |
+|------|------------|-----------|
+| **0** | Baseline reproducible + inventario hardcodes | Alta |
+| **1** | Schema `model.pooling` + validator extendido | Alta |
+| **2** | `PoolingModule` + `EmbeddingExtractor` unificado | **Crítica** |
+| **3** | Proyección `slice_native` (dims ↔ slices) | Alta |
+| **4** | XAI/Grad-CAM mismo forward que train | Media |
+| **5** | Matriz de ablaciones (GeM, capas, S, masking) | Media |
+| **6** | Migración checkpoints + docs | Baja |
+
+Plan completo con fórmulas, criterios de aceptación y referencias 2022–2026:
+**[`docs/2026-06-11_PLAN_IMPLEMENTACION_POOLING_SLICE_ALIGNED.md`](docs/2026-06-11_PLAN_IMPLEMENTACION_POOLING_SLICE_ALIGNED.md)**
+
+Implementación (2026-06-11): **`docs/2026-06-11_IMPLEMENTACION_POOLING_SLICE_CHANGELOG.md`** — smoke test: `python scripts/smoke_test_pooling_slice.py --config test_config.yaml`
+
+### Brechas conocidas (pendientes de Fase 2)
+
+- `extract_embeddings()` en post-training **no pasa máscara** → t-SNE/kNN plots no reflejan inferencia producción.
+- XAI usa mean de última capa, no el pooling de entrenamiento.
+- Slicing por índice mezcla ramas LF/HF en cada slice — se corrige con `slice_native`.
+
+---
+
 ## Etapa 7 — Evaluación y Métricas
 
-| Métrica | Definición |
-|---------|-----------|
-| **Recall@K** | Fracción de queries con ≥1 vecino correcto en top-K (Wang et al., CVPR 2019) |
-| **NMI** | Calidad de clustering (K-Means sobre embeddings) |
-| **Distance Ratio** | $\rho = \bar{d}_{inter} / \bar{d}_{intra}$ — separación relativa (objetivo: $\rho > 3$) |
-| **kNN Confusion Matrix** | Leave-one-out sobre embeddings de validación |
-| **Centroid Classification** | $\hat{y} = \arg\min_c \|f_\theta(x) - \hat{\mu}_c\|_2$ |
+| Métrica | Definición | Rol |
+|---------|-----------|-----|
+| **slice_accuracy** | Clasificación slice-aware (media cosenos por slice) | **Primaria** — coherente con `sliced_ms` |
+| **Recall@K** | Fracción de queries con ≥1 vecino correcto en top-K (Wang et al., CVPR 2019) | Estándar DML |
+| **mAP@R** | Ranking completo (Musgrave et al., ECCV 2020) | Calidad topológica |
+| **NMI** | Concordancia K-Means vs. etiquetas | Clustering |
+| **Rango espectral efectivo** | Dimensión activa del espacio de embeddings | Objetivo >30 con S=4 |
+| **kNN accuracy** | 1-NN global 128D | **Secundaria** — puede divergir de slice_accuracy |
+| **Distance Ratio** | $\rho = \bar{d}_{inter} / \bar{d}_{intra}$ | Separación (objetivo $\rho > 2$) |
 
 ---
 
@@ -477,8 +524,8 @@ Imagen cámara (cualquier resolución)
   │
   └── Para cada grano:
         Crop + padding (20%) → Máscara contorno → Gray bg (128)
-        → Val transform (Resize 252, Normalize) → AnalogyNet → ê ∈ S^127
-        → ŷ = argmin_c ‖ê − μ_c‖₂ + distancia + confianza
+        → Val transform → AnalogyNet(mask=…) → ê ∈ S^127
+        → SliceAwareClassifier: media cosenos por slice vs slice_representatives.pt
   │
   └── Resultado:
         • Imagen anotada: bboxes coloreados por clase + labels
@@ -508,7 +555,7 @@ Hook en blocks[-1].attn.qkv → Extraer Q, K
 Para metric learning, se pondera cada attention head por su contribución a la clasificación (Chefer et al., CVPR 2021):
 
 ```
-Forward con gradientes → cos_sim(embedding, centroide_predicho) → backward
+Forward con gradientes → cos_sim(embedding, target_slice_aware) → backward
   → Importancia por head: h_j = mean(|∂sim/∂QKV_j|)
   → Atención ponderada: A_weighted = Σ_j (h_j · A_cls_j)
   → Muestra qué patches contribuyen a la CLASIFICACIÓN CORRECTA
@@ -553,7 +600,11 @@ MeliVision/
 │
 ├── src/                                # Núcleo científico
 │   ├── models/
-│   │   ├── analogy_net.py              # AnalogyNet: backbone + projection + L2
+│   │   ├── analogy_net.py              # AnalogyNet: backbone + pooling + projection
+│   │   ├── pooling.py                  # (planificado) PoolingModule configurable
+│   │   ├── embedding_extractor.py      # (planificado) forward canónico único
+│   ├── inference/
+│   │   └── slice_classifier.py         # SliceAwareClassifier + representantes
 │   │   ├── hyperbolic.py               # Poincaré Ball (embedding hiperbólico)
 │   │   └── u2net/                      # U²-Net para saliencia
 │   │       └── u2net.py                # Arquitectura U²-Net / U²-NETP
@@ -648,11 +699,21 @@ MeliVision/
 11. **Musgrave, K. et al.** (2020). A Metric Learning Reality Check. *ECCV 2020*.
 12. **Roth, K. et al.** (2022). Non-Isotropy Regularization for Proxy-based DML. *CVPR 2022*.
 13. **Kim, S. et al.** (2023). HIER: Metric Learning Beyond Class-Level Similarities. *CVPR 2023*.
+14. **Kornblith, S., Shlens, J., & Le, Q. V.** (2019). Do Better ImageNet Models Transfer Better? *CVPR 2019*.
+15. **Macenko, M. et al.** (2009). A Method for Normalizing Histology Slides for Quantitative Analysis. *ISBI 2009*.
+16. **Reinhard, E., Ashikhmin, M., Gooch, B., & Shirley, P.** (2001). Color Transfer between Images. *IEEE CG&A*, 21(5).
+17. **Loshchilov, I., & Hutter, F.** (2017). SGDR: Stochastic Gradient Descent with Warm Restarts. *ICLR 2017*.
+
+**Auditoría bibliográfica (correcciones Ashikhmin, Macenko, venues):** [`docs/20260207_172200_REVISION_REFERENCIAS_SOTA.md`](docs/20260207_172200_REVISION_REFERENCIAS_SOTA.md)
+
+**Plan cumplimiento académico SOTA:** [`docs/2026-06-12_PLAN_CUMPLIMIENTO_ACADEMICO_SOTA.md`](docs/2026-06-12_PLAN_CUMPLIMIENTO_ACADEMICO_SOTA.md)
+
+**Ablaciones F-01…F-07:** `python scripts/run_ablation_matrix.py --matrix pooling --dry-run`
 
 ---
 
-**Versión:** 4.0 (DINOv2 + U²-Net + Attention Maps)  
-**Última actualización:** 2026-02-10  
+**Versión:** 5.0 (MLRC + ablaciones + zero activation ImageNet-neutral)  
+**Última actualización:** 2026-06-12  
 **Metodología completa:** [`docs/20260210_2135_METODOLOGIA_COMPLETA_SISTEMA.md`](docs/20260210_2135_METODOLOGIA_COMPLETA_SISTEMA.md)  
 **Mejoras atención + augmentations:** [`docs/20260210_1945_ANALISIS_MEJORAS_ATENCION_Y_AUGMENTATIONS.md`](docs/20260210_1945_ANALISIS_MEJORAS_ATENCION_Y_AUGMENTATIONS.md)  
 **Documentación técnica:** [`docs/20260207_155700_DESCRIPCION_TECNICA_SISTEMA.md`](docs/20260207_155700_DESCRIPCION_TECNICA_SISTEMA.md)  

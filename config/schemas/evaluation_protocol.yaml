@@ -1,0 +1,54 @@
+# MLRC evaluation protocol schema (Musgrave et al., ECCV 2020)
+# Reference: docs/2026-06-12_PLAN_CUMPLIMIENTO_ACADEMICO_SOTA.md §3
+
+training:
+  validation_metric:
+    type: string
+    enum: [mAP@R, recall_at_1, val_loss, F1_macro]
+    default: mAP@R
+    description: Metric for best-checkpoint selection on validation split.
+
+evaluation:
+  protocol:
+    type: string
+    enum: [mlrc, legacy]
+    default: mlrc
+  n_runs:
+    type: integer
+    minimum: 1
+    default: 10
+    description: Independent training runs for mean ± 95% CI reporting.
+  nn_metric:
+    type: string
+    enum: [cosine, euclidean, hyperbolic, null]
+    default: null
+    description: Override NN metric; null derives from sota.embedding_space.
+  map_at_r:
+    exact:
+      type: boolean
+      default: true
+    candidate_multiplier:
+      type: integer
+      default: 12
+      description: Only used when exact=false (debug / RAM-limited).
+  nmi:
+    n_init:
+      type: integer
+      minimum: 1
+      default: 10
+    n_seeds:
+      type: integer
+      minimum: 1
+      default: 5
+  calibration:
+    enabled:
+      type: boolean
+      default: true
+  select_checkpoint_on:
+    type: string
+    enum: [val]
+    default: val
+  report_final_on:
+    type: string
+    enum: [test, val]
+    default: test

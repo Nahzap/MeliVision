@@ -27,6 +27,7 @@ from src.data.dataloader_utils import (
 )
 from src.data.transforms_enhanced import get_train_transforms, get_val_transforms
 from src.utils.config_utils import get_backbone_name
+from src.utils.resolution_config import resolve_effective_image_size
 
 logger = logging.getLogger(__name__)
 
@@ -222,7 +223,7 @@ def _loader_policy(config: dict) -> dict:
 def _grain_dataset_kwargs(config: dict, transform, mask_bg_mode: str) -> dict:
     grain_cfg = config.get("grain_detection", {})
     data_cfg = config.get("data", {})
-    image_size = int(data_cfg.get("image_size", grain_cfg.get("crop_size", 224)))
+    image_size = resolve_effective_image_size(config)
     annotation_root = data_cfg.get("annotation_root", "data/annotations")
 
     return {
@@ -434,20 +435,35 @@ class GrainDataEngine:
         )
 
     def release_train_workers(self):
-        """Shut down train DataLoader workers before validation (reduces RAM/CPU contention)."""
-        if not self._exclusive_val or self.train_workers <= 0:
+        """Shut down train DataLoader workers when train prefetch is not needed."""
+        if self.train_workers <= 0:
             return
         dispose_dataloader_workers(self.train_loader)
         import gc
         gc.collect()
 
     def release_val_workers(self):
-        """Shut down val DataLoader workers before training."""
+        """Shut down val DataLoader workers when val prefetch is not needed."""
         if self.val_workers <= 0:
             return
         dispose_dataloader_workers(self.val_loader)
+        if self.test_loader is not None:
+            dispose_dataloader_workers(self.test_loader)
         import gc
         gc.collect()
+
+    def release_all_workers(self, *, close_datasets: bool = False):
+        """Shut down DataLoader pools. Dataset handles stay open during training."""
+        from src.data.dataloader_utils import close_dataset_resources, free_training_memory
+
+        self.release_train_workers()
+        self.release_val_workers()
+        if close_datasets:
+            for dataset in (self.train_dataset, self.val_dataset, self.test_dataset):
+                close_dataset_resources(dataset)
+        import gc
+        gc.collect()
+        free_training_memory("data_engine_workers_released")
 
 
 def create_dataloaders(config: dict):

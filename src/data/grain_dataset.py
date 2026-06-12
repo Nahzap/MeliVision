@@ -45,9 +45,12 @@ class SegmentedGrainDataset(Dataset):
         crop_size: Tamaño final del crop cuadrado (para AnalogyNet)
         use_mask: Si True, aplica la máscara del grano (fondo fuera del contorno)
         mask_bg_mode: Modo de fondo fuera del contorno cuando use_mask=True.
-            'random' = color aleatorio/ruido (training, evita shortcut learning)
-            'gray'   = gris neutro 128 (inference/val)
-            'black'  = negro puro (legacy, NO recomendado — causa shortcut learning)
+            'imagenet_neutral' = RGB por canal = mean*255 → ~0 tras Normalize ImageNet
+                                 (zero activation del autor: fondo no activa atención)
+            'random' = color aleatorio sólido (training)
+            'gray'   = gris 128 uniforme (legacy)
+            'black'  = negro puro (legacy, NO recomendado)
+            'none'   = fondo original del crop
         min_saliency: Umbral mínimo de saliency para incluir un grano
         return_metadata: Si True, retorna (tensor, class_idx, metadata_dict)
         return_mask: Si True, retorna máscara binaria del grano para masked pooling
@@ -116,6 +119,15 @@ class SegmentedGrainDataset(Dataset):
         stats = self.get_stats()
         for cls_name, count in stats.get('class_distribution', {}).items():
             logger.info(f"  {cls_name}: {count} granos")
+
+    def close(self) -> None:
+        """Close HDF5 handle opened in this process (main or worker)."""
+        if self._h5_file is not None:
+            try:
+                self._h5_file.close()
+            except Exception:
+                pass
+            self._h5_file = None
 
     def _build_index(self):
         """
@@ -242,16 +254,7 @@ class SegmentedGrainDataset(Dataset):
             
             # Aplicar mask_bg_mode on-the-fly si usamos máscara
             if mask_binary is not None:
-                bg_pixels = mask_binary == 0
-                if self.mask_bg_mode == 'random':
-                    # Use a solid random color instead of pixel-wise noise
-                    bg_color = np.random.randint(0, 256, size=(1, 1, 3), dtype=np.uint8)
-                    crop[bg_pixels] = bg_color[0, 0]
-                elif self.mask_bg_mode == 'gray':
-                    crop[bg_pixels] = 128
-                elif self.mask_bg_mode == 'black':
-                    crop[bg_pixels] = 0
-                # Si es 'none', dejamos el crop (background original) intacto.
+                crop = self._apply_mask_bg(crop, mask_binary)
         else:
             # Fallback a lectura on-the-fly
             image, scale = self._load_image(image_path)
@@ -410,18 +413,20 @@ class SegmentedGrainDataset(Dataset):
         return mask_crop
 
     def _apply_mask_bg(self, crop: np.ndarray, mask_crop: np.ndarray) -> np.ndarray:
-        """Aplica el color de fondo a la imagen basándose en la máscara."""
+        """Aplica el color de fondo a la imagen basándose en la máscara (BGR uint8)."""
         bg_pixels = mask_crop == 0
-        if self.mask_bg_mode == 'random':
-            # Use a solid random color instead of pixel-wise noise
+        if self.mask_bg_mode == 'imagenet_neutral':
+            from src.utils.dataset_norm import imagenet_neutral_bgr_uint8
+
+            b, g, r = imagenet_neutral_bgr_uint8()
+            crop[bg_pixels] = (b, g, r)
+        elif self.mask_bg_mode == 'random':
             bg_color = np.random.randint(0, 256, size=(1, 1, 3), dtype=np.uint8)
             crop[bg_pixels] = bg_color[0, 0]
         elif self.mask_bg_mode == 'gray':
             crop[bg_pixels] = 128
         elif self.mask_bg_mode == 'black':
-            crop[mask_crop == 0] = 0
-        # Si es 'none', no hacemos nada (mantenemos el fondo original)
-        
+            crop[bg_pixels] = 0
         return crop
 
     def get_stats(self) -> Dict[str, Any]:

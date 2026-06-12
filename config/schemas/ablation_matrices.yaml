@@ -1,0 +1,38 @@
+# Ablation matrices schema (Phase F) — see src/utils/ablation_matrix.py
+
+matrices:
+  pooling:        # F-01
+    variants: [multi_spectral, gem, mean, fsw]
+    keys: [model.pooling.strategy]
+  slices:         # F-02
+    variants: [2, 4, 8]
+    keys: [training.loss.params.num_slices]
+  layout:         # F-03
+    variants: [lf_hf_dual, slice_native, multi_tower]
+    keys: [model.projection.layout, model.pooling.layer_fusion]
+  masked:         # F-04
+    variants: [masked, unmasked]
+    keys: [grain_detection.masked_pooling, model.pooling.masked.enabled]
+  augment:        # F-05
+    variants: [full, deit3_simple]
+    keys: [sota.augmentation_mode]
+  freeze:         # F-06
+    variants: [head_only, last_2_blocks, full_finetune]
+    keys: [model.freeze_backbone, model.num_unfrozen_blocks]
+  validation_metric:  # F-07
+    variants: [recall_at_1, mAP@R, F1_macro]
+    keys: [training.validation_metric]
+
+cli:
+  dry_run: python scripts/run_ablation_matrix.py --matrix pooling --dry-run
+  prepare: python scripts/run_ablation_matrix.py --matrix slices --prepare-only
+  train:   python scripts/run_ablation_matrix.py --matrix augment --run
+  collect: python scripts/run_ablation_matrix.py --collect ablations/<batch>/manifest.json
+
+output:
+  batch_dir: ablations/<matrix>_<timestamp>/
+  manifest: manifest.json
+  results: results.csv
+  metrics_source:
+    - evaluation_metrics_summary_final.json
+    - images/post_training/val/spectral_analysis/spectral_summary.json

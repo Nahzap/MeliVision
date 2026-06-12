@@ -19,61 +19,30 @@ def extract_embeddings(
     dataloader: DataLoader,
     device: torch.device,
     return_paths: bool = False,
-    show_progress: bool = True
+    show_progress: bool = True,
+    grain_config: Optional[dict] = None,
 ) -> Union[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray, List[str]]]:
     """
-    Extrae embeddings de todas las imágenes en un dataloader.
-    
-    Args:
-        model: Modelo para extraer embeddings
-        dataloader: DataLoader con imágenes
-        device: Dispositivo (cuda/cpu)
-        return_paths: Si True, retorna también rutas de imágenes
-        show_progress: Si True, muestra barra de progreso
-        
-    Returns:
-        Si return_paths=False: (embeddings, labels)
-        Si return_paths=True: (embeddings, labels, paths)
-        
-    Example:
-        >>> embeddings, labels = extract_embeddings(model, test_loader, device)
-        >>> print(embeddings.shape)  # (N, embedding_dim)
+    Extrae embeddings usando el forward canónico (con máscara si el loader la provee).
     """
-    model.eval()
-    
-    embeddings_list = []
-    labels_list = []
-    paths_list = [] if return_paths else None
-    
-    desc = "Extracting embeddings"
-    iterator = tqdm(dataloader, desc=desc) if show_progress else dataloader
-    
-    with torch.no_grad():
-        for batch in iterator:
-            if return_paths:
-                if len(batch) == 3:
-                    images, labels, paths = batch
-                    paths_list.extend(paths)
-                else:
-                    raise ValueError("Dataset debe retornar paths cuando return_paths=True")
-            else:
-                images, labels = batch
-            
-            images = images.to(device)
-            embeddings = model(images)
-            
-            embeddings_list.append(embeddings.cpu().numpy())
-            labels_list.append(labels.numpy())
-    
-    embeddings = np.vstack(embeddings_list)
-    labels = np.concatenate(labels_list)
-    
-    logger.info(f"Extracted {len(embeddings)} embeddings of dimension {embeddings.shape[1]}")
-    
+    from src.models.embedding_extractor import extract_embeddings as _canonical_extract
+
+    result = _canonical_extract(
+        model,
+        dataloader,
+        device,
+        grain_config=grain_config,
+        return_paths=return_paths,
+        show_progress=show_progress,
+    )
     if return_paths:
-        return embeddings, labels, paths_list
-    else:
-        return embeddings, labels
+        embeddings, labels, paths = result
+        logger.info(f"Extracted {len(embeddings)} embeddings of dimension {embeddings.shape[1]}")
+        return embeddings, labels, paths
+
+    embeddings, labels = result
+    logger.info(f"Extracted {len(embeddings)} embeddings of dimension {embeddings.shape[1]}")
+    return embeddings, labels
 
 
 def build_embedding_database(
@@ -424,8 +393,11 @@ def extract_gradient_weighted_attention(model, image_tensor, device, centroid):
         if hasattr(model, 'attention') and model.attention is not None:
             pooled_features = model.attention(pooled_features)
         
-        if hasattr(model, 'projection'):
+        if hasattr(model, "projection") and model.projection is not None:
             embedding = model.projection(pooled_features)
+            embedding = nn.functional.normalize(embedding, p=2, dim=1)
+        elif hasattr(model, "projection_lf") and model.projection_lf is not None:
+            embedding = model.projection_lf(pooled_features)
             embedding = nn.functional.normalize(embedding, p=2, dim=1)
         else:
             embedding = pooled_features
@@ -590,7 +562,9 @@ def generate_gradcam(
     image_tensor: torch.Tensor,
     device: torch.device,
     target_layer=None,
-    centroid: torch.Tensor = None
+    centroid: torch.Tensor = None,
+    mask: Optional[torch.Tensor] = None,
+    grain_config: Optional[dict] = None,
 ) -> np.ndarray:
     """
     Genera mapa de calor de atención para explicabilidad visual.
@@ -614,7 +588,12 @@ def generate_gradcam(
     try:
         from src.utils.visual_explainer import create_explainer
         explainer = create_explainer(model, device)
-        return explainer.generate_heatmap(image_tensor, centroid)
+        return explainer.generate_heatmap(
+            image_tensor,
+            centroid,
+            mask=mask,
+            grain_config=grain_config,
+        )
     except Exception as e:
         logger.warning(f"[generate_gradcam] New explainer failed ({e}), falling back to legacy")
         return _generate_gradcam_legacy(model, image_tensor, device, target_layer, centroid)

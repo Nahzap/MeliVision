@@ -318,35 +318,81 @@ def compute_recall_at_k(
     return metrics
 
 
+def _row_nn_scores(
+    embeddings: np.ndarray,
+    query_idx: int,
+    nn_metric: str = "cosine",
+) -> np.ndarray:
+    """Per-neighbour scores for one query (higher = more similar for cosine/hyperbolic)."""
+    n = len(embeddings)
+    query = embeddings[query_idx]
+
+    if nn_metric == "euclidean":
+        scores = -np.linalg.norm(embeddings - query, axis=1)
+    elif nn_metric == "hyperbolic":
+        q_norm2 = np.sum(query ** 2)
+        u_norm2 = np.sum(embeddings ** 2, axis=1)
+        dot = embeddings @ query
+        sqdist = q_norm2 + u_norm2 - 2.0 * dot
+        denom = np.clip((1.0 - q_norm2) * (1.0 - u_norm2), 1e-15, None)
+        scores = -(sqdist / denom)
+    else:
+        scores = embeddings @ query
+
+    scores[query_idx] = -1e9
+    return scores
+
+
 def compute_nmi(
     embeddings: np.ndarray,
     labels: np.ndarray,
     n_init: int = 10,
-) -> float:
+    n_seeds: int = 1,
+    base_seed: int = 42,
+) -> Tuple[float, float]:
     """
     Calcula Normalized Mutual Information (NMI) entre clusters
     de embeddings y labels reales.
     
     Usa K-Means con K = numero de clases unicas.
     Metrica estandar en Deep Metric Learning (Wang et al. CVPR 2019).
+    Con n_seeds > 1 reporta media sobre reinicios (Musgrave et al. MLRC).
     
     Args:
         embeddings: Embeddings (N, D)
         labels: Labels (N,)
+        n_init: K-Means n_init per seed
+        n_seeds: Number of random seeds to average
+        base_seed: First random_state for K-Means
         
     Returns:
-        NMI score (0-1)
+        (nmi_mean, nmi_std)
     """
     n_clusters = len(np.unique(labels))
-    
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=max(1, int(n_init)))
-    cluster_assignments = kmeans.fit_predict(embeddings)
-    
-    nmi = normalized_mutual_info_score(labels, cluster_assignments)
-    
-    logger.info(f"NMI: {nmi:.4f} (clusters={n_clusters})")
-    
-    return float(nmi)
+    n_seeds = max(1, int(n_seeds))
+    n_init = max(1, int(n_init))
+    scores: List[float] = []
+
+    for offset in range(n_seeds):
+        kmeans = KMeans(
+            n_clusters=n_clusters,
+            random_state=int(base_seed) + offset,
+            n_init=n_init,
+        )
+        cluster_assignments = kmeans.fit_predict(embeddings)
+        scores.append(float(normalized_mutual_info_score(labels, cluster_assignments)))
+
+    nmi_mean = float(np.mean(scores))
+    nmi_std = float(np.std(scores, ddof=1)) if len(scores) > 1 else 0.0
+    if n_seeds > 1:
+        logger.info(
+            f"NMI: {nmi_mean:.4f} ± {nmi_std:.4f} "
+            f"(clusters={n_clusters}, seeds={n_seeds}, n_init={n_init})"
+        )
+    else:
+        logger.info(f"NMI: {nmi_mean:.4f} (clusters={n_clusters})")
+
+    return nmi_mean, nmi_std
 
 
 def compute_embedding_quality(
@@ -368,7 +414,8 @@ def compute_embedding_quality(
         Dict con todas las metricas
     """
     metrics = compute_recall_at_k(embeddings, labels, k_list, nn_metric=nn_metric)
-    metrics['NMI'] = compute_nmi(embeddings, labels)
+    nmi_mean, _ = compute_nmi(embeddings, labels)
+    metrics["NMI"] = nmi_mean
     
     logger.info(f"Embedding quality: " + ", ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
     
@@ -382,6 +429,7 @@ def compute_map_at_r(
     similarity: Optional[np.ndarray] = None,
     sorted_indices: Optional[np.ndarray] = None,
     candidate_multiplier: int = 12,
+    exact: bool = True,
 ) -> float:
     """
     Calcula Mean Average Precision at R (mAP@R).
@@ -420,17 +468,27 @@ def compute_map_at_r(
             row_indices = sorted_indices[i]
         elif similarity is not None:
             row = similarity[i]
-            cap = min(n - 1, max(num_positives + 32, num_positives * max(2, candidate_multiplier)))
+            if exact:
+                cap = n - 1
+            else:
+                cap = min(
+                    n - 1,
+                    max(num_positives + 32, num_positives * max(2, candidate_multiplier)),
+                )
             if cap < n - 1:
                 row_indices = np.argpartition(-row, cap - 1)[:cap]
                 row_indices = row_indices[np.argsort(-row[row_indices])]
             else:
                 row_indices = np.argsort(-row)
         else:
-            # Chunk on the fly to avoid OOM
-            row = np.dot(embeddings[i:i+1], embeddings.T)[0]
-            row[i] = -1e9
-            cap = min(n - 1, max(num_positives + 32, num_positives * max(2, candidate_multiplier)))
+            row = _row_nn_scores(embeddings, i, nn_metric=nn_metric)
+            if exact:
+                cap = n - 1
+            else:
+                cap = min(
+                    n - 1,
+                    max(num_positives + 32, num_positives * max(2, candidate_multiplier)),
+                )
             if cap < n - 1:
                 row_indices = np.argpartition(-row, cap - 1)[:cap]
                 row_indices = row_indices[np.argsort(-row[row_indices])]
@@ -587,6 +645,10 @@ def compute_all_metrics(
     class_names: Optional[List[str]] = None,
     include_per_class: bool = True,
     nmi_n_init: int = 10,
+    nmi_n_seeds: int = 1,
+    nmi_base_seed: int = 42,
+    map_at_r_exact: bool = True,
+    map_at_r_candidate_multiplier: int = 12,
 ) -> Dict[str, any]:
     """
     Calcula TODAS las metricas SOTA para Deep Metric Learning.
@@ -610,10 +672,9 @@ def compute_all_metrics(
     metrics = {}
     max_k = max(k_list)
     
-    # Defensive programming: forcefully L2-normalize embeddings if using cosine distance
-    if nn_metric == 'cosine':
+    # L2-normalize only for cosine retrieval (respect evaluation.nn_metric / embedding_space).
+    if nn_metric == "cosine":
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-        # Add epsilon to prevent division by zero
         embeddings = embeddings / np.clip(norms, a_min=1e-12, a_max=None)
         
     # Shared compute: batched top-k indices and 1-NN predictions to prevent RAM crash
@@ -629,21 +690,28 @@ def compute_all_metrics(
     )
     metrics.update(recall_metrics)
     
-    # NMI (Song et al. CVPR 2016)
-    metrics['NMI'] = compute_nmi(embeddings, labels, n_init=nmi_n_init)
-    
+    # NMI (Song et al. CVPR 2016) — multi-seed when evaluation.nmi.n_seeds > 1
+    nmi_mean, nmi_std = compute_nmi(
+        embeddings,
+        labels,
+        n_init=nmi_n_init,
+        n_seeds=nmi_n_seeds,
+        base_seed=nmi_base_seed,
+    )
+    metrics["NMI"] = nmi_mean
+    metrics["NMI_std"] = nmi_std
+
     # mAP@R (Musgrave et al. ECCV 2020)
-    metrics['mAP@R'] = compute_map_at_r(
+    metrics["mAP@R"] = compute_map_at_r(
         embeddings,
         labels,
         nn_metric=nn_metric,
         similarity=None,
+        exact=map_at_r_exact,
+        candidate_multiplier=map_at_r_candidate_multiplier,
     )
-    
-    # Use same 1-NN metric as retrieval-style R@K for consistency.
-    nn_metric = 'cosine'
 
-    # F1-Score Macro (Barz & Denzler WACV 2020)
+    # F1-Score Macro (Barz & Denzler WACV 2020) — same nn_metric as R@K
     metrics['F1_macro'] = compute_f1_macro(
         embeddings,
         labels,
@@ -679,7 +747,10 @@ def compute_all_metrics(
     logger.info(f"  R@1:      {metrics.get('R@1', 0):.4f}")
     logger.info(f"  R@5:      {metrics.get('R@5', 0):.4f}")
     logger.info(f"  mAP@R:    {metrics['mAP@R']:.4f}")
-    logger.info(f"  NMI:      {metrics['NMI']:.4f}")
+    nmi_log = f"{metrics['NMI']:.4f}"
+    if metrics.get("NMI_std", 0.0) > 0:
+        nmi_log += f" ± {metrics['NMI_std']:.4f}"
+    logger.info(f"  NMI:      {nmi_log}")
     logger.info(f"  F1-Macro: {metrics['F1_macro']:.4f}")
     logger.info(f"  Accuracy: {metrics['Accuracy']:.4f}")
     logger.info(f"  BalAcc:   {metrics['Balanced_Accuracy']:.4f}")

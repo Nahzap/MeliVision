@@ -1,6 +1,9 @@
 """
 PollenGrainDetector — Detector multi-grano de polen usando U²-Net.
 
+Uso previsto: **solo preprocesamiento** (generar .seg / recortes antes del entrenamiento).
+No requiere fine-tune en el pipeline de metric learning.
+
 Adaptado del U2NetDetector validado en XYZ_Ctrl_L206_GUI.
 Pipeline: Saliency map → Umbral adaptativo → Morfología → Contornos → Filtrado
 

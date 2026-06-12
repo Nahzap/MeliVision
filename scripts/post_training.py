@@ -15,6 +15,8 @@ Date: 2026-02-06
 """
 
 import shutil
+from typing import Optional
+
 import torch
 import numpy as np
 import pandas as pd
@@ -46,6 +48,13 @@ from PIL import Image
 from src.visualization.embedding_analysis import EmbeddingSpaceAnalyzer
 from src.utils.unicode_utils import sanitize_for_ascii
 from src.visualization.save_utils import save_plot_with_data
+from src.utils.metrics_utils import compute_all_metrics
+from src.utils.mlrc_protocol import (
+    resolve_map_at_r_config,
+    resolve_nmi_config,
+    resolve_nn_metric,
+    resolve_n_runs,
+)
 from src.inference.slice_classifier import (
     SliceAwareClassifier,
     SliceRepresentatives,
@@ -80,6 +89,19 @@ def _resolve_run_config_path(run_dir: Path) -> Path:
     return nested
 
 
+def publish_final_evaluation_summary(run_dir: Path, prefix: str = "test") -> Optional[Path]:
+    """Copy hold-out evaluation JSON to evaluation_metrics_summary_final.json (MLRC)."""
+    run_dir = Path(run_dir)
+    src = run_dir / f"evaluation_metrics_summary_{prefix}.json"
+    dst = run_dir / "evaluation_metrics_summary_final.json"
+    if not src.exists():
+        logger.warning("No se publicó resumen final: %s no existe", src)
+        return None
+    shutil.copy2(src, dst)
+    logger.info("Evaluación final (hold-out) publicada: %s", dst)
+    return dst
+
+
 def _clear_prefix_artifacts(run_dir: Path, prefix: str) -> Path:
     """Remove all post-training artifacts for a prefix before regenerating."""
     run_dir = Path(run_dir)
@@ -109,14 +131,24 @@ def _clear_prefix_artifacts(run_dir: Path, prefix: str) -> Path:
 
 
 def create_eval_dataloaders(config: dict):
-    """Create val/test loaders using the same GrainDataEngine path as training."""
+    """Create inference loaders in the main process (no worker pools)."""
     import copy
     from src.data.data_engine import GrainDataEngine
 
     eval_config = copy.deepcopy(config)
-    eval_config.setdefault("data", {})["pin_memory"] = False
+    data = eval_config.setdefault("data", {})
+    data["pin_memory"] = False
+    data["num_workers"] = 0
+    data["val_num_workers"] = 0
+    policy = data.setdefault("loader_policy", {})
+    policy["persistent_workers"] = False
     engine = GrainDataEngine.from_config(eval_config)
-    return engine.val_loader, getattr(engine, "test_loader", None), engine
+    return (
+        engine.train_loader,
+        engine.val_loader,
+        getattr(engine, "test_loader", None),
+        engine,
+    )
 
 
 def finalize_self_contained_checkpoint(run_dir: Path) -> None:
@@ -179,20 +211,12 @@ def finalize_self_contained_checkpoint(run_dir: Path) -> None:
     )
 
 
-def generate_pr_f1_epoch_curves(csv_path: str, output_dir: str):
+def generate_retrieval_epoch_curves(csv_path: str, output_dir: str):
     """
-    Generate Precision-Recall trajectory and F1 curves across epochs.
+    Plot retrieval and classification metrics by epoch from training_metrics.csv.
 
-    Requires columns in training_metrics.csv:
-      - epoch
-      - precision_macro
-      - recall_at_1
-
-    F1 is computed explicitly from precision/recall:
-      F1 = 2 * (P * R) / (P + R)
-
-    Returns:
-        Dict with generated artifact paths (when available).
+    Does NOT mix Precision_macro (1-NN classifier) with Recall@1 (retrieval) on a
+    fake PR plane — that was scientifically invalid (Musgrave et al., ECCV 2020).
     """
     csv_path = Path(csv_path)
     output_dir = Path(output_dir)
@@ -200,284 +224,99 @@ def generate_pr_f1_epoch_curves(csv_path: str, output_dir: str):
     artifacts = {}
 
     if not csv_path.exists():
-        logger.warning(f"PR/F1 curves skipped: metrics CSV not found at {csv_path}")
+        logger.warning("Retrieval epoch curves skipped: metrics CSV not found")
         return artifacts
 
     df = pd.read_csv(csv_path)
     if df.empty:
-        logger.warning("PR/F1 curves skipped: training_metrics.csv is empty")
+        logger.warning("Retrieval epoch curves skipped: training_metrics.csv is empty")
         return artifacts
 
-    required_cols = ['epoch', 'precision_macro', 'recall_at_1']
-    missing = [c for c in required_cols if c not in df.columns]
-    if missing:
-        logger.warning(f"PR/F1 curves skipped: missing columns in CSV: {missing}")
-        return artifacts
-
-    # Ensure numeric plotting data even if CSV stores formatted strings
-    for col in required_cols:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-    df = df.dropna(subset=['epoch', 'precision_macro', 'recall_at_1'])
+    df["epoch"] = pd.to_numeric(df["epoch"], errors="coerce")
+    df = df.dropna(subset=["epoch"])
     if df.empty:
-        logger.warning("PR/F1 curves skipped: no valid numeric rows after parsing")
         return artifacts
 
-    # Choose plotting precision source.
-    # Some historical runs have precision_macro frozen across epochs due metric mismatch.
-    precision_source = 'precision_macro'
-    precision_std = float(df['precision_macro'].std(ddof=0)) if len(df) > 1 else 0.0
+    retrieval_cols = [
+        ("recall_at_1", "Recall@1", "#2ecc71"),
+        ("recall_at_5", "Recall@5", "#9b59b6"),
+        ("mAP@R", "mAP@R", "#3498db"),
+    ]
+    present_ret = [(c, l, col) for c, l, col in retrieval_cols if c in df.columns]
+    for col, _, _ in present_ret:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # If native F1 columns exist, keep them for reference only (optional comparison).
-    if 'F1_macro' in df.columns:
-        df['F1_macro'] = pd.to_numeric(df['F1_macro'], errors='coerce')
-    if 'F1_weighted' in df.columns:
-        df['F1_weighted'] = pd.to_numeric(df['F1_weighted'], errors='coerce')
+    if present_ret:
+        fig, ax = plt.subplots(figsize=(12, 6))
+        for col, label, color in present_ret:
+            ax.plot(df["epoch"], df[col], "o-", color=color, linewidth=2, markersize=4, label=label)
+        ax.set_xlabel("Epoch", fontsize=12)
+        ax.set_ylabel("Retrieval score", fontsize=12)
+        ax.set_title("Retrieval Metrics by Epoch (validation)", fontsize=14, fontweight="bold")
+        ax.set_ylim(0, 1.05)
+        ax.legend(fontsize=11)
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        ret_path = output_dir / "retrieval_metrics_by_epoch.png"
+        save_cols = ["epoch"] + [c for c, _, _ in present_ret]
+        save_plot_with_data(ret_path, df[save_cols], dpi=DEFAULT_FIG_DPI, bbox_inches="tight")
+        plt.close()
+        logger.info(f"Retrieval epoch curves saved: {ret_path}")
+        artifacts["retrieval_metrics_by_epoch"] = str(ret_path)
 
-    # Fallback: derive precision from (F1_macro, recall) when precision is effectively constant.
-    # Rearranged equation: P = (F1 * R) / (2R - F1)
-    if (
-        precision_std < 1e-9
-        and 'F1_macro' in df.columns
-        and df['F1_macro'].notna().sum() > 0
-        and float(df['F1_macro'].std(ddof=0)) > 1e-9
-    ):
-        denom_pr = 2.0 * df['recall_at_1'] - df['F1_macro']
-        derived_precision = np.where(
-            np.abs(denom_pr) > 1e-12,
-            (df['F1_macro'] * df['recall_at_1']) / denom_pr,
-            np.nan
-        )
-        valid = np.isfinite(derived_precision) & (derived_precision >= 0.0) & (derived_precision <= 1.0)
-        if np.any(valid):
-            df['precision_from_f1_recall'] = np.where(valid, derived_precision, np.nan)
-            precision_source = 'precision_from_f1_recall'
-            logger.warning(
-                "precision_macro is constant across epochs; using precision reconstructed "
-                "from (F1_macro, recall_at_1) for PR trajectory plotting."
-            )
+    cls_cols = [
+        ("F1_macro", "F1-macro", "#e67e22"),
+        ("precision_macro", "Precision-macro", "#1abc9c"),
+        ("balanced_accuracy", "Balanced Acc", "#34495e"),
+    ]
+    present_cls = [(c, l, col) for c, l, col in cls_cols if c in df.columns]
+    for col, _, _ in present_cls:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    precision_for_plot = df[precision_source]
-
-    # Compute F1 directly from the equation attached by the user:
-    # F1 = 2 * (P * R) / (P + R)
-    denom = precision_for_plot + df['recall_at_1']
-    df['f1_from_pr'] = np.where(denom > 0, 2.0 * (precision_for_plot * df['recall_at_1']) / denom, 0.0)
-
-    if 'F1_macro' in df.columns:
-        df['delta_f1_macro_vs_formula'] = (df['F1_macro'] - df['f1_from_pr']).abs()
-
-    # --- Precision vs Recall trajectory by epoch with F1(iso) ---
-    fig, ax = plt.subplots(figsize=(10, 7))
-    scatter = ax.scatter(
-        df['recall_at_1'],
-        precision_for_plot,
-        c=df['epoch'],
-        cmap='viridis',
-        s=60,
-        alpha=0.9,
-        edgecolors='black',
-        linewidths=0.3
-    )
-    ax.plot(
-        df['recall_at_1'],
-        precision_for_plot,
-        linestyle='--',
-        linewidth=1.2,
-        color='#666',
-        alpha=0.7
-    )
-
-    # Annotate first/last for readability without cluttering every point
-    first = df.iloc[0]
-    last = df.iloc[-1]
-    ax.annotate(
-        f"E{int(first['epoch'])}",
-        (first['recall_at_1'], first[precision_source]),
-        textcoords='offset points',
-        xytext=(6, 6),
-        fontsize=9,
-        fontweight='bold',
-        color='#1f77b4'
-    )
-    ax.annotate(
-        f"E{int(last['epoch'])}",
-        (last['recall_at_1'], last[precision_source]),
-        textcoords='offset points',
-        xytext=(6, -12),
-        fontsize=9,
-        fontweight='bold',
-        color='#d62728'
-    )
-
-    # Draw iso-F1 helper curves to visualize formula behavior on PR plane.
-    r_vals = np.linspace(0.01, 1.0, 500)
-    for f1_level in [0.70, 0.80, 0.90, 0.95]:
-        # From F1 = 2PR/(P+R) => P = (F1 * R) / (2R - F1)
-        denom_iso = (2 * r_vals - f1_level)
-        p_vals = np.where(denom_iso > 0, (f1_level * r_vals) / denom_iso, np.nan)
-        valid = (p_vals >= 0) & (p_vals <= 1)
-        if np.any(valid):
-            ax.plot(
-                r_vals[valid],
-                p_vals[valid],
-                linestyle=':',
-                linewidth=1.0,
-                color='#999',
-                alpha=0.7
-            )
-            ax.text(
-                r_vals[valid][-1] - 0.03,
-                p_vals[valid][-1] - 0.01,
-                f'F1={f1_level:.2f}',
-                fontsize=8,
-                color='#666'
-            )
-
-    cbar = plt.colorbar(scatter, ax=ax)
-    cbar.set_label('Epoch', fontsize=11)
-    # Auto-zoom axes to the effective data region for better readability.
-    x_min = float(df['recall_at_1'].min())
-    x_max = float(df['recall_at_1'].max())
-    y_min = float(precision_for_plot.min())
-    y_max = float(precision_for_plot.max())
-
-    x_span = max(x_max - x_min, 1e-6)
-    y_span = max(y_max - y_min, 1e-6)
-    x_pad = max(0.005, x_span * 0.20)
-    y_pad = max(0.005, y_span * 0.20)
-
-    x_lo = max(0.0, x_min - x_pad)
-    x_hi = min(1.0, x_max + x_pad)
-    y_lo = max(0.0, y_min - y_pad)
-    y_hi = min(1.0, y_max + y_pad)
-
-    # Handle near-constant edge case where limits collapse.
-    if x_hi - x_lo < 0.01:
-        center_x = (x_hi + x_lo) / 2.0
-        x_lo = max(0.0, center_x - 0.01)
-        x_hi = min(1.0, center_x + 0.01)
-    if y_hi - y_lo < 0.01:
-        center_y = (y_hi + y_lo) / 2.0
-        y_lo = max(0.0, center_y - 0.01)
-        y_hi = min(1.0, center_y + 0.01)
-
-    ax.set_xlabel('Recall@1', fontsize=12)
-    ylabel_suffix = ' (reconstructed)' if precision_source == 'precision_from_f1_recall' else ''
-    ax.set_ylabel(f'Precision Macro{ylabel_suffix}', fontsize=12)
-    ax.set_title('Precision vs Recall by Epoch (with iso-F1 lines)', fontsize=14, fontweight='bold')
-    ax.set_xlim(x_lo, x_hi)
-    ax.set_ylim(y_lo, y_hi)
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    pr_path = output_dir / 'precision_recall_by_epoch.png'
-    # Avoid bbox expansion issues with dense annotations when zooming.
-    save_plot_with_data(pr_path, df[['epoch', 'recall_at_1', precision_source]], dpi=DEFAULT_FIG_DPI)
-    plt.close()
-    logger.info(f"PR trajectory saved: {pr_path}")
-    artifacts['precision_recall_by_epoch'] = str(pr_path)
-
-    # --- F1 curves over epochs (formula-based) ---
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(
-        df['epoch'],
-        df['f1_from_pr'],
-        'o-',
-        color='#4ec9b0',
-        linewidth=2,
-        markersize=4,
-        label='F1 from Precision/Recall'
-    )
-    if 'F1_macro' in df.columns and df['F1_macro'].notna().any():
-        ax.plot(
-            df['epoch'],
-            df['F1_macro'],
-            's--',
-            color='#569cd6',
-            linewidth=1.5,
-            markersize=3,
-            alpha=0.85,
-            label='F1 Macro (logged)'
-        )
-    if 'F1_weighted' in df.columns and df['F1_weighted'].notna().any():
-        ax.plot(
-            df['epoch'],
-            df['F1_weighted'],
-            'd--',
-            color='#c586c0',
-            linewidth=1.5,
-            markersize=3,
-            alpha=0.85,
-            label='F1 Weighted (logged)'
-        )
-    ax.set_xlabel('Epoch', fontsize=12)
-    ax.set_ylabel('F1 Score', fontsize=12)
-    ax.set_title('F1 Across Epochs (computed from Precision & Recall)', fontsize=14, fontweight='bold')
-    ax.set_ylim(0, 1.05)
-    ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=11)
-    plt.tight_layout()
-    f1_path = output_dir / 'f1_curves_by_epoch.png'
-    cols_to_save = ['epoch', 'f1_from_pr']
-    if 'F1_macro' in df.columns: cols_to_save.append('F1_macro')
-    if 'F1_weighted' in df.columns: cols_to_save.append('F1_weighted')
-    save_plot_with_data(f1_path, df[cols_to_save], dpi=DEFAULT_FIG_DPI, bbox_inches='tight')
-    plt.close()
-    logger.info(f"F1 curves saved: {f1_path}")
-    artifacts['f1_curves_by_epoch'] = str(f1_path)
-
-    # --- Export equation-based values to TXT for auditability ---
-    txt_path = output_dir / 'f1_from_precision_recall_by_epoch.txt'
-    with open(txt_path, 'w', encoding='utf-8') as f:
-        f.write("F1 computed from Precision and Recall per epoch\n")
-        f.write("Formula: F1 = 2 * (precision * recall) / (precision + recall)\n\n")
-        f.write(f"precision_source_for_plot: {precision_source}\n")
-        f.write(f"precision_macro_std: {precision_std:.12f}\n")
-        f.write("epoch\tprecision_used\trecall_at_1\tf1_from_pr")
-        if 'F1_macro' in df.columns:
-            f.write("\tF1_macro_logged\tabs_delta")
-        if 'precision_from_f1_recall' in df.columns:
-            f.write("\tprecision_macro_logged\tprecision_from_f1_recall")
-        f.write("\n")
-        for _, row in df.iterrows():
-            line = (
-                f"{int(row['epoch'])}\t"
-                f"{float(row[precision_source]):.6f}\t"
-                f"{row['recall_at_1']:.6f}\t"
-                f"{row['f1_from_pr']:.6f}"
-            )
-            if 'F1_macro' in df.columns and pd.notna(row.get('F1_macro')):
-                delta = abs(float(row['F1_macro']) - float(row['f1_from_pr']))
-                line += f"\t{float(row['F1_macro']):.6f}\t{delta:.6f}"
-            if 'precision_from_f1_recall' in df.columns and pd.notna(row.get('precision_from_f1_recall')):
-                line += (
-                    f"\t{float(row['precision_macro']):.6f}"
-                    f"\t{float(row['precision_from_f1_recall']):.6f}"
-                )
-            line += "\n"
-            f.write(line)
-    logger.info(f"F1 equation audit file saved: {txt_path}")
-    artifacts['f1_from_precision_recall_txt'] = str(txt_path)
+    if present_cls:
+        fig, ax = plt.subplots(figsize=(12, 6))
+        for col, label, color in present_cls:
+            ax.plot(df["epoch"], df[col], "s-", color=color, linewidth=2, markersize=4, label=label)
+        ax.set_xlabel("Epoch", fontsize=12)
+        ax.set_ylabel("Classification score", fontsize=12)
+        ax.set_title("Classification Metrics by Epoch (validation)", fontsize=14, fontweight="bold")
+        ax.set_ylim(0, 1.05)
+        ax.legend(fontsize=11)
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        cls_path = output_dir / "classification_metrics_by_epoch.png"
+        save_cols = ["epoch"] + [c for c, _, _ in present_cls]
+        save_plot_with_data(cls_path, df[save_cols], dpi=DEFAULT_FIG_DPI, bbox_inches="tight")
+        plt.close()
+        logger.info(f"Classification epoch curves saved: {cls_path}")
+        artifacts["classification_metrics_by_epoch"] = str(cls_path)
 
     return artifacts
 
 
-def extract_embeddings(model, dataloader, device):
-    """Extract all embeddings and labels from a dataloader."""
-    model.eval()
-    all_embeddings = []
-    all_labels = []
+def generate_pr_f1_epoch_curves(csv_path: str, output_dir: str):
+    """
+    Deprecated alias — use generate_retrieval_epoch_curves (Phase A integrity).
+    """
+    logger.info(
+        "generate_pr_f1_epoch_curves redirigido a generate_retrieval_epoch_curves "
+        "(curva PR precision_macro vs R@1 eliminada por invalidez científica)"
+    )
+    return generate_retrieval_epoch_curves(csv_path, output_dir)
 
-    with torch.no_grad():
-        for batch_data in tqdm(dataloader, desc="Extracting embeddings"):
-            images, labels = batch_data[0], batch_data[1]
-            images = images.to(device, non_blocking=True)
-            embeddings = model(images)
-            all_embeddings.append(embeddings.cpu())
-            all_labels.append(labels)
 
-    embeddings = torch.cat(all_embeddings, dim=0).numpy()
-    labels = torch.cat(all_labels, dim=0).numpy()
-    
+def extract_embeddings(model, dataloader, device, grain_config=None):
+    """Extract all embeddings and labels from a dataloader (canonical forward + masks)."""
+    from src.models.embedding_extractor import extract_embeddings as _extract
+
+    embeddings, labels = _extract(
+        model,
+        dataloader,
+        device,
+        grain_config=grain_config,
+        show_progress=True,
+    )
+
     norms = np.linalg.norm(embeddings, axis=1)
     logger.info(
         f"[extract_embeddings] {embeddings.shape[0]} samples, dim={embeddings.shape[1]}, "
@@ -595,6 +434,7 @@ def plot_training_curves(csv_path: str, output_dir: str):
     plt.close()
     logger.info(f"Epoch times saved: {output_dir / 'epoch_times.png'}")
 
+    plt.close("all")
     return df
 
 
@@ -2416,16 +2256,18 @@ def run_post_training_analysis(
     else:
         logger.warning(f"Metrics CSV not found: {csv_path}")
 
-    # 2. PR/F1 curves by epoch
+    # 2. Retrieval / classification metrics by epoch (validation log)
     if csv_path.exists():
-        logger.info("[2/11] Generating PR/F1 epoch curves...")
-        generate_pr_f1_epoch_curves(str(csv_path), str(post_dir))
+        logger.info("[2/11] Generating retrieval epoch curves...")
+        generate_retrieval_epoch_curves(str(csv_path), str(post_dir))
     else:
-        logger.warning("PR/F1 epoch curves skipped (no training_metrics.csv)")
+        logger.warning("Retrieval epoch curves skipped (no training_metrics.csv)")
 
     # 3. Embeddings + graphical analysis
     logger.info("[3/11] Extracting embeddings for graphical analysis...")
-    embeddings, labels = extract_embeddings(model, loader, device)
+    embeddings, labels = extract_embeddings(
+        model, loader, device, grain_config=config.get("grain_detection")
+    )
     _free_step_memory("extract_embeddings")
 
     logger.info("[*] Generando gráficos secuencialmente (matplotlib state machine)...")
@@ -2529,14 +2371,59 @@ def run_post_training_analysis(
     # 12. Evaluation summary JSON
     logger.info("[12/12] Generating evaluation summary JSON...")
     summary_json_path = run_dir / f'evaluation_metrics_summary_{prefix}.json'
+    nn_metric = resolve_nn_metric(config)
+    map_exact, map_multiplier = resolve_map_at_r_config(config)
+    nmi_n_init, nmi_n_seeds, nmi_base_seed = resolve_nmi_config(config)
+    mlrc_metrics = compute_all_metrics(
+        embeddings,
+        labels,
+        nn_metric=nn_metric,
+        k_list=[1, 5, 10],
+        class_names=class_names,
+        include_per_class=False,
+        nmi_n_init=nmi_n_init,
+        nmi_n_seeds=nmi_n_seeds,
+        nmi_base_seed=nmi_base_seed,
+        map_at_r_exact=map_exact,
+        map_at_r_candidate_multiplier=map_multiplier,
+    )
+    n_runs = resolve_n_runs(config)
+    mlrc_ci = {
+        "protocol": "mlrc",
+        "n_runs_configured": n_runs,
+        "note": (
+            "Single-run point estimates; aggregate mean±95% CI requires "
+            f"{n_runs} independent training runs."
+            if n_runs > 1
+            else "Single-run point estimates (bootstrap CI optional)."
+        ),
+        "metrics": {
+            "R@1": {"value": float(mlrc_metrics.get("R@1", 0.0))},
+            "mAP@R": {"value": float(mlrc_metrics.get("mAP@R", 0.0))},
+            "NMI": {
+                "value": float(mlrc_metrics.get("NMI", 0.0)),
+                "std_across_seeds": float(mlrc_metrics.get("NMI_std", 0.0)),
+            },
+            "F1_macro": {"value": float(mlrc_metrics.get("F1_macro", 0.0))},
+        },
+    }
     eval_summary = {
         'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'run_dir': str(run_dir),
         'prefix': prefix,
+        'mlrc_protocol': mlrc_ci,
         'metric_learning': {
             'slice_accuracy': float(slice_accuracy),
             'knn_accuracy': float(knn_accuracy),
             'distance_ratio_inter_intra': float(dist_ratio),
+            'R@1': float(mlrc_metrics.get('R@1', 0.0)),
+            'R@5': float(mlrc_metrics.get('R@5', 0.0)),
+            'mAP@R': float(mlrc_metrics.get('mAP@R', 0.0)),
+            'NMI': float(mlrc_metrics.get('NMI', 0.0)),
+            'NMI_std': float(mlrc_metrics.get('NMI_std', 0.0)),
+            'F1_macro': float(mlrc_metrics.get('F1_macro', 0.0)),
+            'nn_metric': nn_metric,
+            'map_at_r_exact': map_exact,
         },
         'classification_standard': std_metrics,
         'per_class': per_class_df.to_dict(orient='records')
@@ -2598,12 +2485,32 @@ def run_post_training_analysis(
         else:
             logger.info("  OK No collapsed pairs detected (all healthy)")
 
+        embed_dim_cfg = int(config.get('model', {}).get('embedding_dim', analyzer.n_dim))
+        spectral_summary = {
+            'embedding_dim': embed_dim_cfg,
+            'global_effective_rank': int(global_results['effective_rank']),
+            'max_dim': int(analyzer.n_dim),
+            'collapse_severity': float(global_results['collapse_severity']),
+            'collapsed_pairs': len(collapsed_pairs),
+            'total_pairs': len(pair_results),
+            'mean_pair_rank': float(
+                np.mean([res['effective_rank'] for res in pair_results.values()])
+            ) if pair_results else 0.0,
+        }
+        summary_path = spectral_dir / 'spectral_summary.json'
+        with open(summary_path, 'w', encoding='utf-8') as f:
+            json.dump(spectral_summary, f, indent=2)
+        logger.info(f"  Spectral summary: {summary_path}")
+
         logger.info(f"  Spectral analysis complete: {spectral_dir}")
 
     except Exception as e:
         logger.error(f"Spectral analysis failed: {e}")
         import traceback
         logger.error(traceback.format_exc())
+
+    del embeddings, labels
+    _free_step_memory("post_training_complete")
 
     logger.info("=" * 70)
     logger.info(f"Post-training analysis complete!")
@@ -2713,7 +2620,7 @@ def run_evaluation_from_checkpoint(
     elif (run_dir / 'class_centroids.pt').exists():
         centroids, _ = load_centroids(str(run_dir / 'class_centroids.pt'), device)
 
-    val_loader, test_loader, data_engine = create_eval_dataloaders(config)
+    _, val_loader, test_loader, data_engine = create_eval_dataloaders(config)
     _free_step_memory("eval_dataloaders")
 
     logger.info("=" * 70)

@@ -342,9 +342,21 @@ class ConfigEditorTab(QWidget):
     configChanged = pyqtSignal()
     configSaved = pyqtSignal(str)
     
+    @staticmethod
+    def resolve_config_path(config_path: str) -> Path:
+        """Resolve config.yaml relative to project root (parent of lib/)."""
+        p = Path(config_path)
+        if p.is_absolute():
+            return p.resolve()
+        root = Path(__file__).resolve().parent.parent
+        for candidate in (root / p, Path.cwd() / p):
+            if candidate.exists():
+                return candidate.resolve()
+        return (root / p).resolve()
+
     def __init__(self, config_path="config.yaml", parent=None):
         super().__init__(parent)
-        self.config_path = Path(config_path)
+        self.config_path = self.resolve_config_path(config_path)
         self.fields = {}
         self.config_data = {}
         self.parent_window = parent
@@ -353,6 +365,7 @@ class ConfigEditorTab(QWidget):
         
         self.init_ui()
         self._connect_dirty_tracking()
+        self._wire_ablation_controls()
         self.load_config()
     
     def init_ui(self):
@@ -583,9 +596,17 @@ class ConfigEditorTab(QWidget):
         
         self.fields['model.projection_head.use_batch_norm'] = BoolField(
             "Batch Norm",
-            tooltip="Usar Batch Normalization"
+            default=False,
+            tooltip="BatchNorm (desaconsejado con batch pequeño; preferir LayerNorm)"
         )
         proj_layout.addRow("Batch Norm:", self.fields['model.projection_head.use_batch_norm'].widget)
+
+        self.fields['model.projection_head.use_layer_norm'] = BoolField(
+            "Layer Norm",
+            default=True,
+            tooltip="LayerNorm en capas ocultas del projection head (D-01)"
+        )
+        proj_layout.addRow("Layer Norm:", self.fields['model.projection_head.use_layer_norm'].widget)
         
         self.fields['model.projection_head.dropout'] = FloatField(
             "Dropout",
@@ -624,6 +645,50 @@ class ConfigEditorTab(QWidget):
         
         proj_group.setLayout(proj_layout)
         layout.addWidget(proj_group)
+
+        pool_group = QGroupBox("Pooling y Proyección (enlazado a ablaciones F-01, F-03, F-04)")
+        pool_layout = QFormLayout()
+
+        self.fields['model.pooling.strategy'] = ChoiceField(
+            "Pooling Strategy",
+            ['multi_spectral', 'gem', 'mean', 'max', 'attention', 'fsw'],
+            default='multi_spectral',
+            tooltip="Estrategia de pooling espacial (F-01)"
+        )
+        pool_layout.addRow("Pooling:", self.fields['model.pooling.strategy'].widget)
+
+        self.fields['model.pooling.layer_fusion'] = ChoiceField(
+            "Layer Fusion",
+            ['per_layer', 'concat'],
+            default='per_layer',
+            tooltip="Fusión de capas ViT (F-03 layout)"
+        )
+        pool_layout.addRow("Layer fusion:", self.fields['model.pooling.layer_fusion'].widget)
+
+        self.fields['model.projection.layout'] = ChoiceField(
+            "Projection Layout",
+            ['lf_hf_dual', 'slice_native', 'multi_tower'],
+            default='multi_tower',
+            tooltip="Layout del projection head (F-03)"
+        )
+        pool_layout.addRow("Layout:", self.fields['model.projection.layout'].widget)
+
+        self.fields['model.pooling.masked.enabled'] = BoolField(
+            "Pooling Masked",
+            default=True,
+            tooltip="Pooling con máscara de grano (F-04; sincronizar con Grano → Masked Pooling)"
+        )
+        pool_layout.addRow("Masked pooling:", self.fields['model.pooling.masked.enabled'].widget)
+
+        self.fields['model.num_unfrozen_blocks'] = IntField(
+            "Unfrozen Blocks",
+            default=2, min_val=0, max_val=24,
+            tooltip="Bloques ViT descongelados si freeze_backbone=true (F-06)"
+        )
+        pool_layout.addRow("Bloques unfrozen:", self.fields['model.num_unfrozen_blocks'].widget)
+
+        pool_group.setLayout(pool_layout)
+        layout.addWidget(pool_group)
         
         layout.addStretch()
         tab.setLayout(layout)
@@ -800,19 +865,52 @@ class ConfigEditorTab(QWidget):
         self.fields['data.image_size'] = IntField(
             "Image Size",
             default=224, min_val=64, max_val=512,
-            tooltip="Tamaño de imagen final"
+            tooltip="Resolución canónica del pipeline (crop HDF5, transforms, modelo). "
+                    "Al cambiar, resize y crop de grano se sincronizan automáticamente."
         )
         img_layout.addRow("Image Size:", self.fields['data.image_size'].widget)
+        self.fields['data.image_size'].widget.valueChanged.connect(self._on_image_size_changed)
         
         self.fields['data.resize_size'] = IntField(
             "Resize Size",
             default=256, min_val=64, max_val=512,
-            tooltip="Tamaño de redimensionamiento inicial"
+            tooltip="Espejo de Image Size (sincronizado automáticamente al guardar)"
         )
+        self.fields['data.resize_size'].widget.setReadOnly(True)
+        self.fields['data.resize_size'].widget.setButtonSymbols(QSpinBox.NoButtons)
         img_layout.addRow("Resize Size:", self.fields['data.resize_size'].widget)
         
         img_group.setLayout(img_layout)
         layout.addWidget(img_group)
+
+        norm_group = QGroupBox("Normalización (data.normalize)")
+        norm_layout = QFormLayout()
+
+        self.fields['data.normalize.mode'] = ChoiceField(
+            "Norm Mode",
+            ['imagenet', 'dataset', 'macenko'],
+            default='imagenet',
+            tooltip="imagenet | dataset (stats_path) | macenko (stain + ImageNet)"
+        )
+        norm_layout.addRow("Mode:", self.fields['data.normalize.mode'].widget)
+
+        self.fields['data.normalize.stats_path'] = PathField(
+            "Stats Path",
+            tooltip="JSON generado por scripts/compute_dataset_norm.py",
+            is_dir=False
+        )
+        norm_layout.addRow("Stats JSON:", self.fields['data.normalize.stats_path'].widget_container)
+
+        self.fields['data.normalize.stain_method'] = ChoiceField(
+            "Stain Method",
+            ['null', 'reinhard', 'macenko'],
+            default='null',
+            tooltip="Pre-normalize opcional (E-02)"
+        )
+        norm_layout.addRow("Stain:", self.fields['data.normalize.stain_method'].widget)
+
+        norm_group.setLayout(norm_layout)
+        layout.addWidget(norm_group)
         
         layout.addStretch()
         tab.setLayout(layout)
@@ -851,9 +949,11 @@ class ConfigEditorTab(QWidget):
         self.fields['grain_detection.crop_size'] = IntField(
             "Crop Size",
             default=252, min_val=64, max_val=512,
-            tooltip="Tamaño del crop (sincronizado con data.image_size al cambiar backbone)"
+            tooltip="Espejo de Datos → Image Size (solo lectura; edítalo en Preprocesamiento)"
         )
-        crop_layout.addRow("Crop Size:", self.fields['grain_detection.crop_size'].widget)
+        self.fields['grain_detection.crop_size'].widget.setReadOnly(True)
+        self.fields['grain_detection.crop_size'].widget.setButtonSymbols(QSpinBox.NoButtons)
+        crop_layout.addRow("Crop Size (sync):", self.fields['grain_detection.crop_size'].widget)
 
         self.fields['grain_detection.crop_padding'] = FloatField(
             "Crop Padding",
@@ -878,17 +978,17 @@ class ConfigEditorTab(QWidget):
 
         self.fields['grain_detection.train_mask_bg_mode'] = ChoiceField(
             "Train BG Mode",
-            ['gray', 'random', 'black'],
-            default='gray',
-            tooltip="Fondo fuera de máscara en entrenamiento"
+            ['imagenet_neutral', 'gray', 'random', 'black', 'none'],
+            default='imagenet_neutral',
+            tooltip="imagenet_neutral = zero activation (fondo → ~0 tras Normalize ImageNet)"
         )
         crop_layout.addRow("Train BG:", self.fields['grain_detection.train_mask_bg_mode'].widget)
 
         self.fields['grain_detection.val_mask_bg_mode'] = ChoiceField(
             "Val BG Mode",
-            ['gray', 'random', 'black'],
-            default='gray',
-            tooltip="Fondo fuera de máscara en validación"
+            ['imagenet_neutral', 'gray', 'random', 'black', 'none'],
+            default='imagenet_neutral',
+            tooltip="Fondo fuera de máscara en validación/inferencia"
         )
         crop_layout.addRow("Val BG:", self.fields['grain_detection.val_mask_bg_mode'].widget)
 
@@ -1013,9 +1113,9 @@ class ConfigEditorTab(QWidget):
 
         self.fields['sota.augmentation_mode'] = ChoiceField(
             "Augmentation Mode",
-            ['full', 'deit3'],
-            default='full',
-            tooltip="full = pipeline microscopía; deit3 = pipeline más ligero"
+            ['full', 'deit3', 'deit3_simple'],
+            default='deit3_simple',
+            tooltip="full = microscopía; deit3/deit3_simple = DeiT III 3-Augment (recomendado ViT)"
         )
         sota_layout.addRow("Modo:", self.fields['sota.augmentation_mode'].widget)
 
@@ -1405,9 +1505,9 @@ class ConfigEditorTab(QWidget):
 
         self.fields['training.validation_metric'] = ChoiceField(
             "Validation Metric",
-            ['recall_at_1', 'recall_at_5', 'map', 'loss'],
-            default='recall_at_1',
-            tooltip="Métrica principal para early stopping y mejor modelo"
+            ['mAP@R', 'recall_at_1', 'F1_macro', 'val_loss'],
+            default='mAP@R',
+            tooltip="Métrica MLRC para selección de checkpoint (F-07 ablación)"
         )
         metric_layout.addRow("Métrica:", self.fields['training.validation_metric'].widget)
 
@@ -1579,6 +1679,27 @@ class ConfigEditorTab(QWidget):
             tooltip="Desactivar con slicing (compite con expansión espectral)"
         )
         reg_layout.addRow("Self-Distillation:", self.fields['sota.self_distillation.enabled'].widget)
+
+        self.fields['sota.anti_collapse.enabled'] = BoolField(
+            "Anti-Collapse",
+            default=False,
+            tooltip="Regularizador de uniformidad en hipersfera (IEEE Trans. Multimedia 2024)"
+        )
+        reg_layout.addRow("Anti-Collapse:", self.fields['sota.anti_collapse.enabled'].widget)
+
+        self.fields['sota.anti_collapse.lambda'] = FloatField(
+            "Anti-Collapse Lambda",
+            default=0.1, min_val=0.0, max_val=5.0, decimals=2, step=0.05,
+            tooltip="Peso del término anti-colapso"
+        )
+        reg_layout.addRow("Anti-Collapse λ:", self.fields['sota.anti_collapse.lambda'].widget)
+
+        self.fields['sota.anti_collapse.t'] = FloatField(
+            "Anti-Collapse t",
+            default=2.0, min_val=0.1, max_val=10.0, decimals=1, step=0.1,
+            tooltip="Temperatura del kernel RBF de uniformidad"
+        )
+        reg_layout.addRow("Anti-Collapse t:", self.fields['sota.anti_collapse.t'].widget)
 
         reg_group.setLayout(reg_layout)
         layout.addWidget(reg_group)
@@ -1752,6 +1873,78 @@ class ConfigEditorTab(QWidget):
 
         eval_group.setLayout(eval_layout)
         layout.addWidget(eval_group)
+
+        abl_group = QGroupBox("Ablaciones (automáticas tras entrenar)")
+        abl_layout = QFormLayout()
+
+        self.fields['evaluation.ablation.enabled'] = BoolField(
+            "Ablation Enabled",
+            default=False,
+            tooltip="Tras el entrenamiento principal, lanzar variantes de ablación configuradas "
+                    "(resultados en runs/<run>/ablations/)"
+        )
+        abl_layout.addRow("Habilitar:", self.fields['evaluation.ablation.enabled'].widget)
+
+        self.fields['evaluation.ablation.when'] = ChoiceField(
+            "When",
+            ['after_training'],
+            default='after_training',
+            tooltip="Momento de ejecución (solo after_training por ahora)"
+        )
+        abl_layout.addRow("Cuándo:", self.fields['evaluation.ablation.when'].widget)
+
+        self.fields['evaluation.ablation.skip_baseline_variant'] = BoolField(
+            "Skip Baseline",
+            default=True,
+            tooltip="Omitir variantes idénticas a la config actual (evita re-entrenar el baseline)"
+        )
+        abl_layout.addRow("Saltar baseline:", self.fields['evaluation.ablation.skip_baseline_variant'].widget)
+
+        self.fields['evaluation.ablation.on_failure'] = ChoiceField(
+            "On Failure",
+            ['continue', 'abort'],
+            default='continue',
+            tooltip="continue: el run principal sigue OK aunque falle una variante; "
+                    "abort: detener ablaciones al primer fallo"
+        )
+        abl_layout.addRow("Si falla variante:", self.fields['evaluation.ablation.on_failure'].widget)
+
+        self.fields['evaluation.ablation.epochs'] = IntField(
+            "Ablation Epochs",
+            default=0, min_val=0, max_val=500,
+            tooltip="0 = automático (mismas épocas que training.epochs); ≥1 = override por variante"
+        )
+        self.fields['evaluation.ablation.epochs'].widget.setSpecialValueText("auto")
+        abl_layout.addRow("Épocas ablación:", self.fields['evaluation.ablation.epochs'].widget)
+
+        matrix_labels = {
+            'pooling': 'F-01 Pooling',
+            'slices': 'F-02 Slices',
+            'layout': 'F-03 Layout',
+            'masked': 'F-04 Masked',
+            'augment': 'F-05 Augment',
+            'freeze': 'F-06 Freeze',
+            'validation_metric': 'F-07 Val metric',
+        }
+        for key, label in matrix_labels.items():
+            field_key = f'evaluation.ablation.matrices.{key}'
+            self.fields[field_key] = BoolField(
+                label,
+                default=False,
+                tooltip=f"Incluir matriz {label} en el estudio automático"
+            )
+            abl_layout.addRow(f"{label}:", self.fields[field_key].widget)
+
+        self.ablation_hint_label = QLabel(
+            "Las variantes usan los mismos campos que Modelo, Entrenamiento, Grano y Augmentación. "
+            "Se ejecutan automáticamente al pulsar Entrenar (tras el run principal)."
+        )
+        self.ablation_hint_label.setWordWrap(True)
+        self.ablation_hint_label.setStyleSheet("color: #666; font-size: 11px; padding: 4px;")
+        abl_layout.addRow(self.ablation_hint_label)
+
+        abl_group.setLayout(abl_layout)
+        layout.addWidget(abl_group)
 
         repro_group = QGroupBox("Reproducibilidad")
         repro_layout = QFormLayout()
@@ -1966,6 +2159,85 @@ class ConfigEditorTab(QWidget):
         tab.setLayout(layout)
         self.tabs.addTab(tab, "⚡ Hardware")
     
+    def _wire_ablation_controls(self):
+        """Habilita/deshabilita controles de ablación según evaluation.ablation.enabled."""
+        matrix_field_keys = [
+            f"evaluation.ablation.matrices.{k}"
+            for k in (
+                "pooling", "slices", "layout", "masked",
+                "augment", "freeze", "validation_metric",
+            )
+        ]
+        dependent_keys = matrix_field_keys + [
+            "evaluation.ablation.when",
+            "evaluation.ablation.skip_baseline_variant",
+            "evaluation.ablation.on_failure",
+            "evaluation.ablation.epochs",
+        ]
+
+        def _refresh_ablation_enabled_state():
+            enabled = self.fields["evaluation.ablation.enabled"].get_value()
+            for key in dependent_keys:
+                if key in self.fields:
+                    self.fields[key].widget.setEnabled(enabled)
+
+        self._refresh_ablation_enabled_state = _refresh_ablation_enabled_state
+        self.fields["evaluation.ablation.enabled"].widget.stateChanged.connect(
+            lambda _state: _refresh_ablation_enabled_state()
+        )
+        self._connect_ablation_preview()
+
+    @staticmethod
+    def _normalize_field_value(full_key: str, val):
+        if full_key == "evaluation.ablation.epochs" and val == 0:
+            return None
+        return val
+
+    def get_draft_config(self) -> dict:
+        """Config actual según los campos de la UI (puede diferir del YAML en disco)."""
+        import copy
+
+        draft = copy.deepcopy(self.config_data)
+        for full_key, field in self.fields.items():
+            val = self._normalize_field_value(full_key, field.get_value())
+            set_nested_value(draft, full_key, val)
+        return draft
+
+    def _connect_ablation_preview(self):
+        """Actualiza resumen en pestaña Entrenamiento al editar bloque de ablación."""
+        preview_keys = [
+            "evaluation.ablation.enabled",
+            "evaluation.ablation.when",
+            "evaluation.ablation.skip_baseline_variant",
+            "evaluation.ablation.on_failure",
+            "evaluation.ablation.epochs",
+        ] + [
+            f"evaluation.ablation.matrices.{k}"
+            for k in (
+                "pooling", "slices", "layout", "masked",
+                "augment", "freeze", "validation_metric",
+            )
+        ]
+
+        def _preview_ablation_summary():
+            if not self.parent_window or not hasattr(self.parent_window, "training_tab"):
+                return
+            from src.utils.ablation_matrix import (
+                ensure_ablation_defaults,
+                format_ablation_startup_summary,
+            )
+
+            draft = self.get_draft_config()
+            ensure_ablation_defaults(draft)
+            summary = format_ablation_startup_summary(draft)
+            if self._dirty:
+                summary += " (vista previa — guarde 💾)"
+            self.parent_window.training_tab.ablation_summary_label.setText(summary)
+
+        for key in preview_keys:
+            if key in self.fields:
+                self.fields[key].valueChanged.connect(_preview_ablation_summary)
+
     def _connect_dirty_tracking(self):
         """Conecta valueChanged de todos los campos para detectar ediciones sin guardar."""
         for field in self.fields.values():
@@ -1990,17 +2262,33 @@ class ConfigEditorTab(QWidget):
         try:
             self._suppress_dirty = True
             with open(self.config_path, 'r', encoding='utf-8') as f:
-                self.config_data = yaml.safe_load(f)
+                self.config_data = yaml.safe_load(f) or {}
+
+            from src.utils.ablation_matrix import ensure_ablation_defaults
+
+            migrated = ensure_ablation_defaults(self.config_data)
             
             # Cargar valores en campos
             self.load_values_from_dict(self.config_data)
+            self._sync_resolution_fields()
+            if hasattr(self, "_refresh_ablation_enabled_state"):
+                self._refresh_ablation_enabled_state()
             self._dirty = False
             
             self.status_label.setText(f"✅ Configuración cargada: {datetime.now().strftime('%H:%M:%S')}")
             self.status_label.setStyleSheet("color: #4ec9b0; padding: 5px;")
             
+            if migrated and self.parent_window and hasattr(self.parent_window, 'log_widget'):
+                self.parent_window.log_widget.append_log(
+                    "Bloque evaluation.ablation aplicado desde defaults — guarde para persistir",
+                    "WARNING",
+                )
             if self.parent_window and hasattr(self.parent_window, 'log_widget'):
                 self.parent_window.log_widget.append_log("Configuración cargada", "SUCCESS")
+            if self.parent_window and hasattr(self.parent_window, "training_tab"):
+                self.parent_window.training_tab.refresh_ablation_summary(
+                    str(self.config_path)
+                )
         
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Error cargando configuración:\n{str(e)}")
@@ -2017,7 +2305,10 @@ class ConfigEditorTab(QWidget):
             if isinstance(value, dict):
                 self.load_values_from_dict(value, full_key)
             elif full_key in self.fields:
-                self.fields[full_key].set_value(value)
+                if value is None and full_key == "evaluation.ablation.epochs":
+                    self.fields[full_key].set_value(0)
+                else:
+                    self.fields[full_key].set_value(value)
     
     def save_config(self):
         """Guarda configuración en archivo"""
@@ -2047,9 +2338,11 @@ class ConfigEditorTab(QWidget):
             backup_path = self.config_path.with_suffix('.yaml.backup')
             shutil.copy2(self.config_path, backup_path)
             
+            self._sync_resolution_fields()
             # Actualizar diccionario con valores de campos (incluye claves nuevas anidadas)
             for full_key, field in self.fields.items():
-                set_nested_value(self.config_data, full_key, field.get_value())
+                val = self._normalize_field_value(full_key, field.get_value())
+                set_nested_value(self.config_data, full_key, val)
             
             # Guardar
             with open(self.config_path, 'w', encoding='utf-8') as f:
@@ -2074,6 +2367,8 @@ class ConfigEditorTab(QWidget):
             saved_path = str(self.config_path.resolve())
             self.configChanged.emit()
             self.configSaved.emit(saved_path)
+            if self.parent_window and hasattr(self.parent_window, "training_tab"):
+                self.parent_window.training_tab.refresh_ablation_summary(saved_path)
         
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Error guardando configuración:\n{str(e)}")
@@ -2103,9 +2398,7 @@ class ConfigEditorTab(QWidget):
         
         if all_valid:
             from src.utils.config_validator import validate_config
-            draft = dict(self.config_data)
-            for full_key, field in self.fields.items():
-                set_nested_value(draft, full_key, field.get_value())
+            draft = self.get_draft_config()
             pipeline = validate_config(draft, str(self.config_path))
             if not pipeline["valid"]:
                 all_valid = False
@@ -2143,6 +2436,22 @@ class ConfigEditorTab(QWidget):
         if reply == QMessageBox.Yes:
             self.load_config()
     
+    def _on_image_size_changed(self, _value=None):
+        """Propaga data.image_size a resize y crop (única fuente de verdad)."""
+        self._sync_resolution_fields()
+
+    def _sync_resolution_fields(self):
+        """Alinea resize_size y grain crop_size con data.image_size."""
+        if 'data.image_size' not in self.fields:
+            return
+        size = int(self.fields['data.image_size'].get_value())
+        if 'data.resize_size' in self.fields:
+            if self.fields['data.resize_size'].get_value() != size:
+                self.fields['data.resize_size'].set_value(size)
+        if 'grain_detection.crop_size' in self.fields:
+            if self.fields['grain_detection.crop_size'].get_value() != size:
+                self.fields['grain_detection.crop_size'].set_value(size)
+
     def on_backbone_changed(self, backbone_name):
         """
         Auto-configura parámetros al cambiar el backbone.

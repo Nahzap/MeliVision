@@ -125,7 +125,7 @@ def test_m2_nmi_perfect_clusters():
     embeddings = np.array(embeddings, dtype=np.float32)
     labels = np.array(labels)
 
-    nmi = compute_nmi(embeddings, labels)
+    nmi, _ = compute_nmi(embeddings, labels)
 
     assert nmi > 0.8, f"NMI con clusters perfectos debe ser > 0.8, obtenido {nmi}"
 
@@ -136,19 +136,20 @@ def test_m2_nmi_range():
     embeddings = np.random.randn(30, 64).astype(np.float32)
     labels = np.array([0]*10 + [1]*10 + [2]*10)
 
-    nmi = compute_nmi(embeddings, labels)
+    nmi, _ = compute_nmi(embeddings, labels)
 
     assert 0.0 <= nmi <= 1.0, f"NMI = {nmi} fuera de rango [0, 1]"
 
 
 def test_m2_nmi_returns_float():
-    """M2: compute_nmi debe retornar float."""
+    """M2: compute_nmi debe retornar (mean, std) con mean float."""
     np.random.seed(42)
     embeddings = np.random.randn(20, 32).astype(np.float32)
     labels = np.array([0]*10 + [1]*10)
 
-    nmi = compute_nmi(embeddings, labels)
+    nmi, nmi_std = compute_nmi(embeddings, labels)
     assert isinstance(nmi, float), f"NMI debe ser float, obtenido {type(nmi)}"
+    assert isinstance(nmi_std, float)
 
 
 # ============================================================

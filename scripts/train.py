@@ -93,19 +93,9 @@ def create_model(config: dict) -> AnalogyNet:
     """
     logger = logging.getLogger(__name__)
     
+    from src.utils.model_factory import create_analogy_net_from_config
+    model = create_analogy_net_from_config(config)
     model_config = config['model']
-    
-    sota_config = config.get('sota', {})
-    model = AnalogyNet(
-        backbone=get_backbone_name(config),
-        embedding_dim=model_config['embedding_dim'],
-        pretrained=model_config['pretrained'],
-        projection_head_config=model_config.get('projection_head'),
-        use_attention=model_config.get('use_attention', False),
-        freeze_backbone=model_config.get('freeze_backbone', False),
-        embedding_space=sota_config.get('embedding_space', 'euclidean'),
-        hyperbolic_curvature=sota_config.get('hyperbolic_curvature', 1.0)
-    )
     
     logger.info(f"Model created: {get_backbone_name(config)}")
     logger.info(f"Embedding dimension: {model_config['embedding_dim']}")
@@ -431,7 +421,12 @@ def estimate_training_time(config: dict, train_loader, val_loader, model, logger
     return estimate
 
 
-def run_training(args, estimate_only: bool = False, run_dir: str = None):
+def run_training(
+    args,
+    estimate_only: bool = False,
+    run_dir: str = None,
+    _ablation_child: bool = False,
+):
     """
     Core training function that accepts an args Namespace.
     Can be called from CLI (main()) or from GUI.
@@ -440,14 +435,17 @@ def run_training(args, estimate_only: bool = False, run_dir: str = None):
         args: Namespace with config, resume, gpu (optional), checkpoint (optional)
         estimate_only: If True, only benchmark and return time estimate + pre-training analysis
         run_dir: If provided, use this as the run directory for checkpoints/models/logs
+        _ablation_child: Internal flag — ablation variants must not spawn nested ablations
         
     Returns:
         If estimate_only: dict with time estimates + pre-training analysis paths
-        Otherwise: None
+        Otherwise: dict with run_dir, status, and optional ablation summary
     """
     
     # Load configuration
     config = load_config(args.config)
+    from src.utils.resolution_config import resolve_effective_image_size, sync_resolution_config
+    config, res_synced = sync_resolution_config(config)
     
     # Override GPU if specified
     if args.gpu is not None:
@@ -473,9 +471,20 @@ def run_training(args, estimate_only: bool = False, run_dir: str = None):
     logger.info("--- CONFIG DUMP ---")
     logger.info(f"  Model: {get_backbone_name(config)}, emb_dim={model_cfg['embedding_dim']}, pretrained={model_cfg['pretrained']}")
     logger.info(f"  Projection: {model_cfg.get('projection_head', {}).get('hidden_dims', [])}, dropout={model_cfg.get('projection_head', {}).get('dropout', 0)}")
-    logger.info(f"  Data: image_size={data_cfg.get('image_size')}, resize={data_cfg.get('resize_size')}, batch={data_cfg['batch_size']}, workers={data_cfg.get('num_workers', 4)}")
+    effective_size = resolve_effective_image_size(config)
     logger.info(
-        f"  Grain: enabled={grain_cfg.get('enabled', True)}, crop_size={grain_cfg.get('crop_size')}, "
+        f"  Data: image_size={effective_size}px (canonical), resize={data_cfg.get('resize_size')}, "
+        f"batch={data_cfg['batch_size']}, workers={data_cfg.get('num_workers', 4)}"
+    )
+    if res_synced:
+        logger.info("  Resolution sync: data.resize_size y grain_detection.crop_size alineados a image_size")
+    stale_crop = grain_cfg.get("crop_size")
+    if stale_crop is not None and int(stale_crop) != effective_size:
+        logger.warning(
+            f"  grain_detection.crop_size={stale_crop} ignorado; pipeline usa data.image_size={effective_size}"
+        )
+    logger.info(
+        f"  Grain: enabled={grain_cfg.get('enabled', True)}, "
         f"use_mask={grain_cfg.get('use_mask')}, masked_pooling={grain_cfg.get('masked_pooling')}"
     )
     logger.info(f"  Training: loss={train_cfg['loss']['type']}, lr={train_cfg['learning_rate']}, epochs={train_cfg['epochs']}, warmup={train_cfg.get('warmup_epochs', 0)}")
@@ -505,6 +514,22 @@ def run_training(args, estimate_only: bool = False, run_dir: str = None):
         estimate_worker_ram_mb,
         free_training_memory,
     )
+
+    from src.utils.config_validator import validate_config
+    from src.utils.sota_integrity import validate_sota_integrity
+
+    validation = validate_config(config, config_path=args.config, check_data_dirs=not estimate_only)
+    if validation["warnings"]:
+        for warn in validation["warnings"]:
+            logger.warning("Config: %s", warn)
+    if not validation["valid"]:
+        for err in validation["errors"]:
+            logger.error("Config: %s", err)
+        raise ValueError(
+            "Configuración inválida. Corrige los errores antes de entrenar "
+            f"(ver docs/2026-06-12_PLAN_CUMPLIMIENTO_ACADEMICO_SOTA.md Fase A)."
+        )
+    logger.info("Pipeline: %s", validation["pipeline_summary"])
 
     # Create dataloaders
     logger.info("\n" + "="*70)
@@ -602,6 +627,21 @@ def run_training(args, estimate_only: bool = False, run_dir: str = None):
         dispose_data_engine(data_engine)
         del train_loader, val_loader, data_engine, model
         free_training_memory("estimate_only")
+
+        from src.utils.ablation_matrix import count_planned_variants
+
+        n_abl = count_planned_variants(config)
+        time_estimate["ablation_variants"] = n_abl
+        if n_abl:
+            abl_epochs = (config.get("evaluation") or {}).get("ablation", {}).get("epochs")
+            ep_note = (
+                f" ({abl_epochs} épocas/variante)"
+                if abl_epochs is not None
+                else " (mismas épocas que el run principal)"
+            )
+            time_estimate["ablation_note"] = (
+                f"+ {n_abl} entrenamiento(s) de ablación tras el run principal{ep_note}"
+            )
         return time_estimate
     
     # Merge training and hardware configs for trainer
@@ -624,7 +664,14 @@ def run_training(args, estimate_only: bool = False, run_dir: str = None):
         'nir': sota_config.get('nir', {}),
         'hier': sota_config.get('hier', {}),
         'dada': sota_config.get('dada', {}),
+        'anti_collapse': sota_config.get('anti_collapse', {}),
         'self_distillation': sota_config.get('self_distillation', {}),
+        'evaluation': eval_cfg,
+        'sota': sota_config,
+        'reproducibility': config.get('reproducibility', {}),
+        'inference': config.get('inference', {}),
+        'grain_detection': config.get('grain_detection', {}),
+        'loader_policy': config.get('data', {}).get('loader_policy', {}),
     }
     
     # Create trainer
@@ -688,12 +735,21 @@ def run_training(args, estimate_only: bool = False, run_dir: str = None):
         # --- Post-training analysis (curves, t-SNE, confusion matrix, inference, report) ---
         if run_dir:
             from scripts.post_training import (
+                create_eval_dataloaders,
                 run_post_training_analysis,
                 compute_and_save_centroids,
                 finalize_self_contained_checkpoint,
+                publish_final_evaluation_summary,
             )
 
+            eval_cfg = config.get("evaluation", {}) or {}
+            report_final_on = str(eval_cfg.get("report_final_on", "test")).lower()
+
             del trainer
+            dispose_data_engine(data_engine)
+            free_training_memory("post_fit_workers_released")
+
+            train_loader, val_loader, test_loader, data_engine = create_eval_dataloaders(config)
             free_training_memory("post_training_start")
 
             try:
@@ -725,18 +781,44 @@ def run_training(args, estimate_only: bool = False, run_dir: str = None):
                 )
                 free_training_memory("centroids_saved")
 
-                logger.info("Running post-training analysis on Validation set...")
+                logger.info(
+                    "Post-training VAL (intermedio — selección de checkpoint fue en val; "
+                    "métricas finales en %s)",
+                    report_final_on,
+                )
                 run_post_training_analysis(
                     model, val_loader, config, run_dir, device,
                     slice_classifier=slice_classifier, centroids=centroids, prefix="val"
                 )
 
-                if test_loader is not None:
-                    logger.info("Running post-training analysis on Test set...")
+                if eval_cfg.get("calibration", {}).get("enabled", True):
+                    from src.utils.threshold_calibration import calibrate_inference_thresholds
+                    calibrate_inference_thresholds(
+                        model, val_loader, device, Path(run_dir), config
+                    )
+
+                final_prefix = report_final_on
+                if report_final_on == "test":
+                    if test_loader is not None:
+                        logger.info("Post-training TEST (evaluación final hold-out, 1 pasada)...")
+                        run_post_training_analysis(
+                            model, test_loader, config, run_dir, device,
+                            slice_classifier=slice_classifier, centroids=centroids, prefix="test"
+                        )
+                    else:
+                        logger.warning(
+                            "evaluation.report_final_on=test pero no hay test_loader; "
+                            "usando val como evaluación final (protocolo MLRC incompleto)"
+                        )
+                        final_prefix = "val"
+                elif test_loader is not None:
+                    logger.info("Post-training TEST (exploratorio; reporte final = %s)...", report_final_on)
                     run_post_training_analysis(
                         model, test_loader, config, run_dir, device,
                         slice_classifier=slice_classifier, centroids=centroids, prefix="test"
                     )
+
+                publish_final_evaluation_summary(Path(run_dir), prefix=final_prefix)
 
                 logger.info("Re-saving best_model.pth as self-contained inference checkpoint...")
                 finalize_self_contained_checkpoint(Path(run_dir))
@@ -752,6 +834,43 @@ def run_training(args, estimate_only: bool = False, run_dir: str = None):
                     f"Use the Evaluación tab or run_evaluation_from_checkpoint to regenerate results.",
                     exc_info=True,
                 )
+            finally:
+                dispose_data_engine(data_engine)
+                free_training_memory("post_training_end")
+
+        ablation_result = None
+        if run_dir and not _ablation_child:
+            abl_cfg = (config.get("evaluation") or {}).get("ablation") or {}
+            if abl_cfg.get("enabled", False):
+                try:
+                    from src.utils.ablation_matrix import execute_integrated_ablation_study
+
+                    logger.info("\n" + "=" * 70)
+                    logger.info("ABLACION INTEGRADA (post-entrenamiento principal)")
+                    logger.info("=" * 70)
+                    ablation_result = execute_integrated_ablation_study(
+                        config=config,
+                        config_path=args.config,
+                        parent_run_dir=Path(run_dir),
+                        logger=logger,
+                    )
+                except Exception as abl_err:
+                    logger.error(
+                        "Ablación integrada falló (entrenamiento principal OK): %s",
+                        abl_err,
+                        exc_info=True,
+                    )
+                    ablation_result = {
+                        "enabled": True,
+                        "status": "failed",
+                        "error": str(abl_err),
+                    }
+
+        return {
+            "run_dir": run_dir,
+            "status": "completed",
+            "ablation": ablation_result,
+        }
 
     except KeyboardInterrupt:
         alarm_manager.warning(

@@ -1,0 +1,26 @@
+{
+  "matrix": "slices",
+  "matrix_id": "F-02",
+  "base_config": "config.yaml",
+  "batch_dir": "C:\\Users\\askna\\Documents\\GitHub\\MetricLearning\\ablations\\slices_2026-06-12_153552",
+  "runs": [
+    {
+      "variant_id": "slices_2",
+      "variant_label": "S=2",
+      "config_path": "C:\\Users\\askna\\Documents\\GitHub\\MetricLearning\\ablations\\slices_2026-06-12_153552\\configs\\slices_2.yaml",
+      "run_dir": null
+    },
+    {
+      "variant_id": "slices_4",
+      "variant_label": "S=4",
+      "config_path": "C:\\Users\\askna\\Documents\\GitHub\\MetricLearning\\ablations\\slices_2026-06-12_153552\\configs\\slices_4.yaml",
+      "run_dir": null
+    },
+    {
+      "variant_id": "slices_8",
+      "variant_label": "S=8",
+      "config_path": "C:\\Users\\askna\\Documents\\GitHub\\MetricLearning\\ablations\\slices_2026-06-12_153552\\configs\\slices_8.yaml",
+      "run_dir": null
+    }
+  ]
+}
