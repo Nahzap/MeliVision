@@ -63,28 +63,46 @@ def _parse_manifest(gallery_dir: Path, class_names: list[str]) -> list[tuple[str
 
 
 def _resolve_image_path(cls_name: str, img_stem: str, annotation_root: Path) -> Path | None:
-    img_name = f"{img_stem}.png"
+    """Resolve source image for a gallery entry (stem from output PNG name)."""
     cls_dir = annotation_root / cls_name
-    candidates = [
-        cls_dir / img_name,
-        Path("data/processed/train") / cls_name / img_name,
-        Path("data/processed/val") / cls_name / img_name,
-        Path("data/processed/test") / cls_name / img_name,
-    ]
-    for seg_path in sorted(cls_dir.glob("*.seg")):
+    if not cls_dir.is_dir():
+        return None
+
+    # 1) Exact stem from gallery filename (.png / .jpg)
+    for ext in (".png", ".jpg", ".jpeg", ".PNG", ".JPG", ".JPEG"):
+        direct = cls_dir / f"{img_stem}{ext}"
+        if direct.exists():
+            return direct
+    for root in (
+        Path("data/processed/train") / cls_name,
+        Path("data/processed/val") / cls_name,
+        Path("data/processed/test") / cls_name,
+    ):
+        for ext in (".png", ".jpg", ".jpeg", ".PNG", ".JPG", ".JPEG"):
+            candidate = root / f"{img_stem}{ext}"
+            if candidate.exists():
+                return candidate
+
+    # 2) Matching .seg for this stem → # Imagen header (same logic as post_training)
+    seg_path = cls_dir / f"{img_stem}.seg"
+    if seg_path.exists():
         try:
             with open(seg_path, encoding="utf-8") as f:
                 for line in f.readlines()[:10]:
                     if line.startswith("# Imagen:"):
-                        hinted = line.split(":", 1)[1].strip()
-                        candidates.insert(0, seg_path.parent / hinted)
-                        candidates.insert(1, Path("data/processed/test") / cls_name / hinted)
+                        img_name = line.split(":", 1)[1].strip()
+                        for candidate in (
+                            cls_dir / img_name,
+                            Path("data/processed/train") / cls_name / img_name,
+                            Path("data/processed/val") / cls_name / img_name,
+                            Path("data/processed/test") / cls_name / img_name,
+                        ):
+                            if candidate.exists():
+                                return candidate
                         break
         except OSError:
-            continue
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
+            pass
+
     return None
 
 
@@ -103,6 +121,10 @@ def regenerate_fullimage_folder(
         raise FileNotFoundError(config_path)
     with open(config_path, encoding="utf-8") as f:
         config = yaml.safe_load(f)
+
+    from src.utils.config_utils import merge_global_active_detector
+
+    config = merge_global_active_detector(config, str(ROOT / "config.yaml"))
 
     ckpt_path = run_dir / "checkpoints" / "best_model.pth"
     if not ckpt_path.exists():
@@ -201,6 +223,7 @@ def regenerate_fullimage_folder(
             discovery_mode=discovery_mode,
         )
         grains = results.get("grains", [])
+        rejected_dets = results.get("rejected_detections", [])
         full_img = cv2.imread(str(img_path))
         if full_img is None:
             logger.warning("Could not read %s", img_path)
@@ -217,9 +240,10 @@ def regenerate_fullimage_folder(
         matched_ann: set[int] = set()
 
         for g_idx, grain in enumerate(grains):
+            eval_cls_name = grain.get("raw_predicted_class", grain["predicted_class"])
             pred_cls_name = grain["predicted_class"]
-            pred_cls = class_names.index(pred_cls_name) if pred_cls_name in class_names else -1
-            if pred_cls == cls_idx:
+            pred_cls = class_names.index(eval_cls_name) if eval_cls_name in class_names else -1
+            if pred_cls == cls_idx and not grain.get("rejected_by_classifier"):
                 img_grains_correct += 1
 
             for ann_i, ann in enumerate(annotated_grains):
@@ -228,7 +252,7 @@ def regenerate_fullimage_folder(
 
             if grain.get("crop") is not None:
                 safe_cls = cls_name.replace(" ", "_").replace("/", "_")
-                safe_pred = pred_cls_name.replace(" ", "_").replace("/", "_")
+                safe_pred = eval_cls_name.replace(" ", "_").replace("/", "_")
                 crop_save = crops_dir / f"{safe_cls}_{img_stem}_grain_{g_idx}_{safe_pred}.png"
                 cv2.imwrite(str(crop_save), grain["crop"])
 
@@ -238,7 +262,23 @@ def regenerate_fullimage_folder(
                 heatmap = explainer.generate_heatmap(
                     grain["tensor"].unsqueeze(0), centroid=pred_target
                 )
-                heatmaps_and_bboxes.append((heatmap, grain["bbox"]))
+                crop_bbox = grain.get("classification_bbox") or grain["bbox"]
+                heatmaps_and_bboxes.append((heatmap, crop_bbox))
+
+        for rej in rejected_dets:
+            bx, by, bw, bh = rej["bbox"]
+            cv2.rectangle(display_img, (bx, by), (bx + bw, by + bh), (160, 160, 160), 2, cv2.LINE_AA)
+            reason = rej.get("rejection_reason", "filtered")
+            cv2.putText(
+                display_img,
+                f"filtrado ({reason})",
+                (bx, max(12, by - 4)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale * 0.75,
+                (160, 160, 160),
+                thickness,
+                cv2.LINE_AA,
+            )
 
         if with_gradcam and explainer is not None and heatmaps_and_bboxes:
             full_img_rgb = cv2.cvtColor(full_img, cv2.COLOR_BGR2RGB)
@@ -293,7 +333,8 @@ def regenerate_fullimage_folder(
 
         title = (
             f"{cls_name} | {img_path.name} | "
-            f"Detectados: {img_grains_total} | Anotados .seg: {n_annotated} | "
+            f"Evaluados: {img_grains_total} | Filtrados: {len(rejected_dets)} | "
+            f"Anotados .seg: {n_annotated} | "
             f"Correctos: {img_grains_correct}/{img_grains_total} ({acc:.0%}) | "
             f"Extra descubiertos: {n_extra_discovered} | "
             f"Anotados perdidos: {n_missed_annotated}"
@@ -326,6 +367,7 @@ def regenerate_fullimage_folder(
                 "accuracy": acc,
                 "discovered_extra": n_extra_discovered,
                 "missed_annotated": n_missed_annotated,
+                "quality_filtered": len(rejected_dets),
             }
         )
 

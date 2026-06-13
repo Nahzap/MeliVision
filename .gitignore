@@ -1,4 +1,8 @@
-# Python
+# =============================================================================
+# MeliVision / MetricLearning — .gitignore
+# =============================================================================
+
+# --- Python ---
 __pycache__/
 *.py[cod]
 *$py.class
@@ -21,100 +25,125 @@ share/python-wheels/
 *.egg
 MANIFEST
 
-# Virtual Environment
+# --- Virtual environment ---
 .venv/
 venv/
 ENV/
 env/
-.env
 
-# PyTorch
+# --- Secrets / credentials ---
+.env
+.env.*
+*.pem
+credentials.json
+
+# --- PyTorch weights & checkpoints ---
 *.pth
 *.pt
 *.ckpt
+*.onnx
 checkpoints/
 
-# Jupyter Notebook
-.ipynb_checkpoints
+# --- Jupyter ---
+.ipynb_checkpoints/
 *.ipynb_checkpoints/
 
-# IDEs
+# --- IDEs & OS ---
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 .DS_Store
+Thumbs.db
+*.code-workspace
 
-# Logs
+# --- Logs & experiment tracking ---
 logs/
 *.log
 tensorboard/
 wandb/
-runs/
 
-# Data (EXCLUIR TODO - datos personales)
-data/
+# --- Training runs & generated outputs ---
+runs/*
+!runs/.gitkeep
+experiments/
+reports/
+evaluation/
+ablations/
+images/
+
+# --- Data (user-provided; not versioned) ---
+data/*
+!data/.gitkeep
+*.h5
+*.hdf5
+*.faiss
+*.index
+
+# --- Binary / media (datasets, figures, archives) ---
 *.jpg
 *.jpeg
 *.png
 *.tiff
+*.tif
 *.bmp
+*.gif
+*.svg
+*.webp
 *.npy
 *.npz
-*.h5
-*.hdf5
 *.zip
-# Pero permitir código fuente en src/data/
+*.tar
+*.tar.gz
+*.7z
+*.rar
+
+# Allow Python source packages named like ignored dirs
 !src/data/
-
-# FAISS Indices
-*.faiss
-*.index
-
-# Experiments y Resultados (EXCLUIR)
-experiments/
-runs/
-reports/
-!experiments/.gitkeep
-
-# Models (EXCLUIR TODOS - muy pesados)
-models/
-*.pth
-*.pt
-*.onnx
-!models/.gitkeep
-# Pero permitir código fuente en src/models/
 !src/models/
 
-# Cache
+# --- Model weights directory at repo root (download via setup_u2net.py) ---
+/models/
+!models/.gitkeep
+
+# --- Config backups (local only) ---
+config.yaml.backup
+config.backup_*.yaml
+*.backup
+
+# --- Root-level scratch scripts & local artifacts ---
+/test_shape.py
+/test_shape2.py
+/test_hybrid.py
+/test_ldm.py
+/test_pipeline.py
+/training_metrics.csv
+/data_BKP*.zip
+/mantos_*.png
+/smoke_multi_tower.log
+
+# --- Generated metrics / plots in scripts ---
+scripts/graphsss/*.csv
+
+# --- Documentation (local only; public doc = /README.md) ---
+docs/
+*.md
+!/README.md
+
+# --- Tests (local only) ---
+tests/
+
+# --- Cache & coverage ---
 .cache/
 *.cache
-
-# Coverage
 .coverage
 htmlcov/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# OS
-Thumbs.db
-.DS_Store
-
-# Temporary files
+# --- Temporary ---
 tmp/
 temp/
 *.tmp
-
-# Documentación técnica detallada (EXCLUIR - solo README público)
-docs/*
-!docs/.gitkeep
-
-# Archivos de workspace personales
-*.code-workspace
-
-# Backups de configuración
-*.backup
-
-# Resultados de tests e imágenes de prueba
-test_*.png
-test_*.jpg

@@ -261,6 +261,8 @@ class SegmentedGrainDataset(Dataset):
             bbox, contour = self._scale_geometry(bbox, contour, scale)
             grain = {"bbox": bbox, "saliency": saliency, "contour": contour}
             crop = self._extract_crop(image, grain)
+            if crop is None:
+                crop = np.zeros((self.crop_size, self.crop_size, 3), dtype=np.uint8)
 
             mask_binary = None
             if (self.use_mask or self.return_mask) and contour is not None:
@@ -314,42 +316,9 @@ class SegmentedGrainDataset(Dataset):
 
     def _extract_crop(self, image: np.ndarray, grain: Dict) -> np.ndarray:
         """Extrae crop cuadrado centrado en el grano con padding."""
-        h_img, w_img = image.shape[:2]
-        x, y, w, h = grain["bbox"]
+        from src.grain_detection.grain_crop_utils import extract_grain_crop
 
-        pad_x = int(w * self.crop_padding)
-        pad_y = int(h * self.crop_padding)
-
-        side = max(w + 2 * pad_x, h + 2 * pad_y)
-
-        cx = x + w // 2
-        cy = y + h // 2
-
-        x1 = cx - side // 2
-        y1 = cy - side // 2
-        x2 = x1 + side
-        y2 = y1 + side
-
-        valid_x1 = max(0, x1)
-        valid_y1 = max(0, y1)
-        valid_x2 = min(w_img, x2)
-        valid_y2 = min(h_img, y2)
-
-        crop = image[valid_y1:valid_y2, valid_x1:valid_x2]
-
-        if crop.size == 0:
-            crop = np.zeros((self.crop_size, self.crop_size, 3), dtype=np.uint8)
-        else:
-            if x1 < 0 or y1 < 0 or x2 > w_img or y2 > h_img:
-                top = max(0, -y1)
-                bottom = max(0, y2 - h_img)
-                left = max(0, -x1)
-                right = max(0, x2 - w_img)
-                crop = cv2.copyMakeBorder(crop, top, bottom, left, right, cv2.BORDER_CONSTANT, value=[128, 128, 128])
-            
-            # Remove cv2.resize, Albumentations will resize it natively.
-
-        return crop
+        return extract_grain_crop(image, grain, crop_padding=self.crop_padding)
 
     def get_raw_crop_and_mask(self, idx: int) -> np.ndarray:
         """Extract raw crop and mask (without background coloring) for HDF5 cache."""
@@ -372,62 +341,18 @@ class SegmentedGrainDataset(Dataset):
 
     def _generate_mask(self, grain: Dict, original_shape: Tuple[int, int]) -> np.ndarray:
         """Genera la máscara binaria pura desde el contorno."""
-        contour = grain.get("contour")
-        if contour is None or len(contour) < 3:
+        from src.grain_detection.grain_crop_utils import generate_grain_mask
+
+        mask = generate_grain_mask(grain, original_shape, crop_padding=self.crop_padding)
+        if grain.get("contour") is None or len(grain.get("contour", [])) < 3:
             return np.full((self.crop_size, self.crop_size), 255, dtype=np.uint8)
-
-        h_img, w_img = original_shape
-        x, y, w, h = grain["bbox"]
-        pad_x = int(w * self.crop_padding)
-        pad_y = int(h * self.crop_padding)
-        side = max(w + 2 * pad_x, h + 2 * pad_y)
-
-        cx = x + w // 2
-        cy = y + h // 2
-        x1 = cx - side // 2
-        y1 = cy - side // 2
-        x2 = x1 + side
-        y2 = y1 + side
-
-        # Crear máscara en coordenadas del crop original
-        mask_full = np.zeros((h_img, w_img), dtype=np.uint8)
-        pts = contour.reshape(-1, 1, 2).astype(np.int32)
-        cv2.drawContours(mask_full, [pts], -1, 255, -1)
-
-        valid_x1 = max(0, x1)
-        valid_y1 = max(0, y1)
-        valid_x2 = min(w_img, x2)
-        valid_y2 = min(h_img, y2)
-        mask_crop = mask_full[valid_y1:valid_y2, valid_x1:valid_x2]
-        
-        if x1 < 0 or y1 < 0 or x2 > w_img or y2 > h_img:
-            top = max(0, -y1)
-            bottom = max(0, y2 - h_img)
-            left = max(0, -x1)
-            right = max(0, x2 - w_img)
-            mask_crop = cv2.copyMakeBorder(mask_crop, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0)
-
-        # Removido el erode agresivo para no reducir el grano y causar speckles.
-        # Conservamos el contorno completo.
-
-        return mask_crop
+        return mask
 
     def _apply_mask_bg(self, crop: np.ndarray, mask_crop: np.ndarray) -> np.ndarray:
         """Aplica el color de fondo a la imagen basándose en la máscara (BGR uint8)."""
-        bg_pixels = mask_crop == 0
-        if self.mask_bg_mode == 'imagenet_neutral':
-            from src.utils.dataset_norm import imagenet_neutral_bgr_uint8
+        from src.grain_detection.grain_crop_utils import apply_mask_bg
 
-            b, g, r = imagenet_neutral_bgr_uint8()
-            crop[bg_pixels] = (b, g, r)
-        elif self.mask_bg_mode == 'random':
-            bg_color = np.random.randint(0, 256, size=(1, 1, 3), dtype=np.uint8)
-            crop[bg_pixels] = bg_color[0, 0]
-        elif self.mask_bg_mode == 'gray':
-            crop[bg_pixels] = 128
-        elif self.mask_bg_mode == 'black':
-            crop[bg_pixels] = 0
-        return crop
+        return apply_mask_bg(crop, mask_crop, self.mask_bg_mode)
 
     def get_stats(self) -> Dict[str, Any]:
         """Retorna estadísticas del dataset."""

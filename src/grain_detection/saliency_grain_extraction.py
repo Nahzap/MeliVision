@@ -55,14 +55,21 @@ def extract_grains_from_saliency(
     adaptive_k: float = 0.30,
     min_area: int = 200,
     max_area: int = 200000,
+    max_area_frac: Optional[float] = None,
     morph_kernel_size: int = 3,
     min_circularity: float = 0.3,
+    max_bbox_side_frac: float = 0.35,
+    max_aspect_ratio: float = 2.5,
     adaptive_k_override: Optional[float] = None,
     min_circularity_override: Optional[float] = None,
 ) -> List[DetectedGrain]:
     """Extrae granos individuales de un mapa de saliencia [0-1]."""
     if saliency is None or saliency.size == 0:
         return []
+
+    h_map, w_map = saliency.shape[:2]
+    if max_area_frac is not None:
+        max_area = int(max_area_frac * h_map * w_map)
 
     sal_mean = float(np.mean(saliency))
     sal_std = float(np.std(saliency))
@@ -106,6 +113,13 @@ def extract_grains_from_saliency(
             continue
 
         x, y, w, h = cv2.boundingRect(contour)
+        img_side = min(saliency.shape[0], saliency.shape[1])
+        if img_side > 0 and max(w, h) > max_bbox_side_frac * img_side:
+            continue
+        aspect = max(w, h) / max(min(w, h), 1)
+        if aspect > max_aspect_ratio:
+            continue
+
         M = cv2.moments(contour)
         if M["m00"] > 0:
             cx = int(M["m10"] / M["m00"])
@@ -132,3 +146,25 @@ def extract_grains_from_saliency(
     for i, g in enumerate(grains):
         g.index = i
     return grains
+
+
+def grain_extraction_kwargs(grain_cfg: dict, *, for_gt: bool = False) -> dict:
+    """Parámetros de extracción desde grain_detection (config YAML)."""
+    from src.grain_detection.detection_profiles import resolve_grain_detection_config
+
+    cfg = resolve_grain_detection_config(grain_cfg)
+    min_area = int(cfg.get("min_area_gt", 200) if for_gt else cfg.get("min_area", 400))
+    out = {
+        "adaptive_k": float(cfg.get("adaptive_k", 0.22)),
+        "min_area": min_area,
+        "max_area": int(cfg.get("max_area", 100000)),
+        "morph_kernel_size": int(cfg.get("morph_kernel_size", 3)),
+        "min_circularity": float(
+            cfg.get("min_circularity_gt", 0.2) if for_gt else cfg.get("min_circularity", 0.32)
+        ),
+        "max_bbox_side_frac": float(cfg.get("max_bbox_side_frac", 0.40)),
+        "max_aspect_ratio": float(cfg.get("max_aspect_ratio", 2.8)),
+    }
+    if cfg.get("max_area_frac") is not None:
+        out["max_area_frac"] = float(cfg["max_area_frac"])
+    return out

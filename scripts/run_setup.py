@@ -43,6 +43,32 @@ from src.utils.config_utils import get_backbone_name
 logger = logging.getLogger(__name__)
 
 
+def ensure_detector_run_directory(run_dir: str) -> dict:
+    """
+    Ensure ``runs/{timestamp}/detector/`` exists for detector artifacts.
+
+    Args:
+        run_dir: Parent run directory (``runs/{timestamp}``)
+
+    Returns:
+        dict with detector paths as strings
+    """
+    base = Path(run_dir)
+    detector_dir = base / "detector"
+    paths = {
+        "run_dir": str(base.resolve()),
+        "detector_dir": str(detector_dir.resolve()),
+        "pre_training_dir": str((detector_dir / "pre_training").resolve()),
+        "curves_dir": str((detector_dir / "curves").resolve()),
+        "evaluation_dir": str((detector_dir / "evaluation").resolve()),
+        "logs_dir": str((detector_dir / "logs").resolve()),
+    }
+    for p in paths.values():
+        Path(p).mkdir(parents=True, exist_ok=True)
+    logger.info(f"Detector run directory ready: {detector_dir}")
+    return paths
+
+
 def create_run_directory(base_dir: str = "runs") -> dict:
     """
     Creates a timestamped run directory with all required subfolders.

@@ -79,6 +79,19 @@ class Styles:
         }}
     """
     
+    BUTTON_SAVE = """
+        QPushButton {
+            background-color: #0e639c;
+            color: white;
+            font-weight: bold;
+            padding: 8px 16px;
+            border-radius: 5px;
+        }
+        QPushButton:hover {
+            background-color: #1177bb;
+        }
+    """
+
     BUTTON_SECONDARY = f"""
         QPushButton {{
             background-color: {Colors.BG_ALTERNATE};

@@ -308,20 +308,38 @@ class GrainDataEngine:
         logger.info(
             f"[GRAIN MODE] On-the-fly crops from .seg - train: {data_config['train_dir']}"
         )
+        crop_source = str(data_config.get("crop_source", "seg")).strip().lower()
+        if crop_source == "detector":
+            from src.data.detector_localized_grain_dataset import DetectorLocalizedGrainDataset
+            from src.grain_detection.detector_registry import get_active_detector_config
+
+            active = get_active_detector_config(config)
+            logger.info(
+                f"[GRAIN MODE] crop_source=detector | active={active.get('backend')} "
+                f"checkpoint={active.get('checkpoint')}"
+            )
+            DatasetCls = DetectorLocalizedGrainDataset
+        else:
+            DatasetCls = SegmentedGrainDataset
+            logger.info(f"[GRAIN MODE] crop_source=seg (oracle .seg)")
+
         train_kw = _grain_dataset_kwargs(config, train_transforms, train_mask_bg)
         val_kw = _grain_dataset_kwargs(config, val_transforms, val_mask_bg)
 
-        train_dataset = SegmentedGrainDataset(
-            root=data_config["train_dir"], **train_kw
-        )
-        val_dataset = SegmentedGrainDataset(
-            root=data_config["val_dir"], **val_kw
-        )
+        if DatasetCls is SegmentedGrainDataset:
+            train_dataset = DatasetCls(root=data_config["train_dir"], **train_kw)
+            val_dataset = DatasetCls(root=data_config["val_dir"], **val_kw)
+        else:
+            train_dataset = DatasetCls(root=data_config["train_dir"], config=config, **train_kw)
+            val_dataset = DatasetCls(root=data_config["val_dir"], config=config, **val_kw)
         
         test_dataset = None
         test_dir = data_config.get("test_dir")
         if test_dir and Path(test_dir).exists():
-            test_dataset = SegmentedGrainDataset(root=test_dir, **val_kw)
+            if DatasetCls is SegmentedGrainDataset:
+                test_dataset = DatasetCls(root=test_dir, **val_kw)
+            else:
+                test_dataset = DatasetCls(root=test_dir, config=config, **val_kw)
             if len(test_dataset) == 0:
                 test_dataset = None
             else:

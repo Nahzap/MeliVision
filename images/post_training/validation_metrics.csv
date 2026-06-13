@@ -1,2 +1,0 @@
-epoch,recall_at_1,recall_at_5,mAP@R,NMI,F1_macro
-1,0.919532,0.976387,0.750714,0.797835,0.920647

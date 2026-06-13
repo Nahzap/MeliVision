@@ -19,9 +19,15 @@ from src.models.pooling_config import (
     validate_projection_config,
 )
 from src.utils.resolution_config import resolve_effective_image_size
+from src.utils.detector_resolution_config import resolve_detector_input_size, resolve_detector_patch_size
+from src.grain_detection.detector_registry import validate_active_detector, normalize_backend
 from src.utils.sota_integrity import validate_sota_integrity
 from src.utils.mlrc_protocol import normalize_validation_metric
 
+
+from src.training.detector_loss_factory import DETECTOR_LOSS_TYPES
+
+DETECTOR_VALIDATION_METRICS = ("det_f1", "Fm", "mask_iou")
 
 LOSS_REQUIRED_PARAMS = {
     "multi_similarity": ["alpha", "beta", "base"],
@@ -251,10 +257,56 @@ def validate_config(
     explicit_threshold = raw_pooling.get("masked", {}).get("threshold")
     saliency = grain_cfg.get("saliency_threshold")
     loc_detector = str(grain_cfg.get("localization_detector", "u2net")).strip().lower()
-    if loc_detector not in ("u2net", "pollen", "vit", "model", "analogynet", "vit_attention", "u2-net"):
+    active = grain_cfg.get("active_detector") or {}
+    active_backend = active.get("backend") or loc_detector
+    try:
+        normalize_backend(active_backend)
+    except ValueError:
         errors.append(
-            f"grain_detection.localization_detector inválido: {loc_detector!r} "
-            "(use u2net o vit)"
+            f"grain_detection.active_detector.backend inválido: {active_backend!r} "
+            "(use u2net, vit_dense o vit)"
+        )
+    errors.extend(validate_active_detector(config))
+
+    crop_source = str(_get_nested(config, "data", "crop_source", default="seg")).lower()
+    if crop_source not in ("seg", "detector"):
+        errors.append("data.crop_source debe ser 'seg' o 'detector'")
+
+    det_cfg = config.get("detection_training") or {}
+    if det_cfg.get("enabled", True):
+        input_size = resolve_detector_input_size(config)
+        patch_size = resolve_detector_patch_size(config)
+        if input_size % patch_size != 0:
+            errors.append(
+                f"detection_training.input_size ({input_size}) debe ser múltiplo de "
+                f"patch_size ({patch_size})"
+            )
+        if int(det_cfg.get("num_unfrozen_blocks", 2)) < 0:
+            errors.append("detection_training.num_unfrozen_blocks debe ser >= 0")
+        loss_type = str((det_cfg.get("loss") or {}).get("type", "bce_dice")).lower()
+        if loss_type not in DETECTOR_LOSS_TYPES:
+            errors.append(
+                f"detection_training.loss.type={loss_type!r} inválido; "
+                f"use: {', '.join(DETECTOR_LOSS_TYPES)}"
+            )
+        val_metric = str(det_cfg.get("validation_metric", "det_f1"))
+        if val_metric.lower() == "fm":
+            val_metric = "Fm"
+        if val_metric not in DETECTOR_VALIDATION_METRICS:
+            errors.append(
+                f"detection_training.validation_metric={val_metric!r} inválido; "
+                f"use: {', '.join(DETECTOR_VALIDATION_METRICS)}"
+            )
+        max_side = grain_cfg.get("max_load_side")
+        if max_side is not None and int(max_side) != input_size:
+            warnings.append(
+                f"grain_detection.max_load_side ({max_side}) != detection_training.input_size "
+                f"({input_size}); se sincronizará al guardar"
+            )
+    if loc_detector not in ("u2net", "pollen", "vit", "model", "analogynet", "vit_attention", "u2-net", "vit_dense"):
+        warnings.append(
+            f"grain_detection.localization_detector legacy: {loc_detector!r} "
+            "(preferir active_detector.backend)"
         )
     resolved_threshold = pooling_cfg.get("masked", {}).get("threshold")
     if (

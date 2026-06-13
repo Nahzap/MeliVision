@@ -25,26 +25,19 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
-LOCALIZATION_DETECTORS = ("u2net", "vit")
+LOCALIZATION_DETECTORS = ("u2net", "vit", "vit_dense")
 
 
 def resolve_localization_detector(grain_config: Optional[Dict]) -> str:
-    """Return active full-image localization backend: ``u2net`` (default) or ``vit``."""
+    """Return active full-image localization backend."""
+    from src.grain_detection.detector_registry import get_active_detector_config, normalize_backend
+
     cfg = grain_config or {}
-    backend = str(cfg.get("localization_detector", "u2net")).strip().lower()
-    aliases = {
-        "pollen": "u2net",
-        "u2-net": "u2net",
-        "u²-net": "u2net",
-        "model": "vit",
-        "analogynet": "vit",
-        "vit_attention": "vit",
-    }
-    backend = aliases.get(backend, backend)
+    active = get_active_detector_config({"grain_detection": cfg})
+    backend = normalize_backend(active.get("backend", "u2net"))
     if backend not in LOCALIZATION_DETECTORS:
         raise ValueError(
-            f"grain_detection.localization_detector must be one of {LOCALIZATION_DETECTORS}, "
-            f"got {backend!r}"
+            f"active_detector.backend must be one of {LOCALIZATION_DETECTORS}, got {backend!r}"
         )
     return backend
 
@@ -81,6 +74,17 @@ class FullImageClassifier:
                 config=grain_config,
                 slice_classifier=slice_classifier,
             )
+
+        if backend == "vit_dense":
+            from src.grain_detection.detector_registry import get_active_detector_config
+            from src.grain_detection.vit_dense_detector import PollenViTDetector
+
+            active = get_active_detector_config({"grain_detection": grain_config})
+            ckpt = active.get("checkpoint")
+            logger.info(f"[FullImageClassifier] Localización: PollenViTDetector @ {ckpt}")
+            det_config = dict(grain_config)
+            det_config["device"] = str(device)
+            return PollenViTDetector(str(ckpt), config=det_config, device=str(device))
 
         from src.grain_detection.grain_detector import PollenGrainDetector
 
@@ -156,6 +160,19 @@ class FullImageClassifier:
         self.crop_size = self._grain_config.get("crop_size", 256)
         self.use_mask = self._grain_config.get("use_mask", True)
         self.masked_pooling = bool(self._grain_config.get("masked_pooling", True))
+        self.mask_bg_mode = str(
+            self._grain_config.get("val_mask_bg_mode")
+            or self._grain_config.get("mask_bg_mode")
+            or "imagenet_neutral"
+        )
+        self.nms_iou_threshold = float(self._grain_config.get("nms_iou_threshold", 0.5))
+        self.drop_low_confidence_detections = bool(
+            self._grain_config.get("drop_low_confidence_detections", False)
+        )
+
+        from src.grain_detection.detection_quality import resolve_quality_config
+
+        self._quality_cfg = resolve_quality_config(self._grain_config)
 
         mode = "slice-aware" if slice_classifier is not None else f"kNN (k={k})"
         logger.info(
@@ -195,12 +212,18 @@ class FullImageClassifier:
         Returns:
             FullImageClassifier listo para usar
         """
-        from src.utils.config_utils import load_config, get_transforms_from_config, resolve_run_config_path
+        from src.utils.config_utils import (
+            load_config,
+            get_transforms_from_config,
+            merge_global_active_detector,
+            resolve_run_config_path,
+        )
         from src.utils.model_utils import load_model_from_checkpoint
         from src.inference.slice_classifier import load_slice_classifier_from_run
 
         config_path = resolve_run_config_path(checkpoint_path, config_path)
         config = load_config(config_path)
+        config = merge_global_active_detector(config, "config.yaml")
         device = torch.device(
             "cuda" if torch.cuda.is_available() and config.get("use_gpu", True)
             else "cpu"
@@ -314,12 +337,19 @@ class FullImageClassifier:
             distribution = {
                 self.class_names[i]: float(cs[i]) for i in range(len(self.class_names))
             }
+            dist_thr = float(self._grain_config.get("distance_threshold", 0.0))
+            min_conf = float(self._grain_config.get("min_classifier_confidence", 0.35))
+            if dist_thr > 0:
+                min_conf = max(min_conf, 1.0 - dist_thr)
+            rejected = confidence < min_conf
             return {
                 "predicted_class": self.class_names[pred_idx],
                 "predicted_label": pred_idx,
                 "confidence": confidence,
                 "mean_distance": 1.0 - confidence,
                 "class_distribution": distribution,
+                "rejected": rejected,
+                "display_class": "UNKNOWN" if rejected else self.class_names[pred_idx],
             }
 
         emb_2d = np.expand_dims(emb_1d, axis=0)
@@ -332,6 +362,12 @@ class FullImageClassifier:
             "confidence": prediction["confidence"],
             "mean_distance": prediction["mean_distance"],
             "class_distribution": self.knn.get_class_distribution(emb_2d),
+            "rejected": bool(prediction.get("rejected", False)),
+            "display_class": (
+                "UNKNOWN"
+                if prediction.get("rejected")
+                else prediction["predicted_class"]
+            ),
         }
 
     # =========================================================================
@@ -409,16 +445,29 @@ class FullImageClassifier:
         # Escalar coordenadas detectadas de vuelta a la resolución original
         if scale != 1.0:
             orig_h, orig_w = orig_image.shape[:2]
+            inv = 1.0 / scale
             for grain in detected_grains:
                 bx, by, bw, bh = grain.bbox
                 grain.bbox = (
-                    int(bx / scale),
-                    int(by / scale),
-                    max(1, int(bw / scale)),
-                    max(1, int(bh / scale))
+                    int(bx * inv),
+                    int(by * inv),
+                    max(1, int(bw * inv)),
+                    max(1, int(bh * inv)),
                 )
+                if grain.classification_bbox is not None:
+                    cx, cy, cw, ch = grain.classification_bbox
+                    grain.classification_bbox = (
+                        int(cx * inv),
+                        int(cy * inv),
+                        max(1, int(cw * inv)),
+                        max(1, int(ch * inv)),
+                    )
                 if grain.contour is not None:
-                    grain.contour = (np.asarray(grain.contour, dtype=np.float32) / scale).astype(np.int32)
+                    grain.contour = (
+                        np.asarray(grain.contour, dtype=np.float32) * inv
+                    ).astype(np.int32)
+                gcx, gcy = grain.centroid
+                grain.centroid = (int(gcx * inv), int(gcy * inv))
             saliency_map = cv2.resize(saliency_map, (orig_w, orig_h))
             image = orig_image  # Volver a usar la imagen original para extraer los crops
             h, w = orig_h, orig_w
@@ -427,11 +476,67 @@ class FullImageClassifier:
             f"[FullImage] Detección: {len(detected_grains)} granos en {t_detect:.0f}ms"
         )
 
+        from src.grain_detection.grain_crop_utils import nms_detected_grains
+        from src.grain_detection.detection_quality import (
+            filter_detections,
+            split_oversized_detections,
+        )
+
+        rejected_detections: List[Dict[str, Any]] = []
+        if saliency_map is not None and self._quality_cfg.get("split_multi_peak_enabled"):
+            before = len(detected_grains)
+            detected_grains = split_oversized_detections(
+                detected_grains, saliency_map, self._quality_cfg
+            )
+            if len(detected_grains) != before:
+                logger.info(
+                    "[FullImage] Multi-peak split: %d → %d",
+                    before,
+                    len(detected_grains),
+                )
+
+        if self.nms_iou_threshold > 0 and len(detected_grains) > 1:
+            before = len(detected_grains)
+            detected_grains = nms_detected_grains(
+                detected_grains, iou_threshold=self.nms_iou_threshold
+            )
+            if len(detected_grains) < before:
+                logger.info(
+                    f"[FullImage] NMS: {before} → {len(detected_grains)} "
+                    f"(iou<{self.nms_iou_threshold})"
+                )
+
+        detected_grains, quality_rejected = filter_detections(
+            detected_grains,
+            (h, w),
+            self._quality_cfg,
+            saliency=saliency_map,
+            crop_padding=self.crop_padding,
+        )
+        for grain, reason in quality_rejected:
+            rejected_detections.append(
+                {
+                    "bbox": grain.bbox,
+                    "classification_bbox": grain.crop_bbox(),
+                    "contour": grain.contour,
+                    "saliency": grain.saliency_prob,
+                    "rejection_reason": reason,
+                }
+            )
+        if quality_rejected:
+            logger.info(
+                "[FullImage] Quality filter: %d rejected (%s)",
+                len(quality_rejected),
+                ", ".join(sorted({r for _, r in quality_rejected})),
+            )
+
         if not detected_grains:
             return {
                 "grains": [],
+                "rejected_detections": rejected_detections,
                 "summary": {
                     "total_grains": 0,
+                    "rejected_detections": len(rejected_detections),
                     "per_class_counts": {},
                     "elapsed_ms": (time.perf_counter() - t0) * 1000,
                 },
@@ -449,12 +554,19 @@ class FullImageClassifier:
 
         # 2.1. Preparar lista de tensores (solo granos con crop válido)
         for grain in detected_grains:
-            crop_bgr = self._extract_crop(image, grain)
+            from src.grain_detection.grain_crop_utils import prepare_grain_crop_and_mask
+
+            crop_bgr, mask_crop = prepare_grain_crop_and_mask(
+                image,
+                grain,
+                crop_padding=self.crop_padding,
+                use_mask=self.use_mask,
+                mask_bg_mode=self.mask_bg_mode,
+            )
             if crop_bgr is None:
                 continue
             valid_grains.append(grain)
-            if self.use_mask and grain.contour is not None:
-                crop_bgr, mask_crop = self._apply_contour_mask(crop_bgr, image, grain)
+            if mask_crop is not None:
                 mask_float = torch.from_numpy(mask_crop.astype(np.float32) / 255.0)
             else:
                 mask_float = torch.ones(self.crop_size, self.crop_size, dtype=torch.float32)
@@ -513,17 +625,29 @@ class FullImageClassifier:
 
             pred_info = self._classify_embedding(emb_1d)
 
+            display_cls = pred_info.get("display_class", pred_info["predicted_class"])
+            rejected_cls = bool(pred_info.get("rejected", False))
+            if rejected_cls and self.drop_low_confidence_detections:
+                logger.debug(
+                    "[FullImage] Grano descartado (baja confianza/OOD): "
+                    f"dist={pred_info.get('mean_distance', 0):.3f}"
+                )
+                continue
+
             result = {
                 "index": grain.index,
                 "bbox": grain.bbox,
+                "classification_bbox": grain.crop_bbox(),
                 "contour": grain.contour,
                 "saliency": grain.saliency_prob,
-                "predicted_class": pred_info["predicted_class"],
+                "predicted_class": display_cls,
+                "raw_predicted_class": pred_info["predicted_class"],
                 "predicted_label": pred_info["predicted_label"],
                 "confidence": pred_info["confidence"],
                 "mean_distance": pred_info["mean_distance"],
                 "class_distribution": pred_info["class_distribution"],
                 "embedding": emb_1d,
+                "rejected_by_classifier": rejected_cls,
             }
             if return_crops:
                 result["crop"] = crop_bgr_list[i]
@@ -548,8 +672,10 @@ class FullImageClassifier:
 
         return {
             "grains": grain_results,
+            "rejected_detections": rejected_detections,
             "summary": {
                 "total_grains": len(grain_results),
+                "rejected_detections": len(rejected_detections),
                 "per_class_counts": per_class_counts,
                 "elapsed_ms": elapsed,
                 "detect_ms": t_detect,
@@ -560,90 +686,17 @@ class FullImageClassifier:
         }
 
     def _extract_crop(self, image: np.ndarray, grain) -> np.ndarray:
-        """Extrae crop cuadrado centrado en el grano con padding."""
-        h_img, w_img = image.shape[:2]
-        bx, by, bw, bh = grain.bbox
+        """Legacy wrapper — prefer grain_crop_utils.prepare_grain_crop_and_mask."""
+        from src.grain_detection.grain_crop_utils import extract_grain_crop
 
-        pad_x = int(bw * self.crop_padding)
-        pad_y = int(bh * self.crop_padding)
-        side = max(bw + 2 * pad_x, bh + 2 * pad_y)
+        return extract_grain_crop(image, grain, crop_padding=self.crop_padding)
 
-        cx = bx + bw // 2
-        cy = by + bh // 2
-        x1 = cx - side // 2
-        y1 = cy - side // 2
-        x2 = x1 + side
-        y2 = y1 + side
+    def _apply_contour_mask(self, crop: np.ndarray, image: np.ndarray, grain) -> tuple:
+        """Legacy wrapper — prefer grain_crop_utils.prepare_grain_crop_and_mask."""
+        from src.grain_detection.grain_crop_utils import apply_mask_bg, generate_grain_mask
 
-        valid_x1 = max(0, x1)
-        valid_y1 = max(0, y1)
-        valid_x2 = min(w_img, x2)
-        valid_y2 = min(h_img, y2)
-
-        crop = image[valid_y1:valid_y2, valid_x1:valid_x2]
-        if crop.size == 0:
-            return None
-        
-        if x1 < 0 or y1 < 0 or x2 > w_img or y2 > h_img:
-            top = max(0, -y1)
-            bottom = max(0, y2 - h_img)
-            left = max(0, -x1)
-            right = max(0, x2 - w_img)
-            crop = cv2.copyMakeBorder(crop, top, bottom, left, right, cv2.BORDER_REFLECT_101)
-            
-        return crop
-
-    def _apply_contour_mask(
-        self, crop: np.ndarray, image: np.ndarray, grain
-    ) -> tuple:
-        """
-        Aplica máscara del contorno: fondo gris neutro fuera del grano.
-        Usa gris (128) en inferencia para ser consistente con training (val usa 'gray').
-
-        Returns:
-            (crop_masked, mask_binary) — mask is (crop_size, crop_size) uint8 [0/255]
-        """
-        contour = grain.contour
-        if contour is None or len(contour) < 3:
-            full_mask = np.full(crop.shape[:2], 255, dtype=np.uint8)
-            return crop, full_mask
-
-        h_img, w_img = image.shape[:2]
-        bx, by, bw, bh = grain.bbox
-        pad_x = int(bw * self.crop_padding)
-        pad_y = int(bh * self.crop_padding)
-        side = max(bw + 2 * pad_x, bh + 2 * pad_y)
-
-        cx = bx + bw // 2
-        cy = by + bh // 2
-        x1 = cx - side // 2
-        y1 = cy - side // 2
-        x2 = x1 + side
-        y2 = y1 + side
-
-        # Crear máscara en coordenadas de imagen completa
-        mask_full = np.zeros((h_img, w_img), dtype=np.uint8)
-        pts = contour.reshape(-1, 1, 2).astype(np.int32)
-        cv2.drawContours(mask_full, [pts], -1, 255, -1)
-
-        valid_x1 = max(0, x1)
-        valid_y1 = max(0, y1)
-        valid_x2 = min(w_img, x2)
-        valid_y2 = min(h_img, y2)
-
-        # Recortar la máscara igual que el crop (sin resize interpolado)
-        mask_crop = mask_full[valid_y1:valid_y2, valid_x1:valid_x2]
-
-        if x1 < 0 or y1 < 0 or x2 > w_img or y2 > h_img:
-            top = max(0, -y1)
-            bottom = max(0, y2 - h_img)
-            left = max(0, -x1)
-            right = max(0, x2 - w_img)
-            mask_crop = cv2.copyMakeBorder(mask_crop, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0)
-
-        # Fondo gris neutro (consistente con training val: mask_bg_mode='gray')
-        crop = crop.copy()
-        crop[mask_crop == 0] = 128
+        mask_crop = generate_grain_mask(grain, image.shape[:2], crop_padding=self.crop_padding)
+        crop = apply_mask_bg(crop, mask_crop, self.mask_bg_mode)
         return crop, mask_crop
 
     # =========================================================================

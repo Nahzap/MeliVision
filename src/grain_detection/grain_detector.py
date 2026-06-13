@@ -22,6 +22,7 @@ import numpy as np
 
 from .detected_grain import DetectedGrain
 from .salient_detector import SalientObjectDetector
+from .detection_profiles import resolve_grain_detection_config
 from .saliency_grain_extraction import (
     bbox_iou,
     extract_grains_from_saliency,
@@ -54,15 +55,17 @@ class PollenGrainDetector:
                 min_area, max_area, morph_kernel_size, min_circularity,
                 crop_padding, crop_size, device
         """
-        config = config or {}
+        config = resolve_grain_detection_config(config)
 
         # Parámetros de detección (defaults = modo SENSITIVE para polen)
         self.saliency_threshold = config.get("saliency_threshold", 0.30)
         self.adaptive_k = config.get("adaptive_k", 0.30)
-        self.min_area = config.get("min_area", 200)
-        self.max_area = config.get("max_area", 200000)
+        self.min_area = config.get("min_area", 1000)
+        self.max_area = config.get("max_area", 80000)
         self.morph_kernel_size = config.get("morph_kernel_size", 3)
-        self.min_circularity = config.get("min_circularity", 0.3)
+        self.min_circularity = config.get("min_circularity", 0.45)
+        self.max_bbox_side_frac = float(config.get("max_bbox_side_frac", 0.35))
+        self.max_aspect_ratio = float(config.get("max_aspect_ratio", 2.5))
 
         # Parámetros de crop
         self.crop_padding = config.get("crop_padding", 0.20)
@@ -178,6 +181,8 @@ class PollenGrainDetector:
             max_area=self.max_area,
             morph_kernel_size=self.morph_kernel_size,
             min_circularity=self.min_circularity,
+            max_bbox_side_frac=self.max_bbox_side_frac,
+            max_aspect_ratio=self.max_aspect_ratio,
             adaptive_k_override=adaptive_k_override,
             min_circularity_override=min_circularity_override,
         )

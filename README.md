@@ -2,9 +2,10 @@
 
 Sistema de **microscopía automatizada** para clasificación de granos de polen mediante **Deep Metric Learning (DML)** con **DINOv2 Vision Transformer**.
 
-- **Localización:** U²-Net (SOD) + filtros morfológicos de polen — preprocesamiento `.seg` e inferencia full-image.
+- **Localización (producción):** ViT-denso (DINOv2) + estrategia **coarse-to-fine** configurable + quality gates — inferencia full-image.
+- **Localización (preprocesamiento):** U²-Net (SOD) + morfología — generación de anotaciones `.seg`.
 - **DML:** AnalogyNet (ViT entrenado) aprende embeddings 128D en $\mathbb{S}^{127}$ y clasifica por slice.
-- **Inferencia cámara:** `PollenGrainDetector` localiza → `FullImageClassifier` + best model clasifica.
+- **Inferencia cámara:** `PollenViTDetector` localiza → `FullImageClassifier` + best model clasifica.
 
 ---
 
@@ -13,7 +14,7 @@ Sistema de **microscopía automatizada** para clasificación de granos de polen 
 - [Contexto Científico](#contexto-científico)
 - [Pipeline Completo del Sistema](#pipeline-completo-del-sistema)
 - [Etapa 1 — Adquisición Óptica](#etapa-1--adquisición-óptica)
-- [Etapa 2 — Detección de Granos (U²-Net)](#etapa-2--detección-de-granos-u²-net)
+- [Etapa 2 — Detección de Granos](#etapa-2--detección-de-granos)
 - [Etapa 3 — Formato .seg y Dataset On-The-Fly](#etapa-3--formato-seg-y-dataset-on-the-fly)
 - [Etapa 4 — Preprocesamiento y Augmentaciones](#etapa-4--preprocesamiento-y-augmentaciones)
 - [Etapa 5 — Modelo de Embedding (AnalogyNet + DINOv2)](#etapa-5--modelo-de-embedding-analogynet--dinov2)
@@ -26,6 +27,7 @@ Sistema de **microscopía automatizada** para clasificación de granos de polen 
 - [Resultados Experimentales](#resultados-experimentales)
 - [Arquitectura de Software](#arquitectura-de-software)
 - [Referencias](#referencias)
+- [Documentación académica](#documentación-académica)
 
 ---
 
@@ -103,7 +105,7 @@ El sistema soporta datasets con múltiples clases de polen. La partición estrat
 ║            ▼                                                      ║
 ║  ┌──────────────────────────────────────────┐                     ║
 ║  │ ETAPA 6-8: Sliced MS + evaluación MLRC + post-training           ║
-║  │ ETAPA 9: Inferencia — U²-Net localiza → ViT clasifica            ║
+║  │ ETAPA 9: Inferencia — ViT-denso coarse-fine → ViT clasifica    ║
 ║  └─────────┬────────────────────────────────┘                     ║
 ║            │                                                      ║
 ║            ▼                                                      ║
@@ -149,10 +151,12 @@ El sistema soporta datasets con múltiples clases de polen. La partición estrat
 
 ---
 
-## Etapa 2 — Detección de Granos (U²-Net)
+## Etapa 2 — Detección de Granos
 
-> **Rol:** U²-Net localiza granos (SOD) en preprocesamiento (`.seg`) **y** en inferencia full-image.  
-> La **clasificación de especie** la hace el best model (AnalogyNet + slice-aware), no U²-Net.
+> **Rol dual:** U²-Net genera anotaciones `.seg` en preprocesamiento; **ViT-denso** (`localization_detector: vit_dense`) es el detector activo en inferencia full-image.  
+> La **clasificación de especie** la hace el best model (AnalogyNet + slice-aware), no el detector.
+
+### U²-Net — Preprocesamiento y backend legacy
 
 ### Arquitectura U²-Net
 
@@ -193,6 +197,30 @@ Saliency P(x,y)
   → N DetectedGrain: {bbox, contorno, saliency, centroide}
 ```
 
+### ViT-denso — Detector activo (inferencia E2E)
+
+**PollenViTDetector** (`vit_dense_detector.py`) usa un backbone DINOv2 con cabeza de segmentación densa. Produce mapas de saliencia pixel-level a 504 px (letterbox), superando U²-Net en recall sobre granos pequeños y campos densos.
+
+**Estrategia coarse-to-fine** (`coarse_fine_detection.py`, `detection_strategy: coarse_fine`):
+
+| Etapa | Función |
+|-------|---------|
+| **Coarse** | Paso global único sobre imagen (o `max_load_side`) |
+| **Supplement** | Sliding-window + picos de saliencia para granos omitidos |
+| **Verify** | Re-detección local por candidato |
+| **Quality gates** | Filtros pre-clasificación (`detection_quality.py`) |
+
+**Quality gates configurables** (sin umbrales hardcodeados):
+
+| Gate | Propósito |
+|------|-----------|
+| `reject_edge_partial` | Descarta granos parcialmente cortados en borde |
+| `split_multi_peak_enabled` | Separa blobs fusionados (watershed en saliencia) |
+| `reject_multi_peak_area_frac` | Rechaza bboxes grandes con múltiples picos (fusión) |
+| `classification_bbox` | Crop tight alineado con entrenamiento `.seg` (≠ `bbox` display) |
+
+**Referencias:** Oquab et al., 2024 (DINOv2); Felzenszwalb et al., 2010 (cascada); Veta et al., 2016 (tiling en microscopía).
+
 ---
 
 ## Etapa 3 — Formato .seg y Dataset On-The-Fly
@@ -223,19 +251,15 @@ Inicialización:
 __getitem__(idx):
   1. Leer imagen original (cache LRU)
   2. Extraer crop cuadrado con padding 20%
-  3. Aplicar máscara del contorno → Gray background (128)
+  3. Aplicar máscara del contorno → fondo `imagenet_neutral`
   4. Resize a 252×252
   5. Aplicar transforms (Albumentations o torchvision)
   6. Return (tensor, class_idx) o (tensor, class_idx, mask)
 ```
 
-### Gray Background: Justificación Matemática
+### Fondo neutral ImageNet: Justificación Matemática
 
-Después de normalización ImageNet ($\mu = [0.485, 0.456, 0.406]$, $\sigma = [0.229, 0.224, 0.225]$):
-
-$$\text{gray}_{norm} = \frac{128/255 - \mu}{\sigma} \approx (0.07, 0.02, -0.03) \approx \mathbf{0}$$
-
-Los patches de fondo gris producen activaciones **~cero** en DINOv2 → contribuyen mínimamente al mean pooling sin necesidad de masked pooling explícito.
+Tras normalización ImageNet ($\mu = [0.485, 0.456, 0.406]$, $\sigma = [0.229, 0.224, 0.225]$), el color neutral en espacio normalizado es $\mathbf{0}$. Los píxeles fuera del contorno contribuyen mínimamente al pooling enmascarado — coherente con train e inferencia (`mask_background: imagenet_neutral`).
 
 ---
 
@@ -259,7 +283,7 @@ Los patches de fondo gris producen activaciones **~cero** en DINOv2 → contribu
 | 12 | **Domain** | CoarseDropout(1–3 huecos, fill=128, p=0.15) | Oclusiones (burbujas) |
 | 13 | **Norm** | Normalize(μ_ImageNet, σ_ImageNet) + ToTensorV2 | Compatibilidad DINOv2 |
 
-**Todos los bordes/huecos rellenados con gris (128)** — consistencia con gray background.
+**Todos los bordes/huecos rellenados con fondo neutral** — consistencia con `imagenet_neutral` en train e inferencia.
 
 **Validación:** Solo `Resize(252) → Normalize → ToTensor` (sin augmentación).
 
@@ -495,8 +519,8 @@ training:
     params:
       num_slices: 4       # S — controla rango espectral
 grain_detection:
-  localization_detector: u2net
-  discovery_mode: false
+  localization_detector: vit_dense
+  detection_strategy: coarse_fine
   masked_pooling: true
 ```
 
@@ -522,7 +546,7 @@ Implementación (2026-06-11): **`docs/2026-06-11_IMPLEMENTACION_POOLING_SLICE_CH
 - Checkpoint e informe alineados con `validation_metric` (mAP@R).
 - `val_loss` de validación usa `prenorm` en sliced_ms.
 - Post-training separa métricas slice-aware vs 1-NN LOO.
-- Inferencia full-image sin atención ViT como detector (`PollenGrainDetector` / U²-Net).
+- Inferencia full-image con ViT-denso coarse-fine (`PollenViTDetector`) + quality gates configurables.
 - Validator rechaza regularizadores no implementados.
 
 Registro completo: [`docs/2026-06-12_17-44-00_REGISTRO_DML_PIPELINE_REFERENCIAS.md`](docs/2026-06-12_17-44-00_REGISTRO_DML_PIPELINE_REFERENCIAS.md)
@@ -563,37 +587,56 @@ Pipeline automatizado de **9 etapas** sobre el mejor modelo:
 
 ## Etapa 9 — Inferencia End-to-End
 
-Pipeline en **dos etapas** (localizar → identificar), estándar en microscopía automatizada:
+Pipeline en **dos etapas** (localizar → identificar), estándar en microscopía automatizada (Litjens et al., 2017):
 
 ```
 Imagen cámara (cualquier resolución)
   │
-  ├── PollenGrainDetector (U²-Net SOD + morfología polen) → N granos
+  ├── PollenViTDetector (ViT-denso + coarse-fine + quality gates) → N granos
+  │     coarse → supplement (SW) → verify → split → NMS → quality filter
   │
-  └── Para cada grano:
-        Crop + padding → Máscara contorno → fondo imagenet_neutral
-        → Val transform → AnalogyNet(mask si masked_pooling) → ê ∈ S^127
+  └── Para cada grano (toda detección se clasifica; sin drop silencioso):
+        Crop con classification_bbox + padding → Máscara contorno
+        → fondo imagenet_neutral → Val transform
+        → AnalogyNet(mask si masked_pooling) → ê ∈ S^127
         → SliceAwareClassifier vs slice_representatives.pt
   │
-  └── Resultado: imagen anotada + conteo por especie + heatmaps opcionales (Grad-CAM del ViT)
+  └── Resultado: imagen anotada + conteo por especie + heatmaps (Grad-CAM con classification_bbox)
 ```
 
 | Etapa | Módulo | Tarea | ¿Entrena? |
 |-------|--------|-------|-----------|
-| Localización | `PollenGrainDetector` | Dónde está el grano | No (SOD fijo) |
+| Localización | `PollenViTDetector` + `coarse_fine_detection` | Dónde está el grano | Sí (detector aparte) |
+| Quality gates | `detection_quality.py` | Filtra parciales/fusionados | No (config) |
 | Identificación | AnalogyNet + `SliceAwareClassifier` | Qué especie es | Sí (best checkpoint) |
 
-Config (`grain_detection`):
+Config activa (`grain_detection`):
 
 ```yaml
-localization_detector: u2net   # u2net (default) | vit (legacy: atención ViT)
-discovery_mode: false          # true = multi-umbral agresivo (más FP)
-adaptive_k: 0.3                # umbral adaptativo saliency
-min_area: 1000                 # área mínima grano (px²)
-min_circularity: 0.3           # filtro morfológico polen
+localization_detector: vit_dense
+detection_strategy: coarse_fine
+sliding_window_enabled: true
+max_load_side: 1536
+nms_iou_threshold: 0.5
+crop_padding: 0.2
+detector_bbox_expand_frac: 0.0      # crop tight = entrenamiento .seg
+max_area_frac: 0.15
+reject_edge_partial: true
+split_multi_peak_enabled: true
+reject_multi_peak_area_frac: 0.055  # solo multi-pico, no por tamaño
+drop_low_confidence_detections: false
 ```
 
-`ModelGrainDetector` (atención ViT) queda como backend legacy (`localization_detector: vit`).
+**Backends alternativos:** `u2net` (SOD clásico), `vit` (atención ViT legacy, `ModelGrainDetector`).
+
+**Scripts de validación E2E:**
+
+```bash
+python scripts/regenerate_fullimage_folder.py   # Regenera galería val/test
+python scripts/analyze_gallery_folder.py        # Métricas E2E → gallery_analysis.json
+```
+
+**Revisión bibliográfica y registro de cambios:** [`docs/2026-06-13_REVISION_BIBLIOGRAFICA_Y_PIPELINE_E2E.md`](docs/2026-06-13_REVISION_BIBLIOGRAFICA_Y_PIPELINE_E2E.md)
 
 ---
 
@@ -636,20 +679,32 @@ El sistema auto-detecta el tipo de backbone y selecciona el método correcto aut
 
 ---
 
-### Resultados Experimentales
+## Resultados Experimentales
 
-El sistema ha sido validado con múltiples configuraciones de backbone (ResNet, ConvNeXt, DINOv2) y funciones de pérdida (Triplet, Multi-Similarity, ArcFace, **Sliced MS**). Los mejores resultados para el estudio actual se obtienen con:
+### Clasificación (DML aislado, crops `.seg`)
 
-- **Backbone:** DINOv2 ViT-S/14
-- **Loss:** `sliced_ms` (4×32D) + LDM
-- **Inferencia:** `SliceAwareClassifier` + `FullImageClassifier`
+| Componente | Configuración |
+|------------|---------------|
+| **Backbone** | DINOv2 ViT-S/14 (21M parámetros) |
+| **Embedding** | 128D en $\mathbb{S}^{127}$ |
+| **Loss** | `sliced_ms` (4×32D) + LDM |
+| **Inferencia** | `SliceAwareClassifier` + representantes por slice |
+| **Accuracy aislado (val)** | ~97.5% |
 
-- **Backbone:** DINOv2 ViT-S/14 (21M parámetros)
-- **Embedding:** 128 dimensiones (hiperesfera S^127)
-- **Loss:** `sliced_ms` (Sliced Multi-Similarity + LDM)
-- **Augmentaciones:** Gray background (128) + máscara de contorno
+### Inferencia end-to-end (galería val, 46 imágenes)
 
-Las métricas de evaluación incluyen Recall@K, NMI, mAP@R y F1-Score Macro siguiendo protocolos estándar de Deep Metric Learning (CUB-200, Stanford Online Products).
+Run: `runs/2026-06-13_09-50-06` · Detector: `runs/2026-06-13_03-02-32/detector/best_detector.pth`
+
+| Métrica | Valor |
+|---------|-------|
+| **E2E legacy** (clasificados correctos / total detectados) | **89.5%** (85/95) |
+| **Recall detección** (anotados `.seg` con IoU ≥ 0.3) | **95.1%** (77/81) |
+| **Clasificación en matched** | **90.8%** |
+| Gevuina avellana / Anthemis cotula / Eucryphia | **100%** |
+
+La brecha clasificador aislado (~97%) vs E2E (~90%) refleja principalmente errores de **localización**, no capacidad discriminativa del ViT.
+
+Métricas de evaluación DML: R@K, NMI, mAP@R, F1-macro (protocolo MLRC, Musgrave et al., ECCV 2020).
 
 ---
 
@@ -672,8 +727,14 @@ MeliVision/
 │   │       └── u2net.py                # Arquitectura U²-Net / U²-NETP
 │   │
 │   ├── grain_detection/                # Pipeline de detección
+│   │   ├── vit_dense_detector.py       # PollenViTDetector (backend activo)
+│   │   ├── coarse_fine_detection.py    # Coarse → supplement → verify
+│   │   ├── detection_quality.py        # Quality gates configurables
+│   │   ├── grain_crop_utils.py         # Crops/masks unificados train↔infer
+│   │   ├── detected_grain.py           # DetectedGrain + classification_bbox
+│   │   ├── detection_profiles.py       # Presets sensitive/balanced/strict
 │   │   ├── salient_detector.py         # Wrapper U²-Net (SOD)
-│   │   ├── grain_detector.py           # PollenGrainDetector (localización)
+│   │   ├── grain_detector.py           # PollenGrainDetector (U²-Net)
 │   │   ├── model_grain_detector.py     # Backend legacy (atención ViT)
 │   │   ├── seg_format.py               # Parser/Writer formato .seg
 │   │   ├── annotator.py                # SegmentationAnnotator (batch)
@@ -706,7 +767,9 @@ MeliVision/
 │
 ├── scripts/
 │   ├── train.py                        # Entrenamiento completo
-│   └── post_training.py               # Análisis post-entrenamiento (9 etapas)
+│   ├── post_training.py               # Análisis post-entrenamiento (9 etapas)
+│   ├── regenerate_fullimage_folder.py  # Regenera galería E2E + Grad-CAM
+│   └── analyze_gallery_folder.py       # Métricas E2E sobre galería
 │
 ├── lib/                                # Interfaz gráfica (PyQt5)
 │   ├── gui_app.py                      # Ventana principal (5 tabs)
@@ -730,7 +793,7 @@ MeliVision/
 | **Deep Learning** | PyTorch ≥ 2.0 | Framework base |
 | **Metric Learning** | pytorch-metric-learning ≥ 2.0 | Losses, miners, samplers |
 | **Vision Transformer** | DINOv2 (torch.hub) | Backbone ViT-S/14 |
-| **Object Detection** | U²-Net (custom) | Detección de granos (SOD) |
+| **Object Detection** | ViT-denso + U²-Net (custom) | Localización granos (SOD) |
 | **Augmentación** | Albumentations 2.0 | Pipeline de augmentación |
 | **Búsqueda vectorial** | FAISS | Índices para k-NN |
 | **Visualización** | matplotlib, seaborn | Gráficos y heatmaps |
@@ -769,13 +832,25 @@ MeliVision/
 
 **Auditoría bibliográfica (correcciones Ashikhmin, Macenko, venues):** [`docs/20260207_172200_REVISION_REFERENCIAS_SOTA.md`](docs/20260207_172200_REVISION_REFERENCIAS_SOTA.md)
 
+## Documentación académica
+
+| Documento | Contenido |
+|-----------|-----------|
+| [`docs/2026-06-13_REVISION_BIBLIOGRAFICA_Y_PIPELINE_E2E.md`](docs/2026-06-13_REVISION_BIBLIOGRAFICA_Y_PIPELINE_E2E.md) | **Revisión bibliográfica** (física, ingeniería, palinología) + registro E2E |
+| [`docs/2026-06-12_17-44-00_REGISTRO_DML_PIPELINE_REFERENCIAS.md`](docs/2026-06-12_17-44-00_REGISTRO_DML_PIPELINE_REFERENCIAS.md) | Registro DML, correcciones P0/P1 |
+| [`docs/2026-06-12_PLAN_CUMPLIMIENTO_ACADEMICO_SOTA.md`](docs/2026-06-12_PLAN_CUMPLIMIENTO_ACADEMICO_SOTA.md) | Plan cumplimiento IEEE/SOTA |
+| [`docs/2026-06-11_PLAN_IMPLEMENTACION_POOLING_SLICE_ALIGNED.md`](docs/2026-06-11_PLAN_IMPLEMENTACION_POOLING_SLICE_ALIGNED.md) | Pooling configurable + slicing |
+
 **Plan cumplimiento académico SOTA:** [`docs/2026-06-12_PLAN_CUMPLIMIENTO_ACADEMICO_SOTA.md`](docs/2026-06-12_PLAN_CUMPLIMIENTO_ACADEMICO_SOTA.md)
+
+**Revisión bibliográfica E2E (ingeniería + física):** [`docs/2026-06-13_REVISION_BIBLIOGRAFICA_Y_PIPELINE_E2E.md`](docs/2026-06-13_REVISION_BIBLIOGRAFICA_Y_PIPELINE_E2E.md)
 
 **Ablaciones F-01…F-07:** `python scripts/run_ablation_matrix.py --matrix pooling --dry-run`
 
 ---
 
-**Versión:** 6.2 (inferencia two-stage: U²-Net localiza, ViT clasifica)  
-**Última actualización:** 2026-06-11  
+**Versión:** 7.0 (inferencia two-stage: ViT-denso coarse-fine localiza, ViT clasifica)  
+**Última actualización:** 2026-06-13  
 **Registro DML y referencias:** [`docs/2026-06-12_17-44-00_REGISTRO_DML_PIPELINE_REFERENCIAS.md`](docs/2026-06-12_17-44-00_REGISTRO_DML_PIPELINE_REFERENCIAS.md)  
+**Revisión bibliográfica y pipeline E2E:** [`docs/2026-06-13_REVISION_BIBLIOGRAFICA_Y_PIPELINE_E2E.md`](docs/2026-06-13_REVISION_BIBLIOGRAFICA_Y_PIPELINE_E2E.md)  
 **Plan cumplimiento académico:** [`docs/2026-06-12_PLAN_CUMPLIMIENTO_ACADEMICO_SOTA.md`](docs/2026-06-12_PLAN_CUMPLIMIENTO_ACADEMICO_SOTA.md)

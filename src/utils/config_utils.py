@@ -52,6 +52,51 @@ def resolve_run_config_path(checkpoint_path: str, fallback: str = "config.yaml")
     return fallback
 
 
+def merge_global_active_detector(config: Dict, global_config_path: str = "config.yaml") -> Dict:
+    """
+    Aplica grain_detection.active_detector del config.yaml del proyecto.
+
+    El entrenamiento DML usa siempre .seg; el detector activo (U²-Net / ViT-denso)
+    se elige en la pestaña Detección y debe usarse en inferencia y evaluación E2E,
+    aunque el snapshot del run tenga otro valor.
+    """
+    path = Path(global_config_path)
+    if not path.is_absolute():
+        for base in (Path.cwd(), Path(__file__).resolve().parents[2]):
+            candidate = base / path
+            if candidate.exists():
+                path = candidate
+                break
+    if not path.exists():
+        return config
+    try:
+        global_cfg = load_config(str(path))
+    except FileNotFoundError:
+        return config
+    active = (global_cfg.get("grain_detection") or {}).get("active_detector")
+    global_gd = global_cfg.get("grain_detection") or {}
+    merged = dict(config)
+    gd = dict(merged.get("grain_detection") or {})
+    # Global grain_detection is the source of truth for inference (no key whitelist).
+    for key, value in global_gd.items():
+        if key == "active_detector":
+            continue
+        gd[key] = value
+    if active and active.get("backend"):
+        gd["active_detector"] = active
+        backend = str(active.get("backend", "")).lower()
+        if backend:
+            gd["localization_detector"] = backend
+    merged["grain_detection"] = gd
+    if active and active.get("backend"):
+        logger.info(
+            "[config] active_detector desde %s → backend=%s",
+            path,
+            active.get("backend"),
+        )
+    return merged
+
+
 def get_transforms_from_config(config: Dict, mode: str = 'val'):
     """
     Obtiene transforms desde configuración.

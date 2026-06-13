@@ -54,6 +54,7 @@ data:
   val_dir: data/processed/val
   test_dir: data/processed/test
   annotation_root: data/annotations
+  crop_source: seg
   classes_per_batch: 8
   samples_per_class: 2
   batch_size: 16
@@ -249,18 +250,72 @@ sota:
     enabled: true
     lambda: 0.1
     t: 2.0
+detection_training:
+  enabled: true
+  input_size: 504
+  patch_size: 14
+  epochs: 25
+  batch_size: 8
+  val_batch_size: 8
+  num_workers: 4
+  max_train_images: 3000
+  max_val_images: 600
+  val_fast: false
+  val_det_f1_max_images: 400
+  learning_rate: 0.0001
+  backbone_lr_factor: 0.1
+  weight_decay: 0.01
+  optimizer: adamw
+  scheduler: cosine
+  scheduler_params:
+    T_max: 25
+    eta_min: 1.0e-06
+  loss:
+    type: bce_dice
+    bce_weight: 0.5
+    dice_weight: 0.5
+  validation_metric: det_f1
+  vis_every_n_images: 50
+  early_stopping:
+    enabled: true
+    patience: 10
+    min_delta: 0.005
+    restore_best_weights: true
+  freeze_backbone: true
+  num_unfrozen_blocks: 2
+  save_best_only: true
+  log_interval: 20
+  visualize_every_n_epochs: 5
+  vis_samples_per_epoch: 6
+  auto_evaluate: true
+  use_h5_cache: true
+  augmentation:
+    random_horizontal_flip: 0.5
+    random_vertical_flip: 0.5
+    random_rotation: 90
+    color_jitter_brightness: 0.2
 grain_detection:
   enabled: true
-  localization_detector: u2net
+  detection_profile: balanced
+  localization_detector: vit_dense
+  active_detector:
+    backend: vit_dense
+    checkpoint: C:\Users\askna\Documents\GitHub\MetricLearning\runs\2026-06-13_03-02-32\detector\best_detector.pth
+    label: ViT-denso @ 2026-06-13_03-02-32
+    loaded_at: '2026-06-13T09:35:38'
   discovery_mode: false
   model_type: u2netp
   input_size: 320
   saliency_threshold: 0.3
-  adaptive_k: 0.3
-  min_area: 1000
-  max_area: 120000
+  adaptive_k: 0.22
+  min_area: 400
+  max_area: 100000
+  max_area_frac: 0.15
   morph_kernel_size: 3
-  min_circularity: 0.3
+  min_circularity: 0.32
+  max_bbox_side_frac: 0.4
+  max_aspect_ratio: 2.8
+  min_classifier_confidence: 0.35
   crop_padding: 0.2
   crop_size: 252
   use_mask: true
@@ -268,7 +323,47 @@ grain_detection:
   image_cache_size: 32
   image_cache_max_mb: 512
   max_cached_image_mb: 32
-  max_load_side: 512
+  max_load_side: 1536
+  nms_iou_threshold: 0.5
+  detection_strategy: coarse_fine
+  sliding_window_enabled: true
+  sliding_window_overlap: 0.25
+  sliding_window_stride: null
+  sliding_window_tile_size: null
+  sliding_window_k_boost: 0.05
+  supplement_detection_profile: sensitive
+  supplement_min_saliency: 0.42
+  supplement_min_peak: 0.38
+  verify_crop_padding: 0.45
+  verify_min_saliency: 0.32
+  verify_min_iou: 0.12
+  coarse_retain_min_saliency: 0.36
+  detector_bbox_expand_frac: 0.0
+  min_candidate_area: 1500
+  verify_detection_profile: sensitive
+  coarse_merge_iou: 0.28
+  coarse_supplement_merge_iou: 0.25
+  coarse_nms_iou: 0.32
+  peak_min_area: 800
+  peak_min_side: 28
+  peak_morph_kernel_size: 9
+  reject_max_area_frac: 0.14
+  reject_max_side_frac: null
+  drop_low_confidence_detections: false
+  min_visible_bbox_frac: 0.92
+  reject_edge_partial: true
+  edge_margin_frac: 0.008
+  min_edge_bbox_side_frac: 0.055
+  min_centroid_edge_inset_frac: 0.22
+  split_multi_peak_enabled: true
+  split_min_area_frac: 0.018
+  split_peak_min_saliency: 0.32
+  split_peak_min_area: 500
+  split_peak_morph_kernel: 3
+  min_saliency_fill_frac: 0.06
+  reject_multi_peak_area_frac: 0.055
+  min_classify_side_frac: 0.028
+  saliency_fill_threshold: 0.30
   distance_threshold: 0.7
   train_mask_bg_mode: imagenet_neutral
   val_mask_bg_mode: imagenet_neutral
@@ -349,3 +444,10 @@ inference:
   similarity_threshold: 0.6
   confidence_threshold: 0.8
   device: cuda
+gui:
+  detector_training:
+    resume: false
+    checkpoint: ''
+  dml_training:
+    resume: false
+    checkpoint: ''

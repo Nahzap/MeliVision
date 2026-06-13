@@ -33,6 +33,7 @@ class DetectedGrain:
     saliency_prob: float                    # Probabilidad U²-Net [0-1]
     centroid: Tuple[int, int]               # (cx, cy) en imagen original
     contour: Optional[np.ndarray] = None    # Puntos del contorno Nx2
+    classification_bbox: Optional[Tuple[int, int, int, int]] = None
 
     # --- Clasificación (Metric Learning) ---
     predicted_class: Optional[str] = None
@@ -60,6 +61,10 @@ class DetectedGrain:
     @property
     def h(self) -> int:
         return self.bbox[3]
+
+    def crop_bbox(self) -> Tuple[int, int, int, int]:
+        """Tight bbox for classifier crops (matches .seg training); never expanded."""
+        return self.classification_bbox or self.bbox
 
 
 @dataclass

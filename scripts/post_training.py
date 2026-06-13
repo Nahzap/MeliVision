@@ -2186,6 +2186,12 @@ def generate_fullimage_inference(model, slice_classifier, device, config, output
     all_results = {}
     total_grains = 0
     total_correct = 0
+    total_annotated = 0
+    total_matched_ann = 0
+    total_missed_ann = 0
+    total_extra_fp = 0
+    total_matched_cls_correct = 0
+    total_matched_cls_wrong = 0
 
     for cls_idx, cls_name in enumerate(class_names):
         cls_dir = annotation_root / cls_name
@@ -2272,6 +2278,8 @@ def generate_fullimage_inference(model, slice_classifier, device, config, output
             thickness = max(1, int(min(h_img, w_img) / 800))
 
             matched_ann = set()
+            img_matched_cls_ok = 0
+            img_matched_cls_bad = 0
             for g_idx, grain in enumerate(grains):
                 pred_cls_name = grain["predicted_class"]
                 pred_cls = (
@@ -2280,9 +2288,18 @@ def generate_fullimage_inference(model, slice_classifier, device, config, output
                 if pred_cls == cls_idx:
                     img_grains_correct += 1
 
+                best_iou = 0.0
                 for ann_i, ann in enumerate(annotated_grains):
-                    if _fullimage_bbox_iou(grain["bbox"], ann["bbox"]) >= 0.3:
+                    iou = _fullimage_bbox_iou(grain["bbox"], ann["bbox"])
+                    if iou >= 0.3:
                         matched_ann.add(ann_i)
+                    if iou > best_iou:
+                        best_iou = iou
+                if best_iou >= 0.3:
+                    if pred_cls == cls_idx:
+                        img_matched_cls_ok += 1
+                    else:
+                        img_matched_cls_bad += 1
 
                 if grain.get("crop") is not None:
                     crops_dir = gallery_dir / "crops"
@@ -2356,6 +2373,12 @@ def generate_fullimage_inference(model, slice_classifier, device, config, output
                 )
             )
             n_missed_annotated = n_annotated - len(matched_ann)
+            total_annotated += n_annotated
+            total_matched_ann += len(matched_ann)
+            total_missed_ann += n_missed_annotated
+            total_extra_fp += n_extra_discovered
+            total_matched_cls_correct += img_matched_cls_ok
+            total_matched_cls_wrong += img_matched_cls_bad
             total_grains += img_grains_total
             total_correct += img_grains_correct
             acc = img_grains_correct / img_grains_total if img_grains_total > 0 else 0
@@ -2429,6 +2452,46 @@ def generate_fullimage_inference(model, slice_classifier, device, config, output
         logger.info(f"  Full-image inference: {total_correct}/{total_grains} grains "
                      f"({overall_acc:.1%}) across {n_total_images} images -> {gallery_dir}")
 
+        matched_cls_total = total_matched_cls_correct + total_matched_cls_wrong
+        decomposed = {
+            "legacy_e2e_accuracy": overall_acc,
+            "legacy_correct": total_correct,
+            "legacy_total_detected": total_grains,
+            "detection_recall_on_annotated": (
+                total_matched_ann / total_annotated if total_annotated else 0.0
+            ),
+            "classification_on_matched_only": (
+                total_matched_cls_correct / matched_cls_total if matched_cls_total else 0.0
+            ),
+            "annotated_grains": total_annotated,
+            "matched_annotations": total_matched_ann,
+            "missed_annotations": total_missed_ann,
+            "false_positive_detections": total_extra_fp,
+            "matched_classification_correct": total_matched_cls_correct,
+            "matched_classification_wrong": total_matched_cls_wrong,
+        }
+        from src.grain_detection.detector_registry import get_active_detector_config
+
+        analysis_path = gallery_dir / "e2e_decomposed_metrics.json"
+        with open(analysis_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "active_detector": get_active_detector_config(config),
+                    "decomposed": decomposed,
+                    "per_class": all_results,
+                },
+                f,
+                indent=2,
+                ensure_ascii=False,
+            )
+        logger.info(
+            "  E2E decomposed — det_recall=%.1f%% cls_matched=%.1f%% legacy=%.1f%% → %s",
+            decomposed["detection_recall_on_annotated"] * 100,
+            decomposed["classification_on_matched_only"] * 100,
+            decomposed["legacy_e2e_accuracy"] * 100,
+            analysis_path,
+        )
+
     return all_results
 
 
@@ -2458,6 +2521,16 @@ def run_post_training_analysis(
         centroids: Legacy full centroids (kNN compat only)
     """
     run_dir = Path(run_dir)
+    from src.utils.config_utils import merge_global_active_detector
+    from src.grain_detection.detector_registry import get_active_detector_config
+
+    config = merge_global_active_detector(config, "config.yaml")
+    active_detector = get_active_detector_config(config)
+    logger.info(
+        "Post-training E2E usará detector: %s (backend=%s)",
+        active_detector.get("label"),
+        active_detector.get("backend"),
+    )
     class_names = loader.dataset.classes
     csv_path = run_dir / 'training_metrics.csv'
 
@@ -2674,6 +2747,7 @@ def run_post_training_analysis(
         'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'run_dir': str(run_dir),
         'prefix': prefix,
+        'active_detector': active_detector,
         'mlrc_protocol': mlrc_ci,
         'metric_learning': {
             'slice_accuracy': float(slice_accuracy),

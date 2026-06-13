@@ -28,6 +28,7 @@ from lib.config_editor import ConfigEditorTab
 from lib.dataset_manager_gui import DatasetManagerTab
 from lib.inference_tab import InferenceTab
 from lib.contour_analysis_tab import ContourAnalysisTab
+from lib.detector_training_tab import DetectionTrainingTab
 from lib.styles import Styles, Colors, apply_global_styles
 
 
@@ -135,6 +136,25 @@ class TrainingTab(QWidget):
             "color: #0e639c; font-size: 11px; padding: 4px; background: #e8f4f8; border-radius: 4px;"
         )
         config_layout.addRow("Estudio ablación:", self.ablation_summary_label)
+
+        self.crops_info_label = QLabel(
+            "<b>Flujo:</b> 1) Entrenar detector en <b>Detección</b> → "
+            "2) Seleccionar detector y <b>Guardar</b> → "
+            "3) Entrenar clasificador aquí (crops siempre desde <b>.seg</b>) → "
+            "4) Resultados E2E = clasificador + detector elegido."
+        )
+        self.crops_info_label.setWordWrap(True)
+        self.crops_info_label.setStyleSheet(
+            "color: #555; font-size: 11px; padding: 6px; background: #f5f5f5; border-radius: 4px;"
+        )
+        config_layout.addRow("Flujo:", self.crops_info_label)
+
+        self.detector_results_label = QLabel("Detector E2E: (cargando…)")
+        self.detector_results_label.setWordWrap(True)
+        self.detector_results_label.setStyleSheet(
+            "color: #0e639c; font-size: 11px; padding: 6px; background: #e8f4f8; border-radius: 4px;"
+        )
+        config_layout.addRow("Resultados E2E:", self.detector_results_label)
         
         # Checkpoint (opcional)
         checkpoint_layout = QHBoxLayout()
@@ -155,7 +175,12 @@ class TrainingTab(QWidget):
         
         # === Controles ===
         controls_layout = QHBoxLayout()
-        
+
+        self.save_btn = QPushButton("💾 Guardar")
+        self.save_btn.setStyleSheet(Styles.BUTTON_SAVE)
+        self.save_btn.setToolTip("Guardar opciones de esta pestaña en config.yaml")
+        self.save_btn.clicked.connect(self.save_form)
+
         self.estimate_btn = QPushButton("⏱️ Estimar Tiempo")
         self.estimate_btn.clicked.connect(self.estimate_time)
         
@@ -169,6 +194,7 @@ class TrainingTab(QWidget):
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.stop_training)
         
+        controls_layout.addWidget(self.save_btn)
         controls_layout.addWidget(self.estimate_btn)
         controls_layout.addWidget(self.train_btn)
         controls_layout.addWidget(self.stop_btn)
@@ -216,6 +242,98 @@ class TrainingTab(QWidget):
         if path:
             self.config_path.setText(path)
             self.refresh_ablation_summary(path)
+            self._load_tab_prefs(path)
+            self.refresh_detector_for_results_summary(path)
+
+    def refresh_detector_for_results_summary(self, config_path: str = None):
+        """Muestra qué detector se usará en resultados full-image del clasificador."""
+        from lib.gui_tab_prefs import load_config, resolve_config_path
+        from src.grain_detection.detector_registry import get_active_detector_config, validate_active_detector
+
+        path = config_path or self.config_path.text()
+        style_ok = (
+            "color: #0e639c; font-size: 11px; padding: 6px; background: #e8f4f8; border-radius: 4px;"
+        )
+        style_warn = (
+            "color: #d9480f; font-size: 11px; padding: 6px; background: #fff4e6; border-radius: 4px;"
+        )
+        try:
+            p = resolve_config_path(path)
+            if not p.exists():
+                self.detector_results_label.setText("Detector E2E: config no encontrada")
+                self.detector_results_label.setStyleSheet(style_warn)
+                return
+            cfg = load_config(p)
+            errors = validate_active_detector(cfg)
+            active = get_active_detector_config(cfg)
+            label = active.get("label") or active.get("backend", "?")
+            if errors:
+                self.detector_results_label.setText(
+                    "Detector E2E: <b>no configurado</b> — vaya a Detección, seleccione "
+                    f"su detector y pulse Guardar.<br>{errors[0]}"
+                )
+                self.detector_results_label.setStyleSheet(style_warn)
+            else:
+                saved = active.get("loaded_at")
+                saved_note = f" (guardado {saved})" if saved else ""
+                self.detector_results_label.setText(
+                    f"Detector E2E: <b>{label}</b>{saved_note} — "
+                    "se usará en full-image inference al terminar el entrenamiento."
+                )
+                self.detector_results_label.setStyleSheet(style_ok)
+        except Exception:
+            self.detector_results_label.setText("Detector E2E: error leyendo config")
+            self.detector_results_label.setStyleSheet(style_warn)
+
+    def _load_tab_prefs(self, config_path: str = None):
+        from lib.gui_tab_prefs import apply_dml_tab_to_widgets, load_config, resolve_config_path
+
+        path = config_path or self.config_path.text()
+        try:
+            p = resolve_config_path(path)
+            if p.exists():
+                apply_dml_tab_to_widgets(self, load_config(p))
+                self.refresh_detector_for_results_summary(str(p))
+        except Exception:
+            pass
+
+    def _ensure_dml_uses_seg(self):
+        """Entrenamiento DML siempre con .seg; no altera el detector activo de inferencia."""
+        from lib.gui_tab_prefs import load_config, resolve_config_path, save_config_full
+
+        p = resolve_config_path(self.config_path.text())
+        if not p.exists():
+            return
+        cfg = load_config(p)
+        cfg.setdefault("data", {})["crop_source"] = "seg"
+        save_config_full(p, cfg, backup=False)
+
+    def save_form(self):
+        from lib.gui_tab_prefs import (
+            _deep_update,
+            dml_tab_updates_from_widgets,
+            load_config,
+            resolve_config_path,
+            save_config_full,
+        )
+
+        try:
+            p = resolve_config_path(self.config_path.text())
+            if not p.exists():
+                QMessageBox.warning(self, "Error", f"No existe config: {p}")
+                return
+            cfg = load_config(p)
+            _deep_update(cfg, dml_tab_updates_from_widgets(self))
+            cfg.setdefault("data", {})["crop_source"] = "seg"
+            save_config_full(p, cfg)
+            self.status_label.setText("Opciones guardadas en config.yaml")
+            if self.parent_window and hasattr(self.parent_window, "log_widget"):
+                self.parent_window.log_widget.append_log(
+                    "Pestaña Entrenamiento DML guardada en config.yaml", "SUCCESS"
+                )
+            QMessageBox.information(self, "Guardado", "Opciones de entrenamiento guardadas en config.yaml")
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"No se pudo guardar:\n{exc}")
 
     def refresh_ablation_summary(self, config_path: str = None):
         """Lee evaluation.ablation del YAML y actualiza el resumen en la pestaña Entrenamiento."""
@@ -290,6 +408,34 @@ class TrainingTab(QWidget):
             gpu=None
         )
     
+    def _validate_detector_for_results(self) -> bool:
+        """Exige detector activo guardado antes de estimar/entrenar el clasificador."""
+        from lib.gui_tab_prefs import load_config, resolve_config_path
+        from src.grain_detection.detector_registry import get_active_detector_config, validate_active_detector
+
+        p = resolve_config_path(self.config_path.text())
+        if not p.exists():
+            return True
+        cfg = load_config(p)
+        errors = validate_active_detector(cfg)
+        if errors:
+            QMessageBox.warning(
+                self,
+                "Detector requerido",
+                "Antes de entrenar el clasificador debe elegir el detector para los resultados E2E:\n\n"
+                "1. Pestaña <b>Detección</b> → entrenar ViT-denso (o U²-Net)\n"
+                "2. Seleccionar checkpoint → <b>Guardar</b>\n"
+                "3. Volver aquí y estimar/entrenar\n\n"
+                + "\n".join(f"• {e}" for e in errors),
+            )
+            return False
+        active = get_active_detector_config(cfg)
+        self.parent_window.log_widget.append_log(
+            f"Resultados E2E usarán detector: {active.get('label', active.get('backend'))}",
+            "INFO",
+        )
+        return True
+
     def _validate_inputs(self):
         """Valida inputs y retorna True si son válidos"""
         if not self._warn_if_config_unsaved():
@@ -302,13 +448,15 @@ class TrainingTab(QWidget):
         if checkpoint_path and not Path(checkpoint_path).exists():
             QMessageBox.warning(self, "Error", "Checkpoint no encontrado")
             return False
+        if not self._validate_detector_for_results():
+            return False
         return True
     
     def estimate_time(self):
         """Estima tiempo de entrenamiento en background y escribe resultados al log"""
         if not self._validate_inputs():
             return
-        
+        self._ensure_dml_uses_seg()
         self.estimate_btn.setEnabled(False)
         self.train_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
@@ -526,7 +674,7 @@ class TrainingTab(QWidget):
         """Inicia entrenamiento directamente en thread separado"""
         if not self._validate_inputs():
             return
-        
+        self._ensure_dml_uses_seg()
         if not self._estimate_done or not self._run_dir:
             QMessageBox.warning(self, "Estimación requerida",
                 "Debes ejecutar 'Estimar Tiempo' antes de iniciar el entrenamiento.\n"
@@ -819,6 +967,7 @@ class MainWindow(QMainWindow):
         self.dataset_tab = DatasetManagerTab(self)
         self.contour_tab = ContourAnalysisTab(self)
         self.training_tab = TrainingTab(self)
+        self.detector_training_tab = DetectionTrainingTab(self)
         self.inference_tab = InferenceTab(self)
         self.evaluation_tab = EvaluationTab(self)
         
@@ -838,6 +987,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(dataset_scroll, "📊 Gestor de Datos")
         self.tabs.addTab(contour_scroll, "🔬 Análisis de Contornos")
         self.tabs.addTab(self.training_tab, "🚀 Entrenamiento")
+        self.tabs.addTab(self.detector_training_tab, "🎯 Detección")
         self.tabs.addTab(self.inference_tab, "🔍 Inferencia")
         self.tabs.addTab(self.evaluation_tab, "� Evaluación")
         
@@ -846,6 +996,8 @@ class MainWindow(QMainWindow):
         # Sync Config → Training al guardar y al arranque
         self.config_tab.configSaved.connect(self._on_config_saved)
         self.training_tab.sync_config_path(self.config_tab.get_config_path_str())
+        self.detector_training_tab.sync_config_path(self.config_tab.get_config_path_str())
+        self.detector_training_tab.detector_widget.detectorLoaded.connect(self._on_detector_loaded)
         
         splitter.addWidget(self.tabs)
         
@@ -921,6 +1073,7 @@ class MainWindow(QMainWindow):
             self.log_widget.append_log(f"Validación arranque OK — {summary}", "INFO")
 
         self.training_tab.refresh_ablation_summary(path)
+        self.detector_training_tab._refresh_summary()
     
     def log_widget_clear(self):
         """Limpia el widget de logs"""
@@ -928,13 +1081,22 @@ class MainWindow(QMainWindow):
         self.log_widget.append_log("Logs limpiados", "INFO")
     
     def _on_config_saved(self, config_path: str):
-        """Propaga la ruta YAML guardada a la pestaña de entrenamiento."""
+        """Propaga la ruta YAML guardada a pestañas dependientes."""
         self.training_tab.sync_config_path(config_path)
+        self.detector_training_tab.sync_config_path(config_path)
         self._run_startup_validation()
         self.training_tab.refresh_ablation_summary(config_path)
         self.log_widget.append_log(
-            f"Config sincronizada con Entrenamiento: {config_path}", "INFO"
+            f"Config sincronizada: {config_path}", "INFO"
         )
+
+    def _on_detector_loaded(self, payload: dict):
+        label = payload.get("label", payload.get("backend", "?"))
+        self.log_widget.append_log(f"Detector activo: {label}", "SUCCESS")
+        if hasattr(self, "training_tab"):
+            self.training_tab.refresh_detector_for_results_summary()
+        if hasattr(self, "_pipeline_status"):
+            self.status_bar.showMessage(f"Detector: {label} | {self._pipeline_status}")
     
     def _on_tab_changed(self, index):
         """Callback cuando se cambia de tab — actualiza header y registra"""
@@ -955,11 +1117,15 @@ class MainWindow(QMainWindow):
             0: "Configuracion del Sistema",
             1: "Gestion de Datasets",
             2: "Analisis de Contornos",
-            3: "Entrenamiento de Modelos",
-            4: "Inferencia y Prediccion",
-            5: "Evaluacion y Resultados",
+            3: "Entrenamiento DML",
+            4: "Entrenamiento Deteccion",
+            5: "Inferencia y Prediccion",
+            6: "Evaluacion y Resultados",
         }
-        tab_names = ["Configuracion", "Gestor de Datos", "Contornos", "Entrenamiento", "Inferencia", "Evaluacion"]
+        tab_names = [
+            "Configuracion", "Gestor de Datos", "Contornos",
+            "Entrenamiento DML", "Deteccion", "Inferencia", "Evaluacion",
+        ]
         if 0 <= index < len(tab_names):
             self.header.setText(f"MetricLearning  |  {tab_titles.get(index, '')}")
             pipeline = getattr(self, "_pipeline_status", "")
