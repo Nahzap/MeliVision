@@ -15,6 +15,7 @@ import logging
 from typing import Dict, Any, List
 
 from lib.styles import Styles, Colors
+from lib.active_detector_widget import ActiveDetectorWidget
 from src.utils.logging_utils import setup_logger
 from src.utils.run_artifact_utils import check_slice_inference_artifacts
 
@@ -148,11 +149,23 @@ class InferenceWorker(QThread):
             from src.utils.config_utils import resolve_run_config_path
 
             config_path = resolve_run_config_path(self.checkpoint, "config.yaml")
-            logger.info("Inicializando FullImageClassifier (slice-aware si hay artefactos)...")
+            logger.info("Inicializando FullImageClassifier (pipeline E2E: detectar + clasificar)...")
             classifier = FullImageClassifier.from_checkpoint(
                 checkpoint_path=self.checkpoint,
                 config_path=config_path,
                 k=self.k,
+            )
+            cls_mode = (
+                "slice-aware"
+                if classifier.slice_classifier is not None
+                else f"kNN (k={self.k})"
+            )
+            det_backend = getattr(classifier, "localization_backend", "?")
+            det_label = type(classifier.detector).__name__
+            strategy = classifier._grain_config.get("detection_strategy", "single_pass")
+            logger.info(
+                f"[E2E] Detector={det_backend} ({det_label}) | "
+                f"strategy={strategy} | Clasificador={cls_mode}"
             )
             
             # Buscar todas las imágenes en la carpeta
@@ -478,8 +491,11 @@ class InferenceWorker(QThread):
             report_gen = InferenceReportGenerator(output_dir=str(report_output_dir))
             
             model_info = {
-                'name': 'AnalogyNet + FullImageClassifier',
-                'checkpoint': self.checkpoint
+                'name': 'MeliVision E2E (ViT-dense + AnalogyNet)',
+                'checkpoint': self.checkpoint,
+                'detector_backend': getattr(classifier, 'localization_backend', ''),
+                'classifier_mode': cls_mode,
+                'detection_strategy': classifier._grain_config.get('detection_strategy', ''),
             }
             
             report_path = report_gen.generate_report(
@@ -630,7 +646,7 @@ class SingleImageInferenceWorker(QThread):
             from src.utils.config_utils import resolve_run_config_path
 
             config_path = resolve_run_config_path(self.checkpoint, "config.yaml")
-            logger.info("Single-image: FullImageClassifier (slice-aware si hay artefactos)...")
+            logger.info("Single-image E2E: FullImageClassifier (detectar + clasificar)...")
             classifier = FullImageClassifier.from_checkpoint(
                 checkpoint_path=self.checkpoint,
                 config_path=config_path,
@@ -641,9 +657,16 @@ class SingleImageInferenceWorker(QThread):
                 if classifier.slice_classifier is not None
                 else f"kNN (k={self.k})"
             )
+            det_backend = getattr(classifier, "localization_backend", "?")
+            strategy = classifier._grain_config.get("detection_strategy", "single_pass")
+            logger.info(
+                f"[E2E] Detector={det_backend} | strategy={strategy} | Clasificador={mode}"
+            )
             results = classifier.classify_full_image(self.image_path)
             self.finished.emit({
                 "classifier_mode": mode,
+                "detector_backend": det_backend,
+                "detection_strategy": strategy,
                 "results": results,
                 "image_path": self.image_path,
             })
@@ -671,13 +694,15 @@ class InferenceTab(QWidget):
         content_widget = QWidget()
         layout = QVBoxLayout()
         
-        # Modelo
-        model_group = QGroupBox("Modelo")
+        # Clasificador
+        model_group = QGroupBox("Clasificador (AnalogyNet)")
         model_layout = QFormLayout()
         
         checkpoint_layout = QHBoxLayout()
         self.checkpoint_input = QLineEdit()
-        self.checkpoint_input.setPlaceholderText("Selecciona el modelo entrenado (.pth)")
+        self.checkpoint_input.setPlaceholderText(
+            "Checkpoint del clasificador (ej. runs/.../checkpoints/best_model.pth)"
+        )
         checkpoint_btn = QPushButton("📁 Buscar")
         checkpoint_btn.clicked.connect(self.browse_checkpoint)
         checkpoint_layout.addWidget(self.checkpoint_input)
@@ -689,16 +714,48 @@ class InferenceTab(QWidget):
         self.artifact_status_label.setStyleSheet("color: #666; font-size: 9pt; padding: 2px 0;")
         model_layout.addRow("", self.artifact_status_label)
         self.checkpoint_input.textChanged.connect(self._update_checkpoint_artifact_status)
+        self.checkpoint_input.textChanged.connect(self._update_pipeline_status)
         
         model_group.setLayout(model_layout)
         layout.addWidget(model_group)
+
+        # Pipeline E2E: detector + clasificador
+        pipeline_group = QGroupBox("Pipeline E2E (detección + clasificación)")
+        pipeline_layout = QVBoxLayout()
+
+        pipeline_note = QLabel(
+            "Cada imagen de campo completo se procesa en dos fases: "
+            "<b>1)</b> localización de granos (ViT-denso / U²-Net) y "
+            "<b>2)</b> clasificación taxonómica (AnalogyNet slice-aware). "
+            "Configure el detector activo y pulse <i>Cargar detector</i>."
+        )
+        pipeline_note.setWordWrap(True)
+        pipeline_note.setStyleSheet("color: #555; font-size: 11px; margin-bottom: 4px;")
+        pipeline_layout.addWidget(pipeline_note)
+
+        self.detector_widget = ActiveDetectorWidget()
+        self.detector_widget.detectorLoaded.connect(lambda _: self._update_pipeline_status())
+        pipeline_layout.addWidget(self.detector_widget)
+
+        self.pipeline_status_label = QLabel("Configure clasificador y detector para ver el pipeline.")
+        self.pipeline_status_label.setWordWrap(True)
+        self.pipeline_status_label.setStyleSheet(
+            "color: #666; font-size: 9pt; padding: 4px 0; font-weight: bold;"
+        )
+        pipeline_layout.addWidget(self.pipeline_status_label)
+
+        pipeline_group.setLayout(pipeline_layout)
+        layout.addWidget(pipeline_group)
         
         # Modo de inferencia
         mode_group = QGroupBox("Modo de Inferencia")
         mode_layout = QVBoxLayout()
         
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["Carpeta Completa (con Reporte)", "Imagen Individual"])
+        self.mode_combo.addItems([
+            "Carpeta E2E (detectar + clasificar + reporte)",
+            "Imagen individual E2E",
+        ])
         self.mode_combo.currentIndexChanged.connect(self.toggle_inference_mode)
         mode_layout.addWidget(self.mode_combo)
         
@@ -711,7 +768,9 @@ class InferenceTab(QWidget):
         
         folder_dir_layout = QHBoxLayout()
         self.folder_path = QLineEdit()
-        self.folder_path.setPlaceholderText("Directorio con imágenes a clasificar")
+        self.folder_path.setPlaceholderText(
+            "Directorio con imágenes de microscopía (campo completo, sin recortar)"
+        )
         folder_browse = QPushButton("📁 Buscar")
         folder_browse.clicked.connect(self.browse_folder)
         folder_dir_layout.addWidget(self.folder_path)
@@ -722,12 +781,12 @@ class InferenceTab(QWidget):
         layout.addWidget(self.folder_group)
         
         # Imagen Individual
-        self.image_group = QGroupBox("Imagen a Clasificar")
+        self.image_group = QGroupBox("Imagen E2E (campo completo)")
         image_layout = QFormLayout()
         
         query_file_layout = QHBoxLayout()
         self.query_path = QLineEdit()
-        self.query_path.setPlaceholderText("Ruta a la imagen")
+        self.query_path.setPlaceholderText("Ruta a imagen de microscopía (se detectan y clasifican granos)")
         query_browse = QPushButton("📁 Buscar")
         query_browse.clicked.connect(self.browse_query)
         query_file_layout.addWidget(self.query_path)
@@ -762,6 +821,7 @@ class InferenceTab(QWidget):
         self.k_spin.setRange(1, 50)
         self.k_spin.setValue(5)
         options_layout.addRow("k vecinos:", self.k_spin)
+        self.k_spin.valueChanged.connect(self._update_pipeline_status)
         
         options_group.setLayout(options_layout)
         layout.addWidget(options_group)
@@ -828,7 +888,7 @@ class InferenceTab(QWidget):
         layout.addWidget(noise_group)
         
         # Botón Ejecutar
-        self.infer_btn = QPushButton("🔍 Ejecutar Inferencia")
+        self.infer_btn = QPushButton("Ejecutar pipeline E2E")
         self.infer_btn.setStyleSheet(Styles.BUTTON_PRIMARY)
         self.infer_btn.clicked.connect(self.run_inference)
         layout.addWidget(self.infer_btn)
@@ -855,6 +915,101 @@ class InferenceTab(QWidget):
         scroll.setWidget(content_widget)
         root_layout.addWidget(scroll)
         self.setLayout(root_layout)
+        self._update_pipeline_status()
+    
+    def _project_root(self) -> Path:
+        return Path(__file__).resolve().parent.parent
+
+    def _get_pipeline_summary(self) -> Dict[str, str]:
+        """Resumen legible del pipeline E2E (detector global + clasificador del run)."""
+        import yaml
+        from src.grain_detection.detector_registry import get_active_detector_config
+
+        summary: Dict[str, str] = {}
+        global_cfg_path = self._project_root() / "config.yaml"
+        if global_cfg_path.exists():
+            with open(global_cfg_path, encoding="utf-8") as f:
+                global_cfg = yaml.safe_load(f) or {}
+            active = get_active_detector_config(global_cfg)
+            backend = active.get("backend", "u2net")
+            label = active.get("label") or backend
+            ckpt = active.get("checkpoint")
+            if backend == "vit_dense" and ckpt:
+                ckpt_name = Path(str(ckpt)).name
+                summary["detector"] = f"{label} ({ckpt_name})"
+            else:
+                summary["detector"] = str(label)
+            gd = global_cfg.get("grain_detection") or {}
+            summary["strategy"] = str(gd.get("detection_strategy", "single_pass"))
+
+        checkpoint = self.checkpoint_input.text().strip()
+        if checkpoint and Path(checkpoint).exists():
+            info = check_slice_inference_artifacts(checkpoint)
+            if info["has_slice_representatives"]:
+                summary["classifier"] = "slice-aware (slice_representatives.pt)"
+            elif info["has_class_proxies"]:
+                summary["classifier"] = "slice-aware (class_proxies.pt)"
+            else:
+                summary["classifier"] = f"k-NN fallback (k={self.k_spin.value()})"
+            summary["classifier_ckpt"] = Path(checkpoint).name
+
+        return summary
+
+    def _update_pipeline_status(self):
+        """Actualiza la barra de estado del pipeline E2E en la UI."""
+        summary = self._get_pipeline_summary()
+        parts = []
+        if summary.get("classifier"):
+            ckpt = summary.get("classifier_ckpt", "")
+            parts.append(f"Clasificador: {summary['classifier']}" + (f" [{ckpt}]" if ckpt else ""))
+        if summary.get("detector"):
+            parts.append(f"Detector: {summary['detector']}")
+        if summary.get("strategy"):
+            parts.append(f"Estrategia: {summary['strategy']}")
+
+        if parts:
+            self.pipeline_status_label.setText(" | ".join(parts))
+            self.pipeline_status_label.setStyleSheet(
+                "color: #4ec9b0; font-size: 9pt; padding: 4px 0; font-weight: bold;"
+            )
+        else:
+            self.pipeline_status_label.setText(
+                "Configure checkpoint del clasificador y detector activo (pulse Cargar detector)."
+            )
+            self.pipeline_status_label.setStyleSheet(
+                "color: #ffa94d; font-size: 9pt; padding: 4px 0; font-weight: bold;"
+            )
+
+    def _validate_e2e_pipeline(self) -> bool:
+        """Verifica que el detector activo esté listo antes de ejecutar E2E."""
+        import yaml
+        from src.grain_detection.detector_registry import get_active_detector_config
+
+        global_cfg_path = self._project_root() / "config.yaml"
+        if not global_cfg_path.exists():
+            QMessageBox.warning(
+                self,
+                "Configuración no encontrada",
+                "No se encontró config.yaml en la raíz del proyecto.",
+            )
+            return False
+
+        with open(global_cfg_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        active = get_active_detector_config(cfg)
+        backend = active.get("backend", "u2net")
+        if backend == "vit_dense":
+            ckpt = active.get("checkpoint")
+            if not ckpt or not Path(str(ckpt)).exists():
+                QMessageBox.warning(
+                    self,
+                    "Detector no configurado",
+                    "ViT-denso requiere un checkpoint válido.\n\n"
+                    "Seleccione el detector en la sección Pipeline E2E y pulse "
+                    "'Cargar detector' antes de ejecutar.",
+                )
+                return False
+        return True
     
     def toggle_inference_mode(self):
         """Alterna entre modo carpeta e imagen individual"""
@@ -968,16 +1123,22 @@ class InferenceTab(QWidget):
         
         if not self._confirm_inference_artifacts(checkpoint):
             return
+
+        if not self._validate_e2e_pipeline():
+            return
         
         self.infer_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
         self.results_text.clear()
-        self.results_text.append("Procesando imagen (detección + clasificación slice-aware)...")
+        pipeline = self._get_pipeline_summary()
+        self.results_text.append("Procesando imagen E2E (detectar granos → clasificar)...")
+        self.results_text.append(f"Detector: {pipeline.get('detector', '?')}")
+        self.results_text.append(f"Clasificador: {pipeline.get('classifier', '?')}")
         
         if self.parent_window:
             self.parent_window.log_widget.append_log(
-                "Iniciando inferencia single-image (FullImageClassifier)...", "INFO"
+                "Iniciando inferencia E2E single-image (FullImageClassifier)...", "INFO"
             )
         
         k = self.k_spin.value()
@@ -992,6 +1153,8 @@ class InferenceTab(QWidget):
         self.progress_bar.setVisible(False)
         
         mode = payload["classifier_mode"]
+        det_backend = payload.get("detector_backend", "?")
+        strategy = payload.get("detection_strategy", "?")
         results = payload["results"]
         grains = results.get("grains", [])
         summary = results.get("summary", {})
@@ -999,9 +1162,10 @@ class InferenceTab(QWidget):
         
         self.results_text.clear()
         self.results_text.append("=" * 50)
-        self.results_text.append("RESULTADO DE CLASIFICACIÓN (IMAGEN INDIVIDUAL)")
+        self.results_text.append("RESULTADO PIPELINE E2E (IMAGEN INDIVIDUAL)")
         self.results_text.append("=" * 50)
-        self.results_text.append(f"\nModo clasificación: {mode}")
+        self.results_text.append(f"\nDetector: {det_backend} | Estrategia: {strategy}")
+        self.results_text.append(f"Modo clasificación: {mode}")
         self.results_text.append(f"Granos detectados: {summary.get('total_grains', len(grains))}")
         self.results_text.append(f"Tiempo: {summary.get('elapsed_ms', 0):.0f} ms")
         
@@ -1057,16 +1221,28 @@ class InferenceTab(QWidget):
         
         if not self._confirm_inference_artifacts(checkpoint):
             return
+
+        if not self._validate_e2e_pipeline():
+            return
         
         self.infer_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.results_text.clear()
-        self.results_text.append("🔄 Procesando carpeta...")
+        pipeline = self._get_pipeline_summary()
+        self.results_text.append("Procesando carpeta E2E (detectar + clasificar + reporte)...")
+        self.results_text.append(f"Detector: {pipeline.get('detector', '?')}")
+        self.results_text.append(f"Clasificador: {pipeline.get('classifier', '?')}")
+        if pipeline.get("strategy"):
+            self.results_text.append(f"Estrategia: {pipeline['strategy']}")
         
         if self.parent_window:
-            self.parent_window.log_widget.append_log("Iniciando inferencia en carpeta...", "INFO")
+            self.parent_window.log_widget.append_log(
+                f"Iniciando pipeline E2E en carpeta | det={pipeline.get('detector', '?')} "
+                f"| cls={pipeline.get('classifier', '?')}",
+                "INFO",
+            )
         
         # Ejecutar en thread
         k = self.k_spin.value()
@@ -1132,7 +1308,7 @@ class InferenceTab(QWidget):
         
         self.results_text.clear()
         self.results_text.append("=" * 50)
-        self.results_text.append("INFERENCIA COMPLETADA")
+        self.results_text.append("PIPELINE E2E COMPLETADO")
         self.results_text.append("=" * 50)
         self.results_text.append(f"\nTotal imagenes procesadas: {total}")
         self.results_text.append(f"Total granos detectados: {total_grains}")
@@ -1170,10 +1346,10 @@ class InferenceTab(QWidget):
         # Abrir reporte automáticamente
         reply = QMessageBox.question(
             self,
-            "Reporte Generado",
-            f"Inferencia completada exitosamente.\n\n"
+            "Reporte E2E Generado",
+            f"Pipeline E2E completado.\n\n"
             f"Imagenes procesadas: {total}\n"
-            f"Granos detectados: {total_grains}\n"
+            f"Granos detectados y clasificados: {total_grains}\n"
             f"Reporte: {report_path}\n\n"
             f"Desea abrir el reporte ahora?",
             QMessageBox.Yes | QMessageBox.No

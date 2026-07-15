@@ -8,6 +8,8 @@ __pycache__/
 *$py.class
 *.so
 .Python
+paper
+/paper/
 build/
 develop-eggs/
 dist/
