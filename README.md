@@ -1,237 +1,326 @@
 # MeliVision
 
-Sistema de **microscopía automatizada** para clasificación de granos de polen mediante **Deep Metric Learning (DML)** con **DINOv2 Vision Transformer**.
+**Automated optical microscopy for pollen-grain classification using Deep Metric Learning (DML) with a DINOv2 Vision Transformer.**
 
-- **Localización (producción):** ViT-denso (DINOv2) + estrategia **coarse-to-fine** configurable + quality gates — inferencia full-image.
-- **Localización (preprocesamiento):** U²-Net (SOD) + morfología — generación de anotaciones `.seg`.
-- **DML:** AnalogyNet (ViT entrenado) aprende embeddings 128D en $\mathbb{S}^{127}$ y clasifica por slice.
-- **Inferencia cámara:** `PollenViTDetector` localiza → `FullImageClassifier` + best model clasifica.
+**Affiliation:** FLAME³ — Fundamental of Light, Applied optics and Microscale engineering, Experiments and Explorations, Universidad de Concepción, Chile.
 
----
+This repository accompanies a scientific manuscript prepared for *Scientific Reports* (Nature Portfolio). It provides the source code, configuration, and documentation required to reproduce the localisation, embedding, training, evaluation, and end-to-end inference pipelines described in the paper.
 
-## Tabla de Contenidos
-
-- [Contexto Científico](#contexto-científico)
-- [Pipeline Completo del Sistema](#pipeline-completo-del-sistema)
-- [Etapa 1 — Adquisición Óptica](#etapa-1--adquisición-óptica)
-- [Etapa 2 — Detección de Granos](#etapa-2--detección-de-granos)
-- [Etapa 3 — Formato .seg y Dataset On-The-Fly](#etapa-3--formato-seg-y-dataset-on-the-fly)
-- [Etapa 4 — Preprocesamiento y Augmentaciones](#etapa-4--preprocesamiento-y-augmentaciones)
-- [Etapa 5 — Modelo de Embedding (AnalogyNet + DINOv2)](#etapa-5--modelo-de-embedding-analogynet--dinov2)
-- [Etapa 6 — Entrenamiento (Sliced MS Loss)](#etapa-6--entrenamiento-sliced-ms-loss)
-- [Configuración declarativa y plan de alineación](#configuración-declarativa-y-plan-de-alineación)
-- [Etapa 7 — Evaluación y Métricas](#etapa-7--evaluación-y-métricas)
-- [Etapa 8 — Análisis Post-Entrenamiento](#etapa-8--análisis-post-entrenamiento)
-- [Etapa 9 — Inferencia End-to-End](#etapa-9--inferencia-end-to-end)
-- [Etapa 10 — Explicabilidad (Atención DINOv2)](#etapa-10--explicabilidad-atención-dinov2)
-- [Resultados Experimentales](#resultados-experimentales)
-- [Arquitectura de Software](#arquitectura-de-software)
-- [Referencias](#referencias)
-- [Documentación académica](#documentación-académica)
+| Component | Role |
+|-----------|------|
+| **Localisation (production)** | Dense ViT (DINOv2) + configurable coarse-to-fine strategy + quality gates — full-image inference |
+| **Localisation (preprocessing)** | U²-Net (SOD) + morphology — generation of `.seg` annotations |
+| **DML** | AnalogyNet (trained ViT) learns 128D embeddings on S^127 and classifies by slice |
+| **Camera inference** | `PollenViTDetector` localises → `FullImageClassifier` + best model classifies |
 
 ---
 
-## Contexto Científico
+## Table of Contents
 
-### Melisopalinología
+- [Scientific Context](#scientific-context)
+- [Repository Purpose (Scientific Reports)](#repository-purpose-scientific-reports)
+- [System Requirements](#system-requirements)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Full System Pipeline](#full-system-pipeline)
+- [Stage 1 — Optical Acquisition](#stage-1--optical-acquisition)
+- [Stage 2 — Grain Detection](#stage-2--grain-detection)
+- [Stage 3 — .seg Format and On-The-Fly Dataset](#stage-3--seg-format-and-on-the-fly-dataset)
+- [Stage 4 — Preprocessing and Augmentations](#stage-4--preprocessing-and-augmentations)
+- [Stage 5 — Embedding Model (AnalogyNet + DINOv2)](#stage-5--embedding-model-analogynet--dinov2)
+- [Stage 6 — Training (Sliced MS Loss)](#stage-6--training-sliced-ms-loss)
+- [Declarative Configuration and Alignment Plan](#declarative-configuration-and-alignment-plan)
+- [Stage 7 — Evaluation and Metrics](#stage-7--evaluation-and-metrics)
+- [Stage 8 — Post-Training Analysis](#stage-8--post-training-analysis)
+- [Stage 9 — End-to-End Inference](#stage-9--end-to-end-inference)
+- [Stage 10 — Explainability (DINOv2 Attention)](#stage-10--explainability-dinov2-attention)
+- [Experimental Results](#experimental-results)
+- [Software Architecture](#software-architecture)
+- [Data Availability](#data-availability)
+- [Code Availability](#code-availability)
+- [Citation](#citation)
+- [References](#references)
+- [Academic Documentation](#academic-documentation)
 
-La **melisopalinología** — estudio del contenido polínico de la miel — es fundamental para la certificación de origen geográfico y botánico. El análisis manual requiere microscopía óptica directa (>30 min/muestra) con alta dependencia del operador (Louveaux et al., 1978). Este sistema automatiza el proceso completo: detección, clasificación y conteo de granos de polen.
+---
 
-### ¿Por qué Deep Metric Learning?
+## Scientific Context
 
-A diferencia de clasificadores softmax con $C$ neuronas de salida fijas:
+### Melissopalynology
 
-| Propiedad | Clasificador Softmax | Deep Metric Learning |
-|-----------|---------------------|---------------------|
-| Nuevas especies | Re-entrenamiento completo | Solo agregar embeddings de referencia |
-| Escalabilidad | $O(C)$ neuronas finales | Base vectorial extensible |
-| Few-shot | Requiere muchos datos/clase | Funciona con pocas referencias |
-| Interpretabilidad | Logits abstractos | Distancias en espacio métrico |
-| Generalización | Solo clases vistas | Zero-shot a clases no vistas |
+**Melissopalynology** — the study of pollen content in honey — is essential for geographic and botanical origin certification. Manual analysis requires direct optical microscopy (>30 min/sample) with high operator dependence (Louveaux et al., 1978). This system automates the full process: detection, classification, and counting of pollen grains.
+
+### Why Deep Metric Learning?
+
+Unlike softmax classifiers with a fixed number C of output neurons:
+
+| Property | Softmax Classifier | Deep Metric Learning |
+|----------|--------------------|----------------------|
+| New species | Full re-training | Add reference embeddings only |
+| Scalability | O(C) final neurons | Extensible vector database |
+| Few-shot | Many samples per class | Works with few references |
+| Interpretability | Abstract logits | Distances in metric space |
+| Generalisation | Seen classes only | Zero-shot to unseen classes |
 
 ### Dataset
 
-El sistema soporta datasets con múltiples clases de polen. La partición estratificada recomendada es **70% train** · **15% val** · **15% test**.
+The system supports multi-class pollen datasets. The recommended stratified partition is **70% train** · **15% val** · **15% test**.
 
 ---
 
-## Pipeline Completo del Sistema
+## Repository Purpose (Scientific Reports)
+
+This repository is structured so that readers, referees, and independent researchers can:
+
+1. Inspect the exact software stack and declarative configuration (`config.yaml`).
+2. Reproduce training, evaluation, and end-to-end inference for the paper-associated code version.
+3. Access installation instructions, operating-system assumptions, dependencies, and demo entry points.
+4. Locate **Data Availability** and **Code Availability** statements consistent with Nature Portfolio / *Scientific Reports* policies.
+
+Custom code central to the conclusions of the manuscript is maintained under version control in this repository. Authors should mint a DOI for the paper-specific release (e.g. Zenodo / institutional archive) and cite that frozen version in the manuscript **Code Availability** statement.
+
+---
+
+## System Requirements
+
+| Item | Specification |
+|------|---------------|
+| **Operating system** | Windows 10/11, Linux, or macOS |
+| **Language** | Python ≥ 3.10 |
+| **Deep learning** | PyTorch ≥ 2.0 (CUDA recommended for training) |
+| **GPU (recommended)** | NVIDIA GPU with ≥ 8 GB VRAM for DINOv2 ViT-S/14 training |
+| **CPU-only** | Supported for inference demos; training is substantially slower |
+| **Disk** | Space for dataset images, `.seg` annotations, and `runs/` artefacts |
+
+---
+
+## Installation
+
+```bash
+git clone https://github.com/Nahzap/MeliVision.git
+cd MeliVision
+python -m venv .venv
+# Windows:
+.venv\Scripts\activate
+# Linux / macOS:
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+DINOv2 weights are downloaded via `torch.hub` on first use. U²-Net weights under `models/weights/` are fetched automatically when required.
+
+Validate declarative configuration:
+
+```bash
+python -c "from src.utils.config_validator import validate_config; import yaml; validate_config(yaml.safe_load(open('config.yaml')))"
+```
+
+Optional smoke test (pooling / slice layout):
+
+```bash
+python scripts/smoke_test_pooling_slice.py --config test_config.yaml
+```
+
+---
+
+## Quick Start
+
+**GUI (PyQt5):**
+
+```bash
+python app.py
+```
+
+**Training (DML):**
+
+```bash
+python scripts/train.py --config config.yaml
+```
+
+**Post-training analysis (9 stages):**
+
+```bash
+python scripts/post_training.py --run runs/<run_id>
+```
+
+**End-to-end gallery regeneration / metrics:**
+
+```bash
+python scripts/regenerate_fullimage_folder.py
+python scripts/analyze_gallery_folder.py
+```
+
+Expected outputs include annotated full-field images, per-species counts, Grad-CAM / attention heatmaps, and JSON/Markdown reports under `runs/`.
+
+---
+
+## Full System Pipeline
 
 ```
 ╔══════════════════════════════════════════════════════════════════╗
-║                   PIPELINE COMPLETO (10 ETAPAS)                  ║
+║                   FULL PIPELINE (10 STAGES)                      ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║                                                                   ║
 ║  ┌───────────────────┐                                            ║
-║  │ IMAGEN MICROSCOPIO │  Óptico, campo claro, sensor CCD/CMOS    ║
-║  │ (H × W × 3)       │  Iluminación Köhler, obj. 60x       ║
+║  │ MICROSCOPE IMAGE  │  Bright-field optics, CCD/CMOS sensor      ║
+║  │ (H × W × 3)       │  Köhler illumination, 60× objective        ║
 ║  └─────────┬─────────┘                                            ║
 ║            │                                                      ║
 ║            ▼                                                      ║
-║  ┌──────────────────────────────────────────┐                     ║
-║  ETAPA 2: U²-Net (SOLO preprocesamiento → .seg)                  ║
-║  │  Imagen → U²-NETP (320×320) → Saliencia  │                     ║
-║  │  → Umbral adaptativo → Morfología         │                     ║
-║  │  → Contornos → Filtrado (área, circ.)     │                     ║
-║  │  → N detecciones {bbox, contorno, prob}   │                     ║
-║  └─────────┬────────────────────────────────┘                     ║
+║  STAGE 2: U²-Net (preprocessing only → .seg)                     ║
+║  │  Image → U²-NETP (320×320) → Saliency                          ║
+║  │  → Adaptive threshold → Morphology                              ║
+║  │  → Contours → Filtering (area, circ.)                          ║
+║  │  → N detections {bbox, contour, prob}                          ║
+║  └─────────┬──────────────────────────────────────────────────────║
 ║            │                                                      ║
 ║            ▼                                                      ║
-║  ┌──────────────────────────────────────────┐                     ║
-║  │ ETAPA 3: Anotación .seg (texto plano)    │                     ║
-║  │  CERO imágenes adicionales en disco       │                     ║
-║  │  Formato: idx|cls|bbox|saliency|contorno  │                     ║
-║  └─────────┬────────────────────────────────┘                     ║
+║  │ STAGE 3: .seg annotation (plain text)                          ║
+║  │  ZERO extra images on disk                                     ║
+║  │  Format: idx|cls|bbox|saliency|contour                         ║
+║  └─────────┬──────────────────────────────────────────────────────║
 ║            │                                                      ║
 ║            ▼                                                      ║
-║  ┌──────────────────────────────────────────┐                     ║
-║  │ ETAPA 4-5: Crop + Mask + Augment + Embed │                     ║
-║  │  .seg + img → Crop cuadrado + padding     │                     ║
-║  │  → Máscara contorno → Gray bg (128)       │                     ║
-║  │  → Albumentations (geom+color+micro)      │                     ║
-║  │  → Normalización ImageNet                 │                     ║
-║  │                                           │                     ║
-║  │  ┌─────────────────────────────────────┐  │                     ║
-║  │  │ DINOv2 ViT-S/14 (21M params)       │  │                     ║
-║  │  │  Capas 3+11 → masked multi-spec    │  │                     ║
-║  │  │  (mean+max+std) → ℝ^1152 × 2       │  │                     ║
-║  │  ├─────────────────────────────────────┤  │                     ║
-║  │  │ Projection LF/HF → 64+64 + L2-Cat  │  │                     ║
-║  │  ├─────────────────────────────────────┤  │                     ║
-║  │  │ Embedding ê ∈ S^127 (128D)         │  │                     ║
-║  │  └─────────────────────────────────────┘  │                     ║
-║  └─────────┬────────────────────────────────┘                     ║
+║  │ STAGES 4–5: Crop + Mask + Augment + Embed                      ║
+║  │  .seg + img → Square crop + padding                            ║
+║  │  → Contour mask → Neutral grey bg (128)                        ║
+║  │  → Albumentations (geom+colour+micro)                          ║
+║  │  → ImageNet normalisation                                      ║
+║  │                                                                 ║
+║  │  DINOv2 ViT-S/14 (21M params)                                  ║
+║  │    Layers 3+11 → masked multi-spec                             ║
+║  │    (mean+max+std) → R^1152 × 2                                 ║
+║  │  Projection LF/HF → 64+64 + L2-Cat                             ║
+║  │  Embedding e-hat ∈ S^127 (128D)                                ║
+║  └─────────┬──────────────────────────────────────────────────────║
 ║            │                                                      ║
 ║            ▼                                                      ║
-║  ┌──────────────────────────────────────────┐                     ║
-║  │ ETAPA 6-8: Sliced MS + evaluación MLRC + post-training           ║
-║  │ ETAPA 9: Inferencia — ViT-denso coarse-fine → ViT clasifica    ║
-║  └─────────┬────────────────────────────────┘                     ║
+║  │ STAGES 6–8: Sliced MS + MLRC evaluation + post-training        ║
+║  │ STAGE 9: Inference — dense ViT coarse-fine → ViT classifies    ║
+║  └─────────┬──────────────────────────────────────────────────────║
 ║            │                                                      ║
 ║            ▼                                                      ║
-║  RESULTADO: {especie → conteo} + imagen anotada + heatmaps       ║
+║  RESULT: {species → count} + annotated image + heatmaps           ║
 ║                                                                   ║
 ╚══════════════════════════════════════════════════════════════════╝
 ```
 
 ---
 
-## Etapa 1 — Adquisición Óptica
+## Stage 1 — Optical Acquisition
 
-### Sistema Óptico
+### Optical System
 
-| Parámetro | Especificación |
+| Parameter | Specification |
 |-----------|---------------|
-| **Microscopio** | Óptico compuesto, campo claro |
-| **Objetivos** | 60x (inmersión en aceite) |
-| **Iluminación** | Köhler (campo uniforme) |
-| **Sensor** | CCD/CMOS digital, ≥ 1920×1080 |
-| **Preparación** | Acetólisis de Erdtman o montaje directo en glicerina |
+| **Microscope** | Compound optical, bright field |
+| **Objectives** | 60× (oil immersion) |
+| **Illumination** | Köhler (uniform field) |
+| **Sensor** | Digital CCD/CMOS, ≥ 1920×1080 |
+| **Preparation** | Erdtman acetolysis or direct glycerine mount |
 
-### Estructuras Diagnósticas del Grano de Polen
+### Diagnostic Pollen-Grain Structures
 
-| Estructura | Descripción | Relevancia taxonómica |
-|-----------|-------------|----------------------|
-| **Exina** | Capa externa esporopolinínica | Ornamentación específica de especie |
-| **Aperturas** | Colpos (surcos) y poros | Número y disposición definen tipos polínicos |
-| **Forma** | Esferoidal, prolato, oblato | Relación eje polar/ecuatorial |
-| **Ornamentación** | Reticulada, equinada, psilada, etc. | Diagnóstico a nivel de especie |
-| **Tamaño** | 10–200 μm | Diagnóstico a nivel de familia/género |
+| Structure | Description | Taxonomic relevance |
+|-----------|-------------|---------------------|
+| **Exine** | Outer sporopollenin layer | Species-specific ornamentation |
+| **Apertures** | Colpi (furrows) and pores | Number and arrangement define pollen types |
+| **Shape** | Spheroidal, prolate, oblate | Polar/equatorial axis ratio |
+| **Ornamentation** | Reticulate, echinate, psilate, etc. | Species-level diagnosis |
+| **Size** | 10–200 μm | Family/genus-level diagnosis |
 
-### Desafíos Ópticos
+### Optical Challenges
 
-| Desafío | Efecto | Augmentación compensatoria |
-|---------|--------|---------------------------|
-| Profundidad de campo limitada | Desenfoque parcial | Blur (kernel≤3) |
-| Variación de iluminación | Gradientes de brillo | ColorJitter, CLAHE |
-| Artefactos de preparación | Burbujas, residuos | CoarseDropout (fill=128) |
-| Orientación aleatoria | Vistas polar / ecuatorial | Rotate ±180°, Flip H/V |
-| Solapamiento de granos | Oclusiones parciales | Filtrado por circularidad |
-| Ruido electrónico | Shot noise + read noise | GaussNoise |
+| Challenge | Effect | Compensating augmentation |
+|-----------|--------|---------------------------|
+| Limited depth of field | Partial defocus | Blur (kernel ≤ 3) |
+| Illumination variation | Brightness gradients | ColorJitter, CLAHE |
+| Preparation artefacts | Bubbles, residues | CoarseDropout (fill=128) |
+| Random orientation | Polar / equatorial views | Rotate ±180°, Flip H/V |
+| Grain overlap | Partial occlusions | Circularity filtering |
+| Electronic noise | Shot + read noise | GaussNoise |
 
 ---
 
-## Etapa 2 — Detección de Granos
+## Stage 2 — Grain Detection
 
-> **Rol dual:** U²-Net genera anotaciones `.seg` en preprocesamiento; **ViT-denso** (`localization_detector: vit_dense`) es el detector activo en inferencia full-image.  
-> La **clasificación de especie** la hace el best model (AnalogyNet + slice-aware), no el detector.
+> **Dual role:** U²-Net generates `.seg` annotations during preprocessing; **dense ViT** (`localization_detector: vit_dense`) is the active detector for full-image inference.  
+> **Species classification** is performed by the best AnalogyNet + slice-aware model, not by the detector.
 
-### U²-Net — Preprocesamiento y backend legacy
+### U²-Net — Preprocessing and Legacy Backend
 
-### Arquitectura U²-Net
-
-U²-Net (Qin et al., 2020) es una red de detección de objetos salientes (SOD) que genera mapas de saliencia pixel-level sin necesidad de anotaciones de bounding box.
+U²-Net (Qin et al., 2020) is a salient object detection (SOD) network that produces pixel-level saliency maps without bounding-box annotations.
 
 ```
-Imagen RGB (320×320)
+RGB image (320×320)
     │
     ▼
-Encoder: 6 etapas RSU (Residual U-blocks)
-    │     RSU = U-Net anidado dentro de cada bloque
-    │     Captura contexto multi-escala a nivel de bloque
+Encoder: 6 RSU stages (Residual U-blocks)
+    │     RSU = nested U-Net inside each block
+    │     Multi-scale context at block level
     │     320×320 → 160×160 → ... → 20×20
     │
     ▼
-Decoder: 5 etapas RSU (skip connections)
-    │     6 side outputs fusionados
+Decoder: 5 RSU stages (skip connections)
+    │     6 fused side outputs
     │
     ▼
-Saliency P(x,y) ∈ [0, 1]   (probabilidad de objeto saliente)
+Saliency P(x,y) ∈ [0, 1]   (salient-object probability)
 
-Variantes:
-  U²-NET  : 44M params, 176 MB — máxima precisión
-  U²-NETP : 1.1M params, 4.7 MB — tiempo real (default)
+Variants:
+  U²-NET  : 44M params, 176 MB — maximum accuracy
+  U²-NETP : 1.1M params, 4.7 MB — real-time (default)
 ```
 
-### Post-Procesamiento
+### Post-Processing
 
 ```
 Saliency P(x,y)
-  → Umbral adaptativo: T = μ(P) + k·σ(P),  k=0.30,  T ∈ [0.15, 0.50]
-  → Binarización: B(x,y) = 1 si P(x,y) > T
-  → Morfología: Closing + Opening (kernel elíptico 3×3)
+  → Adaptive threshold: T = μ(P) + k·σ(P),  k=0.30,  T ∈ [0.15, 0.50]
+  → Binarisation: B(x,y) = 1 if P(x,y) > T
+  → Morphology: Closing + Opening (elliptical 3×3 kernel)
   → findContours(EXTERNAL)
-  → Filtrado:
-      Área ∈ [1000, 120000] px²
-      Circularidad: C = 4πA/P² ≥ 0.3
-  → N DetectedGrain: {bbox, contorno, saliency, centroide}
+  → Filtering:
+      Area ∈ [1000, 120000] px²
+      Circularity: C = 4πA/P² ≥ 0.3
+  → N DetectedGrain: {bbox, contour, saliency, centroid}
 ```
 
-### ViT-denso — Detector activo (inferencia E2E)
+### Dense ViT — Active Detector (E2E Inference)
 
-**PollenViTDetector** (`vit_dense_detector.py`) usa un backbone DINOv2 con cabeza de segmentación densa. Produce mapas de saliencia pixel-level a 504 px (letterbox), superando U²-Net en recall sobre granos pequeños y campos densos.
+**PollenViTDetector** (`vit_dense_detector.py`) uses a DINOv2 backbone with a dense segmentation head. It produces pixel-level saliency maps at 504 px (letterbox), outperforming U²-Net in recall on small grains and dense fields.
 
-**Estrategia coarse-to-fine** (`coarse_fine_detection.py`, `detection_strategy: coarse_fine`):
+**Coarse-to-fine strategy** (`coarse_fine_detection.py`, `detection_strategy: coarse_fine`):
 
-| Etapa | Función |
-|-------|---------|
-| **Coarse** | Paso global único sobre imagen (o `max_load_side`) |
-| **Supplement** | Sliding-window + picos de saliencia para granos omitidos |
-| **Verify** | Re-detección local por candidato |
-| **Quality gates** | Filtros pre-clasificación (`detection_quality.py`) |
+| Stage | Function |
+|-------|----------|
+| **Coarse** | Single global pass over the image (or `max_load_side`) |
+| **Supplement** | Sliding-window + saliency peaks for missed grains |
+| **Verify** | Local re-detection per candidate |
+| **Quality gates** | Pre-classification filters (`detection_quality.py`) |
 
-**Quality gates configurables** (sin umbrales hardcodeados):
+**Configurable quality gates** (no hard-coded thresholds outside config):
 
-| Gate | Propósito |
-|------|-----------|
-| `reject_edge_partial` | Descarta granos parcialmente cortados en borde |
-| `split_multi_peak_enabled` | Separa blobs fusionados (watershed en saliencia) |
-| `reject_multi_peak_area_frac` | Rechaza bboxes grandes con múltiples picos (fusión) |
-| `classification_bbox` | Crop tight alineado con entrenamiento `.seg` (≠ `bbox` display) |
+| Gate | Purpose |
+|------|---------|
+| `reject_edge_partial` | Reject grains partially cut at the image border |
+| `split_multi_peak_enabled` | Split fused blobs (watershed on saliency) |
+| `reject_multi_peak_area_frac` | Reject large multi-peak boxes (fusion) |
+| `classification_bbox` | Tight crop aligned with `.seg` training (≠ display `bbox`) |
 
-**Referencias:** Oquab et al., 2024 (DINOv2); Felzenszwalb et al., 2010 (cascada); Veta et al., 2016 (tiling en microscopía).
+**References:** Oquab et al., 2024 (DINOv2); Felzenszwalb et al., 2010 (cascade); Veta et al., 2016 (tiling in microscopy).
 
 ---
 
-## Etapa 3 — Formato .seg y Dataset On-The-Fly
+## Stage 3 — .seg Format and On-The-Fly Dataset
 
-### Formato de Anotación .seg
+### .seg Annotation Format
 
-Cada imagen tiene un archivo `.seg` de texto plano asociado (mismo nombre, extensión diferente):
+Each image has an associated plain-text `.seg` file (same stem, different extension):
 
 ```
-# Generado por: PollenGrainDetector (U2-NETP)
-# Imagen: Acaena_sp_001.png | Dimensiones: 1920x1080
+# Generated by: PollenGrainDetector (U2-NETP)
+# Image: Acaena_sp_001.png | Dimensions: 1920x1080
 # Params: threshold: 0.3 | adaptive_k: 0.3 | min_area: 1000
 #
 # grain_index | class_index | bbox_x,y,w,h | saliency | contour
@@ -239,124 +328,126 @@ Cada imagen tiene un archivo `.seg` de texto plano asociado (mismo nombre, exten
 1 | 0 | 512,340,65,71 | 0.847 | 512,360,516,348,524,342,...
 ```
 
-**Principio de diseño: CERO imágenes adicionales en disco.** Los crops se generan on-the-fly desde imagen original + coordenadas del `.seg`.
+**Design principle: ZERO additional images on disk.** Crops are generated on-the-fly from the original image + `.seg` coordinates.
 
 ### SegmentedGrainDataset
 
 ```
-Inicialización:
-  Escanea root/{clase}/*.seg → registra cada grano como sample
-  LRU cache de 64 imágenes originales
+Initialisation:
+  Scan root/{class}/*.seg → register each grain as a sample
+  LRU cache of 64 original images
 
 __getitem__(idx):
-  1. Leer imagen original (cache LRU)
-  2. Extraer crop cuadrado con padding 20%
-  3. Aplicar máscara del contorno → fondo `imagenet_neutral`
-  4. Resize a 252×252
-  5. Aplicar transforms (Albumentations o torchvision)
-  6. Return (tensor, class_idx) o (tensor, class_idx, mask)
+  1. Read original image (LRU cache)
+  2. Extract square crop with 20% padding
+  3. Apply contour mask → `imagenet_neutral` background
+  4. Resize to 252×252
+  5. Apply transforms (Albumentations or torchvision)
+  6. Return (tensor, class_idx) or (tensor, class_idx, mask)
 ```
 
-### Fondo neutral ImageNet: Justificación Matemática
+### ImageNet-Neutral Background: Mathematical Rationale
 
-Tras normalización ImageNet ($\mu = [0.485, 0.456, 0.406]$, $\sigma = [0.229, 0.224, 0.225]$), el color neutral en espacio normalizado es $\mathbf{0}$. Los píxeles fuera del contorno contribuyen mínimamente al pooling enmascarado — coherente con train e inferencia (`mask_background: imagenet_neutral`).
+After ImageNet normalisation (μ = [0.485, 0.456, 0.406], σ = [0.229, 0.224, 0.225]), the neutral colour in normalised space is the zero vector. Pixels outside the contour contribute minimally to masked pooling — consistent between train and inference (`mask_background: imagenet_neutral`).
 
 ---
 
-## Etapa 4 — Preprocesamiento y Augmentaciones
+## Stage 4 — Preprocessing and Augmentations
 
-### Pipeline Albumentations (Training)
+### Albumentations Pipeline (Training)
 
-| # | Grupo | Transformación | Justificación óptica |
-|---|-------|---------------|---------------------|
-| 1 | **Escala** | RandomResizedCrop(scale=0.8–1.0, p=0.5) | Variación de magnificación |
-| 2 | **Geom.** | HorizontalFlip (p=0.5) + VerticalFlip (p=0.5) | Sin orientación preferente |
-| 3 | **Geom.** | Rotate(±180°, p=0.8, fill=128) | Rotación arbitraria del portaobjetos |
-| 4 | **Geom.** | Affine(translate ±8%, scale 0.9–1.1, fill=128) | Posición variable en campo |
-| 5 | **Color** | ColorJitter(B=0.3, C=0.6, S=0.2, H=0.1, p=0.8) | Variabilidad de tinción |
-| 6 | **Micro** | RandomGamma(γ∈[80,120], p=0.5) | No-linealidad del sensor CCD |
-| 7 | **Micro** | GaussNoise(σ∈[10,50]/255, p=0.5) | Ruido electrónico |
-| 8 | **Micro** | Blur(kernel≤3, p=0.3) | Profundidad de campo limitada |
-| 9 | **Micro** | OpticalDistortion(0.1, p=0.3) | Aberraciones de Seidel |
-| 10 | **Micro** | CLAHE(clip=2, grid 8×8, p=0.5) | Iluminación Köhler imperfecta |
-| 11 | **Domain** | RGBShift(±20, p=0.3) | Balance de blancos |
-| 12 | **Domain** | CoarseDropout(1–3 huecos, fill=128, p=0.15) | Oclusiones (burbujas) |
-| 13 | **Norm** | Normalize(μ_ImageNet, σ_ImageNet) + ToTensorV2 | Compatibilidad DINOv2 |
+| # | Group | Transform | Optical justification |
+|---|-------|-----------|----------------------|
+| 1 | **Scale** | RandomResizedCrop(scale=0.8–1.0, p=0.5) | Magnification variation |
+| 2 | **Geom.** | HorizontalFlip (p=0.5) + VerticalFlip (p=0.5) | No preferred orientation |
+| 3 | **Geom.** | Rotate(±180°, p=0.8, fill=128) | Arbitrary slide rotation |
+| 4 | **Geom.** | Affine(translate ±8%, scale 0.9–1.1, fill=128) | Variable field position |
+| 5 | **Colour** | ColorJitter(B=0.3, C=0.6, S=0.2, H=0.1, p=0.8) | Staining variability |
+| 6 | **Micro** | RandomGamma(γ∈[80,120], p=0.5) | CCD sensor non-linearity |
+| 7 | **Micro** | GaussNoise(σ∈[10,50]/255, p=0.5) | Electronic noise |
+| 8 | **Micro** | Blur(kernel≤3, p=0.3) | Limited depth of field |
+| 9 | **Micro** | OpticalDistortion(0.1, p=0.3) | Seidel aberrations |
+| 10 | **Micro** | CLAHE(clip=2, grid 8×8, p=0.5) | Imperfect Köhler illumination |
+| 11 | **Domain** | RGBShift(±20, p=0.3) | White-balance drift |
+| 12 | **Domain** | CoarseDropout(1–3 holes, fill=128, p=0.15) | Occlusions (bubbles) |
+| 13 | **Norm** | Normalize(μ_ImageNet, σ_ImageNet) + ToTensorV2 | DINOv2 compatibility |
 
-**Todos los bordes/huecos rellenados con fondo neutral** — consistencia con `imagenet_neutral` en train e inferencia.
+**All borders/holes filled with neutral background** — consistent with `imagenet_neutral` in train and inference.
 
-**Validación:** Solo `Resize(252) → Normalize → ToTensor` (sin augmentación).
+**Validation:** Only `Resize(252) → Normalize → ToTensor` (no augmentation).
 
 ---
 
-## Etapa 5 — Modelo de Embedding (AnalogyNet + DINOv2)
+## Stage 5 — Embedding Model (AnalogyNet + DINOv2)
 
-### DINOv2 ViT-S/14 Backbone + pooling enmascarado
+### DINOv2 ViT-S/14 Backbone + Masked Pooling
 
-**DINOv2** (Oquab et al., 2023): foundation model SSL sobre LVD-142M. El proyecto **no usa el token CLS** para metric learning; agrega **patch tokens** de capas intermedias con estadísticas multi-espectrales y máscara del contorno.
+**DINOv2** (Oquab et al., 2023): SSL foundation model on LVD-142M. This project **does not use the CLS token** for metric learning; it aggregates **patch tokens** from intermediate layers with multi-spectral statistics and the contour mask.
 
 ```
-Imagen (3 × H × W)  +  máscara alineada con augmentations
+Image (3 × H × W)  +  mask aligned with augmentations
     │
     ▼
 ┌────────────────────────────────────────┐
-│ Patch Embedding (14×14) + 12 bloques   │
-│  Self-attention GLOBAL en cada capa    │
-│  (fondo gris ≈ 0 tras norm ImageNet)   │
+│ Patch Embedding (14×14) + 12 blocks    │
+│  GLOBAL self-attention at every layer  │
+│  (grey bg ≈ 0 after ImageNet norm)     │
 ├────────────────────────────────────────┤
 │ get_intermediate_layers(n=[3, 11])     │
-│  capa 3  → textura / baja semántica    │
-│  capa 11 → semántica / pre-final      │
+│  layer 3  → texture / low semantics    │
+│  layer 11 → semantics / pre-final      │
 ├────────────────────────────────────────┤
 │ Masked multi-spectral pooling          │
-│  por capa: mean + max + std            │
-│  solo patches con máscara > umbral       │
-│  DropToken (train, p configurable)      │
-│  → feat_lf, feat_hf ∈ ℝ^(3×384)=ℝ^1152 │
+│  per layer: mean + max + std           │
+│  only patches with mask > threshold    │
+│  DropToken (train, configurable p)     │
+│  → feat_lf, feat_hf ∈ R^(3×384)=R^1152 │
 ├────────────────────────────────────────┤
 │ projection_lf / projection_hf (MLP)    │
-│  1152 → 256 → 256 → 64 cada rama       │
+│  1152 → 256 → 256 → 64 per branch      │
 ├────────────────────────────────────────┤
-│ L2-Cat-L2 → ê ∈ S^127 (128D)          │
+│ L2-Cat-L2 → e-hat ∈ S^127 (128D)       │
 └────────────────────────────────────────┘
     │
     ▼
-Sliced MS Loss particiona 128D en S slices (default 4×32D)
+Sliced MS Loss partitions 128D into S slices (default 4×32D)
 ```
 
-**Nota:** la imagen **no** se multiplica por la máscara antes del ViT (artefactos posicionales). El filtrado es **post-atención**, en el pooling. Ver auditoría en `docs/20260210_1750_AUDITORIA_REGRESION_MASKED_POOLING.md`.
+**Note:** the image is **not** multiplied by the mask before the ViT (positional artefacts). Filtering is **post-attention**, in the pooling stage. See audit in `docs/20260210_1750_AUDITORIA_REGRESION_MASKED_POOLING.md`.
 
-### Relación pooling ↔ slices espectrales
+### Pooling ↔ Spectral Slices
 
-| Etapa | Qué hace | Efecto en capacidad discriminativa |
-|-------|----------|-----------------------------------|
-| **Pooling** | Comprime N patches → vector rico (mean/max/std, 2 capas) | Preserva morfología intra-grano (textura, heterogeneidad) |
-| **Proyección** | Comprime 1152D → 128D | Aprende qué features entran al espacio métrico |
-| **S slices** | Particiona 128D; MS+LDM independiente por slice | Eleva rango espectral efectivo ≈ S×(C−1) vs. colapso C−1 |
+| Stage | What it does | Effect on discriminative capacity |
+|-------|--------------|-----------------------------------|
+| **Pooling** | Compresses N patches → rich vector (mean/max/std, 2 layers) | Preserves intra-grain morphology (texture, heterogeneity) |
+| **Projection** | Compresses 1152D → 128D | Learns which features enter metric space |
+| **S slices** | Partitions 128D; independent MS+LDM per slice | Raises effective spectral rank ≈ S×(C−1) vs collapse to C−1 |
 
-Los slices N **no sustituyen** un buen pooling: amplifican la geometría métrica **si** las dimensiones de cada slice corresponden a fuentes de señal coherentes. El [plan de implementación](docs/2026-06-11_PLAN_IMPLEMENTACION_POOLING_SLICE_ALIGNED.md) define el layout `slice_native` para alinear capas, pooling y partición S.
+The N slices **do not replace** good pooling: they amplify metric geometry **if** each slice’s dimensions correspond to coherent signal sources. The [implementation plan](docs/2026-06-11_PLAN_IMPLEMENTACION_POOLING_SLICE_ALIGNED.md) defines the `slice_native` layout to align layers, pooling, and S-partition.
 
-### ¿Por qué DINOv2 y no CNN?
+### Why DINOv2 Instead of a CNN?
 
-| Propiedad | CNN (ResNet-50) | DINOv2 ViT-S/14 |
-|-----------|----------------|------------------|
-| Receptive field | Local → global (por capas) | **Global desde la capa 1** |
-| Preentrenamiento | Supervisado (1.3M) | **SSL (142M imágenes)** |
-| Segmentación emergente | No | **Sí** (attention heads) |
-| Parámetros | 23.5M | **21M** (más eficiente) |
-| Transfer learning | Bueno | **Superior** (features universales) |
+| Property | CNN (ResNet-50) | DINOv2 ViT-S/14 |
+|----------|-----------------|-----------------|
+| Receptive field | Local → global (by depth) | **Global from layer 1** |
+| Pretraining | Supervised (1.3M) | **SSL (142M images)** |
+| Emergent segmentation | No | **Yes** (attention heads) |
+| Parameters | 23.5M | **21M** (more efficient) |
+| Transfer learning | Good | **Superior** (universal features) |
 
-### Propiedad de la L2-Normalización
+### L2-Normalisation Property
 
-En $\mathbb{S}^{d-1}$ ($\|a\|=\|b\|=1$):
+On S^{d−1} (‖a‖=‖b‖=1):
 
-$$\|a - b\|_2^2 = 2(1 - \cos(a, b))$$
+```
+‖a − b‖_2² = 2(1 − cos(a, b))
+```
 
-Distancia euclidiana y similitud coseno son monótonamente equivalentes.
+Euclidean distance and cosine similarity are monotonically equivalent.
 
-### Backbones Soportados
+### Supported Backbones
 
-| Backbone | Features | Params | Fuente |
+| Backbone | Features | Params | Source |
 |----------|----------|--------|--------|
 | ResNet-18 | 512 | 11.7M | torchvision |
 | ResNet-50 | 2048 | 23.5M | torchvision |
@@ -366,251 +457,259 @@ Distancia euclidiana y similitud coseno son monótonamente equivalentes.
 | DINOv2 ViT-S/14 + Reg | 384 | 21M | torch.hub (registers) |
 | DINOv2 ViT-B/14 + Reg | 768 | 86M | torch.hub (registers) |
 
-**Espacios de embedding:** Euclidiano ($\mathbb{S}^{d-1}$) o Hiperbólico (bola de Poincaré, Ermolov et al., CVPR 2022).
+**Embedding spaces:** Euclidean (S^{d−1}) or Hyperbolic (Poincaré ball, Ermolov et al., CVPR 2022).
 
 ---
 
-## Etapa 6 — Entrenamiento (Sliced MS Loss)
+## Stage 6 — Training (Sliced MS Loss)
 
-El entrenamiento prioriza pares morfológicamente difíciles mediante **soft mining integrado** en cada slice (véase [Hard Example Mining → Soft Mining integrado](#hard-example-mining--soft-mining-integrado-en-sliced-ms)); los mineros explícitos (OHEM / triplet) quedan como legacy para `arcface`/`triplet`.
+Training prioritises morphologically hard pairs via **integrated soft mining** in each slice (see [Hard Example Mining → Soft Mining](#hard-example-mining--soft-mining-integrated-in-sliced-ms)); explicit miners (OHEM / triplet) remain legacy for `arcface`/`triplet`.
 
-### Función de Pérdida (default: `sliced_ms`)
+### Loss Function (default: `sliced_ms`)
 
-El pipeline actual usa **Sliced Multi-Similarity Loss con Learnable Dynamic Margins** (LDM-MS por subespacio). Particiona el embedding 128D en **S=4 subespacios disjuntos de 32D** y aplica MS Loss (Wang et al., CVPR 2019) de forma independiente en cada slice, con márgenes aprendibles por clase.
+The current pipeline uses **Sliced Multi-Similarity Loss with Learnable Dynamic Margins** (LDM-MS per subspace). It partitions the 128D embedding into **S=4 disjoint 32D subspaces** and applies MS Loss (Wang et al., CVPR 2019) independently in each slice, with learnable per-class margins.
 
-Motivación: mitigar **Neural Collapse** (Papyan et al., PNAS 2020) y elevar el rango espectral efectivo del espacio de embedding (Ko & Gu, CVPR 2020; slicing inspirado en Sanakoyeu et al., CVPR 2019).
+Motivation: mitigate **Neural Collapse** (Papyan et al., PNAS 2020) and raise the effective spectral rank of the embedding space (Ko & Gu, CVPR 2020; slicing inspired by Sanakoyeu et al., CVPR 2019).
 
-$$\mathcal{L}_{\text{sliced}} = \frac{1}{S} \sum_{s=1}^{S} \mathcal{L}_{MS}^{(s)}(\text{normalize}(\mathbf{z}^{(s)}), y)$$
+```
+L_sliced = (1/S) Σ_{s=1..S} L_MS^{(s)}(normalize(z^{(s)}), y)
+```
 
-donde $\mathbf{z}^{(s)}$ es el slice $s$ del embedding y cada slice se L2-normaliza antes de calcular similitud coseno.
+where z^{(s)} is slice s of the embedding and each slice is L2-normalised before cosine similarity.
 
-| Aspecto | k-NN global 128D | Sliced MS + inferencia slice-aware |
-|---------|------------------|----------------------------------|
-| Geometría train/infer | Puede divergir | Coherente por slice |
-| Colapso dimensional | Tendencia a simplex (C−1) | S simplexes independientes |
-| Clasificación inferencia | Centroides / k-NN 128D | Media coseno por slice vs representantes |
+| Aspect | Global 128D k-NN | Sliced MS + slice-aware inference |
+|--------|------------------|-----------------------------------|
+| Train/infer geometry | May diverge | Coherent per slice |
+| Dimensional collapse | Tendency to simplex (C−1) | S independent simplexes |
+| Inference classification | Centroids / 128D k-NN | Mean cosine per slice vs representatives |
 
-**Pérdidas alternativas:** `sliced_proxy` (SG-Softmax por slice), `hybrid_proxy_ms`, Triplet, ArcFace, Proxy Anchor.
+**Alternative losses:** `sliced_proxy` (SG-Softmax per slice), `hybrid_proxy_ms`, Triplet, ArcFace, Proxy Anchor.
 
-Documentación: `docs/2026-06-09_INFORME_MODIFICACIONES_PIPELINE_MULTI_SLICE.md` (slices + inferencia) y `docs/2026-06-11_PLAN_IMPLEMENTACION_POOLING_SLICE_ALIGNED.md` (pooling configurable + alineación slice-native).
+Documentation: `docs/2026-06-09_INFORME_MODIFICACIONES_PIPELINE_MULTI_SLICE.md` (slices + inference) and `docs/2026-06-11_PLAN_IMPLEMENTACION_POOLING_SLICE_ALIGNED.md` (configurable pooling + slice-native alignment).
 
-### Multi-Similarity Loss (base por slice)
+### Multi-Similarity Loss (Base per Slice)
 
-**Multi-Similarity Loss** (Wang et al., CVPR 2019) explota simultáneamente relaciones positivas y negativas de cada muestra respecto a todo el batch:
+**Multi-Similarity Loss** (Wang et al., CVPR 2019) jointly exploits positive and negative relations of each sample with respect to the full batch:
 
-$$\mathcal{L}_{MS} = \frac{1}{m} \sum_{i=1}^{m} \left\{ \frac{1}{\alpha} \log \left[ 1 + \sum_{k \in \mathcal{P}_i} e^{-\alpha(S_{ik} - \lambda)} \right] + \frac{1}{\beta} \log \left[ 1 + \sum_{k \in \mathcal{N}_i} e^{\beta(S_{ik} - \lambda)} \right] \right\}$$
+```
+L_MS = (1/m) Σ_i {
+  (1/α) log[ 1 + Σ_{k∈P_i} exp(−α(S_ik − λ)) ]
+  + (1/β) log[ 1 + Σ_{k∈N_i} exp( β(S_ik − λ)) ]
+}
+```
 
-donde $S_{ik} = \langle f_\theta(x_i), f_\theta(x_k) \rangle$, $\mathcal{P}_i$ = positivos, $\mathcal{N}_i$ = negativos, $\alpha=2, \beta=50, \lambda=0.5$.
+where S_ik = ⟨f_θ(x_i), f_θ(x_k)⟩, P_i = positives, N_i = negatives, α=2, β=50, λ=0.5.
 
-| Aspecto | Triplet Loss | Multi-Similarity Loss |
-|---------|-------------|----------------------|
-| Relaciones/batch | $O(n^3)$ tripletas | Todas: $O(n^2)$ |
-| Mining | Externo (semi-hard) | Integrado (soft mining) |
-| Gradientes | Sparse | Dense |
-| Convergencia | Lenta | Rápida |
+| Aspect | Triplet Loss | Multi-Similarity Loss |
+|--------|--------------|----------------------|
+| Relations / batch | O(n³) triplets | All pairs: O(n²) |
+| Mining | External (semi-hard) | Integrated (soft mining) |
+| Gradients | Sparse | Dense |
+| Convergence | Slow | Fast |
 
-### Hard Example Mining → Soft Mining integrado en Sliced MS
+### Hard Example Mining → Soft Mining Integrated in Sliced MS
 
-Una característica planificada desde el inicio del proyecto fue **enfocar el entrenamiento en las diferencias morfológicas más difíciles de separar** — pares positivo/negativo en el borde del margen, clases confusables en melisopalinología. Esa idea se implementó en dos fases:
+A design goal from the start was to **focus training on the hardest morphological separations** — positive/negative pairs at the margin boundary, confusable melissopalynology classes. That idea was implemented in two phases:
 
-| Fase | Mecanismo | Loss compatible | Estado |
-|------|-----------|-----------------|--------|
-| **v1 (mar 2026)** | `HardNegativeMiner` (OHEM) + triplet miners opcionales | `arcface`, `triplet` | Legacy — código en `src/training/hard_mining.py` |
-| **v2 (actual)** | **Soft mining** vía LogSumExp de MS Loss + LDM por slice | `sliced_ms` (default) | **Activo** — sustituye al minero externo |
+| Phase | Mechanism | Compatible loss | Status |
+|-------|-----------|-----------------|--------|
+| **v1 (Mar 2026)** | `HardNegativeMiner` (OHEM) + optional triplet miners | `arcface`, `triplet` | Legacy — `src/training/hard_mining.py` |
+| **v2 (current)** | **Soft mining** via MS LogSumExp + LDM per slice | `sliced_ms` (default) | **Active** — replaces external miner |
 
-#### v1 — Mineros explícitos (legacy)
+#### v1 — Explicit Miners (Legacy)
 
-Dos bloques en `config.yaml`, ambos **desactivados** con `sliced_ms`:
+Two blocks in `config.yaml`, both **disabled** with `sliced_ms`:
 
 ```yaml
 training:
   mining:          # Triplet Mining — semihard / hard / distance_weighted (pytorch_metric_learning)
     enabled: false
-  hard_mining:     # OHEM — top-k% muestras con mayor pérdida (Shrivastava et al., CVPR 2016)
+  hard_mining:     # OHEM — top-k% highest-loss samples (Shrivastava et al., CVPR 2016)
     enabled: false
 ```
 
-- **`training.hard_mining`:** calcula pérdida por muestra, selecciona el top-k% más difícil y promedia solo sobre esos ejemplos. Funcionó en runs ArcFace (mar 2026, ratio 0.3).
-- **`training.mining`:** mineros de triplets (`TripletMarginMiner`). Útil con Triplet Loss; con ArcFace se omite automáticamente.
+- **`training.hard_mining`:** computes per-sample loss, selects the hardest top-k%, averages only those. Used in ArcFace runs (Mar 2026, ratio 0.3).
+- **`training.mining`:** triplet miners (`TripletMarginMiner`). Useful with Triplet Loss; automatically skipped with ArcFace.
 
-#### v2 — Mining integrado en cada slice (pipeline actual)
+#### v2 — Mining Integrated per Slice (Current Pipeline)
 
-Con **`sliced_ms`**, el minero externo **no participa** (OHEM auto-desactivado; triplet mining incompatible con LDM). La detección de pares difíciles ocurre **dentro** de cada subespacio 32D:
+With **`sliced_ms`**, the external miner **does not participate** (OHEM auto-disabled; triplet mining incompatible with LDM). Hard-pair detection occurs **inside** each 32D subspace:
 
-1. **Soft mining MS:** el término LogSumExp con $\beta=50$ pondera exponencialmente los **negativos cercanos** (hard negatives implícitos); $\alpha$ modula positivos lejanos. Todos los pares del batch contribuyen — gradientes densos, sin recortar el grafo.
-2. **LDM por clase y slice:** `pos_margin` / `neg_margin` aprendibles adaptan la dificultad **por especie** en cada subespacio.
-3. **S=4 slices:** la dificultad se distribuye en 4 geometrías independientes → rango espectral ≈ $S \times (C-1)$ vs. colapso a un simplex.
+1. **MS soft mining:** LogSumExp with β=50 exponentially weights **nearby negatives** (implicit hard negatives); α modulates distant positives. All batch pairs contribute — dense gradients, no graph truncation.
+2. **Per-class, per-slice LDM:** learnable `pos_margin` / `neg_margin` adapt difficulty **per species** in each subspace.
+3. **S=4 slices:** difficulty is distributed across 4 independent geometries → spectral rank ≈ S × (C−1) vs collapse to one simplex.
 
-> **Nota de diseño:** usar mineros duros (`indices_tuple`) con MS/LDM **distorsiona** el soft mining y favorece colapso dimensional (`src/losses/ldm_loss.py`). Por eso el mining explícito quedó fuera de ruta al adoptar `sliced_ms`.
+> **Design note:** using hard miners (`indices_tuple`) with MS/LDM **distorts** soft mining and favours dimensional collapse (`src/losses/ldm_loss.py`). Explicit mining was therefore removed from the default path when adopting `sliced_ms`.
 
-**En Methods del paper:** describir como *implicit hard-pair weighting via Multi-Similarity LogSumExp across S orthogonal subspaces with learnable dynamic margins* — no como OHEM ni triplet mining externo.
+**For Methods in the paper:** describe as *implicit hard-pair weighting via Multi-Similarity LogSumExp across S orthogonal subspaces with learnable dynamic margins* — not as OHEM or external triplet mining.
 
-**Losses adicionales soportadas:** Triplet Margin, Proxy Anchor (CVPR 2020), ArcFace (CVPR 2019), SG-Softmax (AAAI 2023).
+**Additional supported losses:** Triplet Margin, Proxy Anchor (CVPR 2020), ArcFace (CVPR 2019), SG-Softmax (AAAI 2023).
 
-### Muestreo: M-Per-Class Balanced Sampler
+### Sampling: M-Per-Class Balanced Sampler
 
 ```
-P=6 clases/batch × K=12 muestras/clase = 72 imágenes/batch
+P=6 classes/batch × K=12 samples/class = 72 images/batch
 
-Relaciones por batch:
-  Pares positivos: K(K-1)/2 × P = 66 × 6 = 396
-  Pares negativos: K² × P(P-1)/2 = 144 × 15 = 2160
-  → MS Loss explota TODOS estos pares → gradientes densos
+Relations per batch:
+  Positive pairs: K(K−1)/2 × P = 66 × 6 = 396
+  Negative pairs: K² × P(P−1)/2 = 144 × 15 = 2160
+  → MS Loss exploits ALL pairs → dense gradients
 ```
 
-### Configuración de Optimización
+### Optimisation Configuration
 
-| Componente | Técnica | Parámetros |
-|-----------|---------|------------|
+| Component | Technique | Parameters |
+|-----------|-----------|------------|
 | **Optimizer** | AdamW | lr=10⁻⁴, weight_decay=5×10⁻⁴ |
 | **Scheduler** | Cosine Annealing | T_max=30, η_min=10⁻⁶ |
-| **Warmup** | Linear ramp | 3 epochs desde 10⁻⁵ |
-| **Mixed Precision** | AMP (float16/32) | ~50% menos VRAM, ~30% más rápido |
+| **Warmup** | Linear ramp | 3 epochs from 10⁻⁵ |
+| **Mixed Precision** | AMP (float16/32) | ~50% less VRAM, ~30% faster |
 | **Gradient Clipping** | Max norm | 5.0 |
 | **Early Stopping** | `validation_metric` (default mAP@R) | Patience=20, restore best |
 
-### Regularización SOTA (2022–2024)
+### SOTA Regularisation (2022–2024)
 
-| Técnica | Paper | Estado en trainer |
-|---------|-------|-------------------|
-| **NIR** | Roth et al., CVPR 2022 | ✅ Opcional |
-| **HIER** | Kim et al., CVPR 2023 | ✅ Opcional |
-| **Anti-collapse** | Wang & Isola, ICML 2020 | ✅ Opcional (`sota.anti_collapse`) |
-| **Self-Distillation** | Zeng et al., 2024 | ✅ Opcional |
-| Uniformity / VICReg / disentanglement (GUI) | — | ❌ No implementado — validator rechaza si enabled |
+| Technique | Paper | Status in trainer |
+|-----------|-------|-------------------|
+| **NIR** | Roth et al., CVPR 2022 | Optional |
+| **HIER** | Kim et al., CVPR 2023 | Optional |
+| **Anti-collapse** | Wang & Isola, ICML 2020 | Optional (`sota.anti_collapse`) |
+| **Self-Distillation** | Zeng et al., 2024 | Optional |
+| Uniformity / VICReg / disentanglement (GUI) | — | Not implemented — validator rejects if enabled |
 
-### Artefactos de Entrenamiento
+### Training Artefacts
 
-| Artefacto | Descripción |
-|-----------|-------------|
-| `slice_representatives.pt` | **Primario inferencia** — representantes por slice `(S, C, D_s)` |
-| `class_centroids.pt` | Centroides globales (referencia / legacy) |
-| `reference_embeddings.pt` | Embeddings del train set + labels |
-| `training_metrics.csv` | Métricas epoch-a-epoch |
-| `best_model.pth` | Checkpoint con configuración de entrenamiento incorporada |
+| Artefact | Description |
+|----------|-------------|
+| `slice_representatives.pt` | **Primary inference** — per-slice representatives `(S, C, D_s)` |
+| `class_centroids.pt` | Global centroids (reference / legacy) |
+| `reference_embeddings.pt` | Train-set embeddings + labels |
+| `training_metrics.csv` | Epoch-by-epoch metrics |
+| `best_model.pth` | Checkpoint with embedded training configuration |
 
-**Principio:** la evaluación nunca recalcula productos de la fase de entrenamiento.
+**Principle:** evaluation never recomputes products of the training phase.
 
 ---
 
-## Configuración declarativa y plan de alineación
+## Declarative Configuration and Alignment Plan
 
-### Principio: nada hardcodeado
+### Principle: Nothing Hard-Coded
 
-Toda decisión arquitectónica debe vivir en `config.yaml` y validarse al arranque (`src/utils/config_validator.py`). Valores que **hoy están fijos en código** y pasarán a config:
+Every architectural decision must live in `config.yaml` and be validated at startup (`src/utils/config_validator.py`). Values that were previously fixed in code and move to config:
 
-| Parámetro | Código actual | Destino config |
-|-----------|---------------|----------------|
-| Capas ViT | `[3, 11]` | `model.pooling.layers` |
-| Estadísticas | mean+max+std | `model.pooling.statistics` |
+| Parameter | Current code | Config destination |
+|-----------|--------------|--------------------|
+| ViT layers | `[3, 11]` | `model.pooling.layers` |
+| Statistics | mean+max+std | `model.pooling.statistics` |
 | DropToken | `p=0.3` | `model.pooling.drop_token` |
-| Umbral máscara patch | `0.01` | `model.pooling.masked.threshold` |
-| Layout proyección | LF/HF dual | `model.projection.layout: slice_native` |
-| S slices | `num_slices: 4` | ya en `training.loss.params` |
+| Patch mask threshold | `0.01` | `model.pooling.masked.threshold` |
+| Projection layout | Dual LF/HF | `model.projection.layout: slice_native` |
+| S slices | `num_slices: 4` | already in `training.loss.params` |
 
-### Parámetros centrales (hoy)
+### Central Parameters (Current)
 
 ```yaml
 model:
-  embedding_dim: 128      # divisible por num_slices
+  embedding_dim: 128      # divisible by num_slices
 training:
   loss:
     type: sliced_ms
     params:
-      num_slices: 4       # S — controla rango espectral
+      num_slices: 4       # S — controls spectral rank
 grain_detection:
   localization_detector: vit_dense
   detection_strategy: coarse_fine
   masked_pooling: true
 ```
 
-### Roadmap de implementación (2026-06-11)
+### Implementation Roadmap (2026-06-11)
 
-| Fase | Entregable | Prioridad |
-|------|------------|-----------|
-| **0** | Baseline reproducible + inventario hardcodes | Alta |
-| **1** | Schema `model.pooling` + validator extendido | Alta |
-| **2** | `PoolingModule` + `EmbeddingExtractor` unificado | **Crítica** |
-| **3** | Proyección `slice_native` (dims ↔ slices) | Alta |
-| **4** | XAI/Grad-CAM mismo forward que train | Media |
-| **5** | Matriz de ablaciones (GeM, capas, S, masking) | Media |
-| **6** | Migración checkpoints + docs | Baja |
+| Phase | Deliverable | Priority |
+|-------|-------------|----------|
+| **0** | Reproducible baseline + hardcode inventory | High |
+| **1** | `model.pooling` schema + extended validator | High |
+| **2** | Unified `PoolingModule` + `EmbeddingExtractor` | **Critical** |
+| **3** | `slice_native` projection (dims ↔ slices) | High |
+| **4** | XAI/Grad-CAM same forward as train | Medium |
+| **5** | Ablation matrix (GeM, layers, S, masking) | Medium |
+| **6** | Checkpoint migration + docs | Low |
 
-Plan completo con fórmulas, criterios de aceptación y referencias 2022–2026:
+Full plan with formulae, acceptance criteria, and 2022–2026 references:  
 **[`docs/2026-06-11_PLAN_IMPLEMENTACION_POOLING_SLICE_ALIGNED.md`](docs/2026-06-11_PLAN_IMPLEMENTACION_POOLING_SLICE_ALIGNED.md)**
 
-Implementación (2026-06-11): **`docs/2026-06-11_IMPLEMENTACION_POOLING_SLICE_CHANGELOG.md`** — smoke test: `python scripts/smoke_test_pooling_slice.py --config test_config.yaml`
+Implementation log (2026-06-11): **`docs/2026-06-11_IMPLEMENTACION_POOLING_SLICE_CHANGELOG.md`** — smoke test: `python scripts/smoke_test_pooling_slice.py --config test_config.yaml`
 
-### Brechas resueltas (2026-06-12)
+### Resolved Gaps (2026-06-12)
 
-- Checkpoint e informe alineados con `validation_metric` (mAP@R).
-- `val_loss` de validación usa `prenorm` en sliced_ms.
-- Post-training separa métricas slice-aware vs 1-NN LOO.
-- Inferencia full-image con ViT-denso coarse-fine (`PollenViTDetector`) + quality gates configurables.
-- Validator rechaza regularizadores no implementados.
+- Checkpoint and report aligned with `validation_metric` (mAP@R).
+- Validation `val_loss` uses `prenorm` under sliced_ms.
+- Post-training separates slice-aware vs 1-NN LOO metrics.
+- Full-image inference with dense ViT coarse-fine (`PollenViTDetector`) + configurable quality gates.
+- Validator rejects unimplemented regularisers.
 
-Registro completo: [`docs/2026-06-12_17-44-00_REGISTRO_DML_PIPELINE_REFERENCIAS.md`](docs/2026-06-12_17-44-00_REGISTRO_DML_PIPELINE_REFERENCIAS.md)
-
----
-
-## Etapa 7 — Evaluación y Métricas
-
-| Métrica | Definición | Rol |
-|---------|-----------|-----|
-| **Checkpoint** | `training.validation_metric` (default **mAP@R**) | Selección del best model (Musgrave et al., ECCV 2020) |
-| **R@1, mAP@R, NMI, F1-macro** | 1-NN LOO MLRC en embeddings | Métricas retrieval estándar |
-| **slice_accuracy** | Media coseno por slice vs representantes | Clasificador de despliegue (Sanakoyeu et al., CVPR 2019) |
-| **effective_rank** | Componentes para 95% varianza en espectro val | Anti-colapso dimensional |
-| **val_loss** | P×K auxiliar (alineado con prenorm en sliced_ms) | Curvas; no criterio de checkpoint |
-
-**No mezclar** slice_accuracy con R@1 en tablas del paper — son protocolos distintos.
+Full register: [`docs/2026-06-12_17-44-00_REGISTRO_DML_PIPELINE_REFERENCIAS.md`](docs/2026-06-12_17-44-00_REGISTRO_DML_PIPELINE_REFERENCIAS.md)
 
 ---
 
-## Etapa 8 — Análisis Post-Entrenamiento
+## Stage 7 — Evaluation and Metrics
 
-Pipeline automatizado de **9 etapas** sobre el mejor modelo:
+| Metric | Definition | Role |
+|--------|------------|------|
+| **Checkpoint** | `training.validation_metric` (default **mAP@R**) | Best-model selection (Musgrave et al., ECCV 2020) |
+| **R@1, mAP@R, NMI, F1-macro** | 1-NN LOO MLRC on embeddings | Standard retrieval metrics |
+| **slice_accuracy** | Mean cosine per slice vs representatives | Deployment classifier (Sanakoyeu et al., CVPR 2019) |
+| **effective_rank** | Components for 95% variance on val spectrum | Anti-collapse monitor |
+| **val_loss** | Auxiliary P×K (aligned with prenorm in sliced_ms) | Curves; not checkpoint criterion |
 
-| # | Etapa | Output |
+**Do not mix** slice_accuracy with R@1 in paper tables — they are distinct protocols.
+
+---
+
+## Stage 8 — Post-Training Analysis
+
+Automated **9-stage** pipeline on the best model:
+
+| # | Stage | Output |
 |---|-------|--------|
 | 1 | Training curves (loss, recall, lr) | `loss_curves.png`, `recall_curves.png` |
-| 2 | t-SNE 2D + 3D de embeddings | `tsne_2d.png`, `tsne_3d.png` |
+| 2 | 2D + 3D t-SNE of embeddings | `tsne_2d.png`, `tsne_3d.png` |
 | 3 | Confusion matrix (kNN) | `confusion_matrix.png` |
-| 4 | Distribución distancias intra/inter | `distance_distribution.png` |
+| 4 | Intra/inter distance distribution | `distance_distribution.png` |
 | 5 | Inference preview | `inference_preview.png` |
 | 6 | **Attention heatmap gallery** | `gradcam_gallery/*.png` |
-| 7 | Galería inferencia por clase | `inference_gallery/*.png` |
+| 7 | Per-class inference gallery | `inference_gallery/*.png` |
 | 8 | Full-image inference (test) | `fullimage_inference/*.png` |
-| 9 | Reporte markdown automático | `training_report.md` |
+| 9 | Automatic Markdown report | `training_report.md` |
 
 ---
 
-## Etapa 9 — Inferencia End-to-End
+## Stage 9 — End-to-End Inference
 
-Pipeline en **dos etapas** (localizar → identificar), estándar en microscopía automatizada (Litjens et al., 2017):
+Two-stage pipeline (localise → identify), standard in automated microscopy (Litjens et al., 2017):
 
 ```
-Imagen cámara (cualquier resolución)
+Camera image (any resolution)
   │
-  ├── PollenViTDetector (ViT-denso + coarse-fine + quality gates) → N granos
+  ├── PollenViTDetector (dense ViT + coarse-fine + quality gates) → N grains
   │     coarse → supplement (SW) → verify → split → NMS → quality filter
   │
-  └── Para cada grano (toda detección se clasifica; sin drop silencioso):
-        Crop con classification_bbox + padding → Máscara contorno
-        → fondo imagenet_neutral → Val transform
-        → AnalogyNet(mask si masked_pooling) → ê ∈ S^127
+  └── For each grain (every detection is classified; no silent drop):
+        Crop with classification_bbox + padding → Contour mask
+        → imagenet_neutral bg → Val transform
+        → AnalogyNet(mask if masked_pooling) → e-hat ∈ S^127
         → SliceAwareClassifier vs slice_representatives.pt
   │
-  └── Resultado: imagen anotada + conteo por especie + heatmaps (Grad-CAM con classification_bbox)
+  └── Result: annotated image + species counts + heatmaps
+      (Grad-CAM with classification_bbox)
 ```
 
-| Etapa | Módulo | Tarea | ¿Entrena? |
-|-------|--------|-------|-----------|
-| Localización | `PollenViTDetector` + `coarse_fine_detection` | Dónde está el grano | Sí (detector aparte) |
-| Quality gates | `detection_quality.py` | Filtra parciales/fusionados | No (config) |
-| Identificación | AnalogyNet + `SliceAwareClassifier` | Qué especie es | Sí (best checkpoint) |
+| Stage | Module | Task | Trains? |
+|-------|--------|------|---------|
+| Localisation | `PollenViTDetector` + `coarse_fine_detection` | Where the grain is | Yes (separate detector) |
+| Quality gates | `detection_quality.py` | Filter partials/fusions | No (config) |
+| Identification | AnalogyNet + `SliceAwareClassifier` | Which species | Yes (best checkpoint) |
 
-Config activa (`grain_detection`):
+Active config (`grain_detection`):
 
 ```yaml
 localization_detector: vit_dense
@@ -619,203 +718,233 @@ sliding_window_enabled: true
 max_load_side: 1536
 nms_iou_threshold: 0.5
 crop_padding: 0.2
-detector_bbox_expand_frac: 0.0      # crop tight = entrenamiento .seg
+detector_bbox_expand_frac: 0.0      # tight crop = .seg training
 max_area_frac: 0.15
 reject_edge_partial: true
 split_multi_peak_enabled: true
-reject_multi_peak_area_frac: 0.055  # solo multi-pico, no por tamaño
+reject_multi_peak_area_frac: 0.055  # multi-peak only, not by size
 drop_low_confidence_detections: false
 ```
 
-**Backends alternativos:** `u2net` (SOD clásico), `vit` (atención ViT legacy, `ModelGrainDetector`).
+**Alternative backends:** `u2net` (classic SOD), `vit` (legacy ViT attention, `ModelGrainDetector`).
 
-**Scripts de validación E2E:**
+**E2E validation scripts:**
 
 ```bash
-python scripts/regenerate_fullimage_folder.py   # Regenera galería val/test
-python scripts/analyze_gallery_folder.py        # Métricas E2E → gallery_analysis.json
+python scripts/regenerate_fullimage_folder.py   # Regenerate val/test gallery
+python scripts/analyze_gallery_folder.py        # E2E metrics → gallery_analysis.json
 ```
 
-**Revisión bibliográfica y registro de cambios:** [`docs/2026-06-13_REVISION_BIBLIOGRAFICA_Y_PIPELINE_E2E.md`](docs/2026-06-13_REVISION_BIBLIOGRAFICA_Y_PIPELINE_E2E.md)
+**Literature review and change log:** [`docs/2026-06-13_REVISION_BIBLIOGRAFICA_Y_PIPELINE_E2E.md`](docs/2026-06-13_REVISION_BIBLIOGRAFICA_Y_PIPELINE_E2E.md)
 
 ---
 
-## Etapa 10 — Explicabilidad (Atención DINOv2)
+## Stage 10 — Explainability (DINOv2 Attention)
 
 ### CLS-to-Patch Self-Attention
 
-Los mapas de auto-atención de DINOv2 naturalmente segmentan el objeto de interés (Caron et al., ICCV 2021). Método correcto para ViTs (GradCAM fue diseñado para CNNs):
+DINOv2 self-attention maps naturally segment the object of interest (Caron et al., ICCV 2021). Correct method for ViTs (GradCAM was designed for CNNs):
 
 ```
-Hook en blocks[-1].attn.qkv → Extraer Q, K
+Hook on blocks[-1].attn.qkv → Extract Q, K
   → A = softmax(QK^T / √d_k)         (B, 6 heads, 325, 325)
   → A_cls = A[:, :, 0, 1:]            CLS → 324 patches
-  → Promedio sobre heads → (18, 18)
-  → Interpolación bicúbica → (252, 252)
-  → Heatmap [0,1]: rojo=grano, azul=fondo
+  → Average over heads → (18, 18)
+  → Bicubic interpolation → (252, 252)
+  → Heatmap [0,1]: red=grain, blue=background
 ```
 
 ### Gradient-Weighted Attention (Task-Specific)
 
-Para metric learning, se pondera cada attention head por su contribución a la clasificación (Chefer et al., CVPR 2021):
+For metric learning, each attention head is weighted by its contribution to classification (Chefer et al., CVPR 2021):
 
 ```
-Forward con gradientes → cos_sim(embedding, target_slice_aware) → backward
-  → Importancia por head: h_j = mean(|∂sim/∂QKV_j|)
-  → Atención ponderada: A_weighted = Σ_j (h_j · A_cls_j)
-  → Muestra qué patches contribuyen a la CLASIFICACIÓN CORRECTA
+Forward with gradients → cos_sim(embedding, target_slice_aware) → backward
+  → Per-head importance: h_j = mean(|∂sim/∂QKV_j|)
+  → Weighted attention: A_weighted = Σ_j (h_j · A_cls_j)
+  → Shows which patches contribute to CORRECT CLASSIFICATION
 ```
 
-### GradCAM vs Atención Nativa
+### GradCAM vs Native Attention
 
-| Propiedad | GradCAM (CNNs) | Atención DINOv2 |
-|-----------|---------------|-----------------|
-| Diseñado para | CNNs (Selvaraju, 2017) | **Transformers (Caron, 2021)** |
-| Fiabilidad en ViTs | Baja (difuso/errores) | **Alta (propiedad emergente)** |
-| Dependencia | pytorch_grad_cam | **Solo PyTorch hooks** |
-| Task-specific | Sí | **Sí (gradient weighting)** |
+| Property | GradCAM (CNNs) | DINOv2 Attention |
+|----------|----------------|------------------|
+| Designed for | CNNs (Selvaraju, 2017) | **Transformers (Caron, 2021)** |
+| Reliability on ViTs | Low (diffuse/errors) | **High (emergent property)** |
+| Dependency | pytorch_grad_cam | **PyTorch hooks only** |
+| Task-specific | Yes | **Yes (gradient weighting)** |
 
-El sistema auto-detecta el tipo de backbone y selecciona el método correcto automáticamente.
+The system auto-detects backbone type and selects the correct method.
 
 ---
 
-## Resultados Experimentales
+## Experimental Results
 
-### Clasificación (DML aislado, crops `.seg`)
+### Classification (Isolated DML, `.seg` Crops)
 
-| Componente | Configuración |
-|------------|---------------|
-| **Backbone** | DINOv2 ViT-S/14 (21M parámetros) |
-| **Embedding** | 128D en $\mathbb{S}^{127}$ |
+| Component | Configuration |
+|-----------|---------------|
+| **Backbone** | DINOv2 ViT-S/14 (21M parameters) |
+| **Embedding** | 128D on S^127 |
 | **Loss** | `sliced_ms` (4×32D) + LDM |
-| **Inferencia** | `SliceAwareClassifier` + representantes por slice |
-| **Accuracy aislado (val)** | ~97.5% |
+| **Inference** | `SliceAwareClassifier` + per-slice representatives |
+| **Isolated accuracy (val)** | ~97.5% |
 
-### Inferencia end-to-end (galería val, 46 imágenes)
+### End-to-End Inference (Val Gallery, 46 Images)
 
 Run: `runs/2026-06-13_09-50-06` · Detector: `runs/2026-06-13_03-02-32/detector/best_detector.pth`
 
-| Métrica | Valor |
-|---------|-------|
-| **E2E legacy** (clasificados correctos / total detectados) | **89.5%** (85/95) |
-| **Recall detección** (anotados `.seg` con IoU ≥ 0.3) | **95.1%** (77/81) |
-| **Clasificación en matched** | **90.8%** |
+| Metric | Value |
+|--------|-------|
+| **E2E legacy** (correct classifications / total detections) | **89.5%** (85/95) |
+| **Detection recall** (annotated `.seg` with IoU ≥ 0.3) | **95.1%** (77/81) |
+| **Classification on matched** | **90.8%** |
 | Gevuina avellana / Anthemis cotula / Eucryphia | **100%** |
 
-La brecha clasificador aislado (~97%) vs E2E (~90%) refleja principalmente errores de **localización**, no capacidad discriminativa del ViT.
+The gap between isolated classifier (~97%) and E2E (~90%) mainly reflects **localisation** errors, not ViT discriminative capacity.
 
-Métricas de evaluación DML: R@K, NMI, mAP@R, F1-macro (protocolo MLRC, Musgrave et al., ECCV 2020).
+DML evaluation metrics: R@K, NMI, mAP@R, F1-macro (MLRC protocol, Musgrave et al., ECCV 2020).
 
 ---
 
-## Arquitectura de Software
+## Software Architecture
 
 ```
 MeliVision/
-├── app.py                              # Punto de entrada (GUI / CLI)
-├── config.yaml                         # Configuración declarativa completa
+├── app.py                              # Entry point (GUI / CLI)
+├── config.yaml                         # Full declarative configuration
 │
-├── src/                                # Núcleo científico
+├── src/                                # Scientific core
 │   ├── models/
 │   │   ├── analogy_net.py              # AnalogyNet: backbone + pooling + projection
-│   │   ├── pooling.py                  # (planificado) PoolingModule configurable
-│   │   ├── embedding_extractor.py      # (planificado) forward canónico único
+│   │   ├── pooling.py                  # Configurable PoolingModule
+│   │   ├── embedding_extractor.py      # Canonical forward path
 │   ├── inference/
-│   │   └── slice_classifier.py         # SliceAwareClassifier + representantes
-│   │   ├── hyperbolic.py               # Poincaré Ball (embedding hiperbólico)
-│   │   └── u2net/                      # U²-Net para saliencia
-│   │       └── u2net.py                # Arquitectura U²-Net / U²-NETP
+│   │   └── slice_classifier.py         # SliceAwareClassifier + representatives
+│   │   ├── hyperbolic.py               # Poincaré Ball (hyperbolic embedding)
+│   │   └── u2net/                      # U²-Net for saliency
+│   │       └── u2net.py                # U²-Net / U²-NETP architecture
 │   │
-│   ├── grain_detection/                # Pipeline de detección
-│   │   ├── vit_dense_detector.py       # PollenViTDetector (backend activo)
+│   ├── grain_detection/                # Detection pipeline
+│   │   ├── vit_dense_detector.py       # PollenViTDetector (active backend)
 │   │   ├── coarse_fine_detection.py    # Coarse → supplement → verify
-│   │   ├── detection_quality.py        # Quality gates configurables
-│   │   ├── grain_crop_utils.py         # Crops/masks unificados train↔infer
+│   │   ├── detection_quality.py        # Configurable quality gates
+│   │   ├── grain_crop_utils.py         # Unified crops/masks train↔infer
 │   │   ├── detected_grain.py           # DetectedGrain + classification_bbox
-│   │   ├── detection_profiles.py       # Presets sensitive/balanced/strict
-│   │   ├── salient_detector.py         # Wrapper U²-Net (SOD)
+│   │   ├── detection_profiles.py       # sensitive/balanced/strict presets
+│   │   ├── salient_detector.py         # U²-Net wrapper (SOD)
 │   │   ├── grain_detector.py           # PollenGrainDetector (U²-Net)
-│   │   ├── model_grain_detector.py     # Backend legacy (atención ViT)
-│   │   ├── seg_format.py               # Parser/Writer formato .seg
+│   │   ├── model_grain_detector.py     # Legacy backend (ViT attention)
+│   │   ├── seg_format.py               # .seg parser/writer
 │   │   ├── annotator.py                # SegmentationAnnotator (batch)
-│   │   └── full_image_classifier.py    # Pipeline E2E cámara
+│   │   └── full_image_classifier.py    # E2E camera pipeline
 │   │
 │   ├── data/
 │   │   ├── grain_dataset.py            # SegmentedGrainDataset (on-the-fly)
 │   │   ├── dataset.py                  # MielDataset (legacy ImageFolder)
-│   │   └── transforms_enhanced.py      # Augmentaciones SOTA (Albumentations)
+│   │   └── transforms_enhanced.py      # SOTA augmentations (Albumentations)
 │   │
 │   ├── training/
 │   │   ├── trainer_enhanced.py         # Trainer: AMP, mining, EMA, logging
-│   │   └── ema_teacher.py             # Self-Distillation EMA (2024)
+│   │   └── ema_teacher.py              # Self-Distillation EMA (2024)
 │   │
 │   ├── losses/
 │   │   ├── nir_regularizer.py          # NIR (CVPR 2022)
 │   │   ├── hier_regularizer.py         # HIER (CVPR 2023)
-│   │   ├── sg_softmax.py              # SG-Softmax (AAAI 2023)
-│   │   └── dada_wrapper.py            # DADA (AAAI 2024)
+│   │   ├── sg_softmax.py               # SG-Softmax (AAAI 2023)
+│   │   └── dada_wrapper.py             # DADA (AAAI 2024)
 │   │
 │   ├── inference/
-│   │   ├── knn_classifier.py           # Clasificador k-NN
-│   │   └── faiss_index.py             # Índice FAISS
+│   │   ├── knn_classifier.py           # k-NN classifier
+│   │   └── faiss_index.py              # FAISS index
 │   │
 │   ├── utils/
 │   │   ├── inference_utils.py          # Attention maps, GradCAM, embeddings
 │   │   └── metrics_utils.py            # R@K, NMI, confusion matrix
 │   │
-│   └── visualization/                  # Herramientas de visualización
+│   └── visualization/                  # Visualisation tools
 │
 ├── scripts/
-│   ├── train.py                        # Entrenamiento completo
-│   ├── post_training.py               # Análisis post-entrenamiento (9 etapas)
-│   ├── regenerate_fullimage_folder.py  # Regenera galería E2E + Grad-CAM
-│   └── analyze_gallery_folder.py       # Métricas E2E sobre galería
+│   ├── train.py                        # Full training
+│   ├── post_training.py                # Post-training analysis (9 stages)
+│   ├── regenerate_fullimage_folder.py  # Regenerate E2E gallery + Grad-CAM
+│   └── analyze_gallery_folder.py       # E2E metrics on gallery
 │
-├── lib/                                # Interfaz gráfica (PyQt5)
-│   ├── gui_app.py                      # Ventana principal (5 tabs)
-│   ├── config_editor.py               # Tab: Editor visual de config.yaml
-│   ├── dataset_manager_gui.py         # Tab: Gestor de datos (split)
-│   ├── contour_analysis_tab.py        # Tab: Análisis de contornos (U²-Net)
-│   ├── inference_tab.py               # Tab: Inferencia (individual/batch)
-│   └── styles.py                      # Sistema de estilos
+├── lib/                                # Graphical interface (PyQt5)
+│   ├── gui_app.py                      # Main window (5 tabs)
+│   ├── config_editor.py                # Tab: visual config.yaml editor
+│   ├── dataset_manager_gui.py          # Tab: data manager (split)
+│   ├── contour_analysis_tab.py         # Tab: contour analysis (U²-Net)
+│   ├── inference_tab.py                # Tab: inference (single/batch)
+│   └── styles.py                       # Style system
 │
-├── models/weights/                     # Pesos U²-Net (auto-download)
-├── data/processed/{train,val,test}/    # Datos particionados (symlinks)
-├── runs/                               # Resultados por experimento
-├── docs/                               # Documentación técnica
-└── tests/                              # Tests unitarios (pytest)
+├── models/weights/                     # U²-Net weights (auto-download)
+├── data/processed/{train,val,test}/    # Partitioned data (symlinks)
+├── runs/                               # Per-experiment results
+├── docs/                               # Technical documentation
+└── tests/                              # Unit tests (pytest)
 ```
 
-### Stack Tecnológico
+### Technology Stack
 
-| Capa | Tecnología | Función |
-|------|-----------|---------|
-| **Deep Learning** | PyTorch ≥ 2.0 | Framework base |
+| Layer | Technology | Function |
+|-------|------------|----------|
+| **Deep Learning** | PyTorch ≥ 2.0 | Base framework |
 | **Metric Learning** | pytorch-metric-learning ≥ 2.0 | Losses, miners, samplers |
-| **Vision Transformer** | DINOv2 (torch.hub) | Backbone ViT-S/14 |
-| **Object Detection** | ViT-denso + U²-Net (custom) | Localización granos (SOD) |
-| **Augmentación** | Albumentations 2.0 | Pipeline de augmentación |
-| **Búsqueda vectorial** | FAISS | Índices para k-NN |
-| **Visualización** | matplotlib, seaborn | Gráficos y heatmaps |
-| **Reducción dim.** | scikit-learn (t-SNE) | Visualización embeddings |
-| **GUI** | PyQt5 | Interfaz gráfica |
-| **Procesamiento** | OpenCV, Pillow | I/O y procesamiento imagen |
-| **Testing** | pytest | Tests unitarios |
+| **Vision Transformer** | DINOv2 (torch.hub) | ViT-S/14 backbone |
+| **Object Detection** | Dense ViT + U²-Net (custom) | Grain localisation (SOD) |
+| **Augmentation** | Albumentations 2.0 | Augmentation pipeline |
+| **Vector search** | FAISS | Indices for k-NN |
+| **Visualisation** | matplotlib, seaborn | Plots and heatmaps |
+| **Dim. reduction** | scikit-learn (t-SNE) | Embedding visualisation |
+| **GUI** | PyQt5 | Graphical interface |
+| **Processing** | OpenCV, Pillow | Image I/O and processing |
+| **Testing** | pytest | Unit tests |
 
-### Interfaz Gráfica (GUI)
+### Graphical Interface (GUI)
 
-5 tabs: **Configuración** (editor visual YAML) → **Gestor de Datos** (split train/val/test) → **Análisis de Contornos** (explorador U²-Net, click→crop) → **Entrenamiento** (asíncrono, progress bar) → **Inferencia** (individual/batch desde checkpoint).
+5 tabs: **Configuration** (visual YAML editor) → **Data Manager** (train/val/test split) → **Contour Analysis** (U²-Net explorer, click→crop) → **Training** (async, progress bar) → **Inference** (single/batch from checkpoint).
 
 ---
 
-## Referencias
+## Data Availability
+
+Datasets supporting the findings of this study are managed under FLAME³, Universidad de Concepción. Where participant confidentiality or material-transfer restrictions do not apply, the minimal dataset required to interpret, replicate, and build upon the reported results will be deposited in a public repository with accession codes / DOIs listed in the manuscript **Data Availability** section.
+
+Until public deposition is complete, processed layout conventions and local paths are described under `data/` (see also `data/README.md`). Editors and referees may request controlled access consistent with *Scientific Reports* policy.
+
+---
+
+## Code Availability
+
+The custom source code central to the conclusions of this work is available in this GitHub repository:
+
+- **Repository:** https://github.com/Nahzap/MeliVision  
+- **Version associated with the manuscript:** tag / release corresponding to the paper submission (authors will mint a DOI via Zenodo or an institutional archive for the frozen version)  
+- **Configuration:** `config.yaml` (declarative; validated at startup)  
+- **License of use:** to be stated explicitly in the repository `LICENSE` file and in the manuscript Code Availability statement (include any commercial or redistribution restrictions)
+
+Any restrictions on code availability must be described in the manuscript. Subsequent revisions should remain under version control; authors are encouraged to deposit DOI-minted releases for each paper-associated freeze.
+
+---
+
+## Citation
+
+If you use MeliVision in academic work, please cite the associated *Scientific Reports* article (once published) and this repository version. A BibTeX entry will be added upon acceptance. Affiliation for correspondence:
+
+**FLAME³**, Universidad de Concepción, Chile  
+(Fundamental of Light, Applied optics and Microscale engineering, Experiments and Explorations)
+
+---
+
+## References
 
 1. **Qin, X. et al.** (2020). U²-Net: Going Deeper with Nested U-Structure for Salient Object Detection. *Pattern Recognition*, 106.
 2. **Oquab, M. et al.** (2023). DINOv2: Learning Robust Visual Features without Supervision. *arXiv:2304.07193*.
 3. **Caron, M. et al.** (2021). Emerging Properties in Self-Supervised Vision Transformers. *ICCV 2021*.
 4. **Wang, X. et al.** (2019). Multi-Similarity Loss with General Pair Weighting for DML. *CVPR 2019*.
 5. **Chefer, H. et al.** (2021). Transformer Interpretability Beyond Attention Visualization. *CVPR 2021*.
-6. **Dosovitskiy, A. et al.** (2021). An Image is Worth 16×16 Words. *ICLR 2021*.
+6. **Dosovitskiy, A. et al.** (2021). An Image Is Worth 16×16 Words. *ICLR 2021*.
 7. **Touvron, H. et al.** (2022). DeiT III: Revenge of the ViT. *ECCV 2022*.
 8. **Selvaraju, R. et al.** (2017). Grad-CAM: Visual Explanations from Deep Networks. *ICCV 2017*.
 9. **Louveaux, J. et al.** (1978). Methods of Melissopalynology. *Bee World*, 59(4).
@@ -830,27 +959,26 @@ MeliVision/
 18. **Shrivastava, A. et al.** (2016). Training Region-based Object Detectors with Online Hard Example Mining. *CVPR 2016* (OHEM legacy — `hard_mining`).
 19. **Schroff, F. et al.** (2015). FaceNet: A Unified Embedding for Face Recognition and Clustering. *CVPR 2015* (triplet mining).
 
-**Auditoría bibliográfica (correcciones Ashikhmin, Macenko, venues):** [`docs/20260207_172200_REVISION_REFERENCIAS_SOTA.md`](docs/20260207_172200_REVISION_REFERENCIAS_SOTA.md)
-
-## Documentación académica
-
-| Documento | Contenido |
-|-----------|-----------|
-| [`docs/2026-06-13_REVISION_BIBLIOGRAFICA_Y_PIPELINE_E2E.md`](docs/2026-06-13_REVISION_BIBLIOGRAFICA_Y_PIPELINE_E2E.md) | **Revisión bibliográfica** (física, ingeniería, palinología) + registro E2E |
-| [`docs/2026-06-12_17-44-00_REGISTRO_DML_PIPELINE_REFERENCIAS.md`](docs/2026-06-12_17-44-00_REGISTRO_DML_PIPELINE_REFERENCIAS.md) | Registro DML, correcciones P0/P1 |
-| [`docs/2026-06-12_PLAN_CUMPLIMIENTO_ACADEMICO_SOTA.md`](docs/2026-06-12_PLAN_CUMPLIMIENTO_ACADEMICO_SOTA.md) | Plan cumplimiento IEEE/SOTA |
-| [`docs/2026-06-11_PLAN_IMPLEMENTACION_POOLING_SLICE_ALIGNED.md`](docs/2026-06-11_PLAN_IMPLEMENTACION_POOLING_SLICE_ALIGNED.md) | Pooling configurable + slicing |
-
-**Plan cumplimiento académico SOTA:** [`docs/2026-06-12_PLAN_CUMPLIMIENTO_ACADEMICO_SOTA.md`](docs/2026-06-12_PLAN_CUMPLIMIENTO_ACADEMICO_SOTA.md)
-
-**Revisión bibliográfica E2E (ingeniería + física):** [`docs/2026-06-13_REVISION_BIBLIOGRAFICA_Y_PIPELINE_E2E.md`](docs/2026-06-13_REVISION_BIBLIOGRAFICA_Y_PIPELINE_E2E.md)
-
-**Ablaciones F-01…F-07:** `python scripts/run_ablation_matrix.py --matrix pooling --dry-run`
+**Bibliographic audit (Ashikhmin, Macenko, venue corrections):** [`docs/20260207_172200_REVISION_REFERENCIAS_SOTA.md`](docs/20260207_172200_REVISION_REFERENCIAS_SOTA.md)
 
 ---
 
-**Versión:** 7.0 (inferencia two-stage: ViT-denso coarse-fine localiza, ViT clasifica)  
-**Última actualización:** 2026-06-13  
-**Registro DML y referencias:** [`docs/2026-06-12_17-44-00_REGISTRO_DML_PIPELINE_REFERENCIAS.md`](docs/2026-06-12_17-44-00_REGISTRO_DML_PIPELINE_REFERENCIAS.md)  
-**Revisión bibliográfica y pipeline E2E:** [`docs/2026-06-13_REVISION_BIBLIOGRAFICA_Y_PIPELINE_E2E.md`](docs/2026-06-13_REVISION_BIBLIOGRAFICA_Y_PIPELINE_E2E.md)  
-**Plan cumplimiento académico:** [`docs/2026-06-12_PLAN_CUMPLIMIENTO_ACADEMICO_SOTA.md`](docs/2026-06-12_PLAN_CUMPLIMIENTO_ACADEMICO_SOTA.md)
+## Academic Documentation
+
+| Document | Content |
+|----------|---------|
+| [`docs/2026-06-13_REVISION_BIBLIOGRAFICA_Y_PIPELINE_E2E.md`](docs/2026-06-13_REVISION_BIBLIOGRAFICA_Y_PIPELINE_E2E.md) | Literature review (physics, engineering, palynology) + E2E register |
+| [`docs/2026-06-12_17-44-00_REGISTRO_DML_PIPELINE_REFERENCIAS.md`](docs/2026-06-12_17-44-00_REGISTRO_DML_PIPELINE_REFERENCIAS.md) | DML register, P0/P1 corrections |
+| [`docs/2026-06-12_PLAN_CUMPLIMIENTO_ACADEMICO_SOTA.md`](docs/2026-06-12_PLAN_CUMPLIMIENTO_ACADEMICO_SOTA.md) | IEEE/SOTA compliance plan |
+| [`docs/2026-06-11_PLAN_IMPLEMENTACION_POOLING_SLICE_ALIGNED.md`](docs/2026-06-11_PLAN_IMPLEMENTACION_POOLING_SLICE_ALIGNED.md) | Configurable pooling + slicing |
+
+**Ablations F-01…F-07:** `python scripts/run_ablation_matrix.py --matrix pooling --dry-run`
+
+---
+
+**Version:** 7.0 (two-stage inference: dense ViT coarse-fine localises, ViT classifies)  
+**Last updated:** 2026-11-26  
+**Laboratory:** FLAME³, Universidad de Concepción  
+**DML register and references:** [`docs/2026-06-12_17-44-00_REGISTRO_DML_PIPELINE_REFERENCIAS.md`](docs/2026-06-12_17-44-00_REGISTRO_DML_PIPELINE_REFERENCIAS.md)  
+**E2E literature review and pipeline:** [`docs/2026-06-13_REVISION_BIBLIOGRAFICA_Y_PIPELINE_E2E.md`](docs/2026-06-13_REVISION_BIBLIOGRAFICA_Y_PIPELINE_E2E.md)  
+**Academic compliance plan:** [`docs/2026-06-12_PLAN_CUMPLIMIENTO_ACADEMICO_SOTA.md`](docs/2026-06-12_PLAN_CUMPLIMIENTO_ACADEMICO_SOTA.md)
